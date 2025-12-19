@@ -1,0 +1,11 @@
+[Unit]
+Description=Timevault backup
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/timevault
+
+[Install]
+WantedBy=multi-user.target

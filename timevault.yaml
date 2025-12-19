@@ -1,0 +1,72 @@
+# mount is required for all jobs; .timevault must exist at the mount root.
+# mount points must be present in /etc/fstab.
+# job run policy: auto | demand | off
+mount_prefix: "/mnt/backup/"
+excludes:
+  - "/backups"
+  - "/proc"
+  - "/var/run"
+  - "/var/log"
+  - "/var/tmp"
+  - "/tmp"
+  - "/mnt"
+  - "/net"
+  - "/dev"
+  - "/initrd"
+  - "/var/lib/imap/proc"
+  - "/var/spool/postfix/active"
+  - "/var/spool/postfix/defer"
+  - "/var/spool/postfix/deferred"
+  - "/var/spool/postfix/maildrop"
+  - "/var/spool/squid"
+  - "/var/cache"
+  - "/sys"
+  - "/var/ftp/pub/DVD"
+  - "/var/ftp/backup"
+  - "/var/ftp/pub/mirrors"
+  - "/var/ftp/pub/iso"
+  - "/var/ftp/pub/debian"
+  - "/var/ftp/tmp"
+  - "/media"
+  - ".thumbnails"
+  - "/run"
+  - "/var/ftp/swapfile"
+  - "/var/ftp/venomsoft"
+  - "/root/tmp"
+
+jobs:
+  - name: "test"
+    source: "/etc"
+    dest: "/mnt/backup/test"
+    copies: 7
+    mount: "/mnt/backup/test"
+    run: "demand"
+    excludes: []
+  - name: "spitfire-primary"
+    source: "/"
+    dest: "/mnt/backup/1/dublinux"
+    copies: 30
+    mount: "/mnt/backup/1"
+    run: "auto"
+    excludes: []
+  - name: "spitfire-secondary"
+    source: "/mnt/backup/1/dublinux/current/"
+    dest: "/mnt/backup/2/dublinux"
+    copies: 30
+    mount: "/mnt/backup/2"
+    run: "off"
+    excludes: []
+  - name: "bf109-primary"
+    source: "root@mail.moyville.net:/"
+    dest: "/mnt/backup/1/bf109"
+    copies: 30
+    mount: "/mnt/backup/1"
+    run: "auto"
+    excludes: []
+  - name: "bf109-secondary"
+    source: "/mnt/backup/1/bf109/current/"
+    dest: "/mnt/backup/2/bf109"
+    copies: 30
+    mount: "/mnt/backup/2"
+    run: "off"
+    excludes: []

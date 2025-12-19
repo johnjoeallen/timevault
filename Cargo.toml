@@ -1,0 +1,21 @@
+[package]
+name = "timevault"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+walkdir = "2"
+
+[package.metadata.deb]
+maintainer = "Timevault Maintainers"
+depends = "rsync, util-linux, coreutils"
+assets = [
+  ["target/release/timevault", "usr/bin/timevault", "755"],
+  ["timevault.yaml", "etc/timevault.yaml", "644"],
+  ["timevault.service", "lib/systemd/system/timevault.service", "644"],
+  ["timevault.timer", "lib/systemd/system/timevault.timer", "644"],
+]
+conf-files = ["/etc/timevault.yaml"]
