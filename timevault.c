@@ -232,6 +232,84 @@ static int add_string(char ***arr, size_t *count, const char *value) {
     return 1;
 }
 
+static int path_has_parent_dir(const char *path) {
+    const char *p = path;
+    while (*p) {
+        while (*p == '/') p++;
+        if (!*p) break;
+        const char *start = p;
+        while (*p && *p != '/') p++;
+        size_t len = (size_t)(p - start);
+        if (len == 2 && start[0] == '.' && start[1] == '.') {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int path_starts_with(const char *path, const char *prefix) {
+    size_t prefix_len = strlen(prefix);
+    if (prefix_len == 0) return 0;
+    while (prefix_len > 1 && prefix[prefix_len - 1] == '/') {
+        prefix_len--;
+    }
+    if (prefix_len == 1 && prefix[0] == '/') {
+        return path[0] == '/';
+    }
+    if (strncmp(path, prefix, prefix_len) != 0) return 0;
+    return path[prefix_len] == '\0' || path[prefix_len] == '/';
+}
+
+static int validate_job_paths_config(const struct Job *job, const char *mount_prefix, char *err, size_t err_len) {
+    if (!job->dest || !*job->dest) {
+        snprintf(err, err_len, "destination path is empty");
+        return 0;
+    }
+    if (!job->mount || !*job->mount) {
+        snprintf(err, err_len, "mount is required for all jobs");
+        return 0;
+    }
+    if (job->dest[0] != '/') {
+        snprintf(err, err_len, "destination path must be absolute");
+        return 0;
+    }
+    if (job->mount[0] != '/') {
+        snprintf(err, err_len, "mount path must be absolute");
+        return 0;
+    }
+    if (path_has_parent_dir(job->dest)) {
+        snprintf(err, err_len, "destination path must not contain ..");
+        return 0;
+    }
+    if (path_has_parent_dir(job->mount)) {
+        snprintf(err, err_len, "mount path must not contain ..");
+        return 0;
+    }
+    if (mount_prefix && *mount_prefix && !path_starts_with(job->mount, mount_prefix)) {
+        snprintf(err, err_len, "mount %s does not start with required prefix %s", job->mount, mount_prefix);
+        return 0;
+    }
+    size_t mount_len = strlen(job->mount);
+    while (mount_len > 1 && job->mount[mount_len - 1] == '/') {
+        mount_len--;
+    }
+    size_t dest_len = strlen(job->dest);
+    while (dest_len > 1 && job->dest[dest_len - 1] == '/') {
+        dest_len--;
+    }
+    if (dest_len < mount_len ||
+        strncmp(job->dest, job->mount, mount_len) != 0 ||
+        (dest_len > mount_len && job->dest[mount_len] != '/')) {
+        snprintf(err, err_len, "destination %s is not under mount %s", job->dest, job->mount);
+        return 0;
+    }
+    if (dest_len == mount_len && strncmp(job->dest, job->mount, mount_len) == 0) {
+        snprintf(err, err_len, "destination must be a subdirectory of mount");
+        return 0;
+    }
+    return 1;
+}
+
 static int parse_config(const char *path, struct Config *cfg, char *err, size_t err_len) {
     FILE *f = NULL;
     yaml_parser_t parser;
@@ -347,6 +425,17 @@ static int parse_config(const char *path, struct Config *cfg, char *err, size_t 
                     add_string(&job.excludes, &job.excludes_count, (char *)en->data.scalar.value);
                 }
             }
+        }
+
+        if (!validate_job_paths_config(&job, cfg->mount_prefix, err, err_len)) {
+            char prev[256];
+            snprintf(prev, sizeof(prev), "%s", err);
+            snprintf(err, err_len, "job %s: %s", job.name ? job.name : "<unknown>", prev);
+            free_job(&job);
+            yaml_document_delete(&doc);
+            yaml_parser_delete(&parser);
+            fclose(f);
+            return 0;
         }
 
         struct Job *tmp = realloc(cfg->jobs, (cfg->jobs_count + 1) * sizeof(struct Job));
@@ -542,6 +631,16 @@ static int verify_destination(struct Job *job, const char *mount_prefix, char *e
     }
     if (strcmp(mount_real, "/") == 0) {
         snprintf(err, err_len, "mount resolves to /");
+        return 0;
+    }
+    size_t mount_len = strlen(mount_real);
+    if (strncmp(dest_real, mount_real, mount_len) != 0 ||
+        (dest_real[mount_len] != '/' && dest_real[mount_len] != '\0')) {
+        snprintf(err, err_len, "destination %s is not under mount %s", dest_real, mount_real);
+        return 0;
+    }
+    if (dest_real[mount_len] == '\0') {
+        snprintf(err, err_len, "destination must be a subdirectory of mount");
         return 0;
     }
     if (!mount_is_mounted(mount_real)) {

@@ -5,7 +5,7 @@ use std::fs;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::unix::fs::symlink;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use walkdir::WalkDir;
 use serde::Deserialize;
@@ -95,6 +95,52 @@ fn get_config(path: &str) -> io::Result<(Vec<Job>, Option<String>)> {
     parse_config_yaml(path)
 }
 
+fn path_has_parent_dir(path: &Path) -> bool {
+    path.components().any(|c| matches!(c, Component::ParentDir))
+}
+
+fn validate_job_paths(job: &JobConfig, mount_prefix: Option<&str>) -> Result<(), String> {
+    let dest = job.dest.trim();
+    if dest.is_empty() {
+        return Err("destination path is empty".to_string());
+    }
+    let mount = job
+        .mount
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .ok_or_else(|| "mount is required for all jobs".to_string())?;
+    let dest_path = Path::new(dest);
+    let mount_path = Path::new(mount);
+    if !dest_path.is_absolute() {
+        return Err("destination path must be absolute".to_string());
+    }
+    if !mount_path.is_absolute() {
+        return Err("mount path must be absolute".to_string());
+    }
+    if path_has_parent_dir(dest_path) {
+        return Err("destination path must not contain ..".to_string());
+    }
+    if path_has_parent_dir(mount_path) {
+        return Err("mount path must not contain ..".to_string());
+    }
+    if let Some(prefix) = mount_prefix {
+        if !mount_path.starts_with(Path::new(prefix)) {
+            return Err(format!(
+                "mount {} does not start with required prefix {}",
+                mount, prefix
+            ));
+        }
+    }
+    if !dest_path.starts_with(mount_path) {
+        return Err(format!("destination {} is not under mount {}", dest, mount));
+    }
+    if dest_path == mount_path {
+        return Err("destination must be a subdirectory of mount".to_string());
+    }
+    Ok(())
+}
+
 fn parse_config_yaml(path: &str) -> io::Result<(Vec<Job>, Option<String>)> {
     let mut contents = String::new();
     File::open(path)?.read_to_string(&mut contents)?;
@@ -111,6 +157,12 @@ fn parse_config_yaml(path: &str) -> io::Result<(Vec<Job>, Option<String>)> {
                 format!("job {}: {}", job.name, e),
             )
         })?;
+        if let Err(e) = validate_job_paths(&job, mount_prefix.as_deref()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("job {}: {}", job.name, e),
+            ));
+        }
         let mut excludes = global_excludes.clone();
         excludes.extend(job.excludes);
         jobs.push(Job {
@@ -187,6 +239,16 @@ fn verify_destination(job: &Job, mount_prefix: Option<&str>) -> Result<PathBuf, 
         .map_err(|e| format!("cannot access mount {}: {}", mount, e))?;
     if mount_canonical == Path::new("/") {
         return Err("mount resolves to /".to_string());
+    }
+    if !dest_canonical.starts_with(&mount_canonical) {
+        return Err(format!(
+            "destination {} is not under mount {}",
+            dest_canonical.display(),
+            mount_canonical.display()
+        ));
+    }
+    if dest_canonical == mount_canonical {
+        return Err("destination must be a subdirectory of mount".to_string());
     }
     if !mount_is_mounted(&mount_canonical)? {
         return Err(format!(

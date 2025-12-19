@@ -14,8 +14,10 @@ maintainer = "Timevault Maintainers"
 depends = "rsync, util-linux, coreutils"
 assets = [
   ["target/release/timevault", "usr/bin/timevault", "755"],
-  ["timevault.yaml", "etc/timevault.yaml", "644"],
+  ["timevault.example.yaml", "usr/share/doc/timevault/timevault.example.yaml", "644"],
   ["timevault.service", "lib/systemd/system/timevault.service", "644"],
   ["timevault.timer", "lib/systemd/system/timevault.timer", "644"],
+  ["README.md", "usr/share/doc/timevault/README.md", "644"],
+  ["LICENSE", "usr/share/doc/timevault/LICENSE", "644"],
 ]
-conf-files = ["/etc/timevault.yaml"]
+maintainer-scripts = "debian"

@@ -153,6 +153,85 @@ static RunPolicy parse_run_policy(const std::string &value, bool *ok) {
     return RunPolicy::Off;
 }
 
+static bool path_has_parent_dir(const std::string &path) {
+    size_t i = 0;
+    while (i < path.size()) {
+        while (i < path.size() && path[i] == '/') i++;
+        if (i >= path.size()) break;
+        size_t start = i;
+        while (i < path.size() && path[i] != '/') i++;
+        size_t len = i - start;
+        if (len == 2 && path[start] == '.' && path[start + 1] == '.') {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool path_starts_with(const std::string &path, const std::string &prefix) {
+    if (prefix.empty()) return false;
+    size_t prefix_len = prefix.size();
+    while (prefix_len > 1 && prefix[prefix_len - 1] == '/') {
+        prefix_len--;
+    }
+    if (prefix_len == 1 && prefix[0] == '/') {
+        return !path.empty() && path[0] == '/';
+    }
+    if (path.size() < prefix_len) return false;
+    if (path.compare(0, prefix_len, prefix, 0, prefix_len) != 0) return false;
+    return path.size() == prefix_len || path[prefix_len] == '/';
+}
+
+static bool validate_job_paths_config(const Job &job, const std::string &mount_prefix, std::string *err) {
+    if (job.dest.empty()) {
+        *err = "destination path is empty";
+        return false;
+    }
+    if (job.mount.empty()) {
+        *err = "mount is required for all jobs";
+        return false;
+    }
+    if (job.dest[0] != '/') {
+        *err = "destination path must be absolute";
+        return false;
+    }
+    if (job.mount[0] != '/') {
+        *err = "mount path must be absolute";
+        return false;
+    }
+    if (path_has_parent_dir(job.dest)) {
+        *err = "destination path must not contain ..";
+        return false;
+    }
+    if (path_has_parent_dir(job.mount)) {
+        *err = "mount path must not contain ..";
+        return false;
+    }
+    if (!mount_prefix.empty() && !path_starts_with(job.mount, mount_prefix)) {
+        *err = "mount " + job.mount + " does not start with required prefix " + mount_prefix;
+        return false;
+    }
+    size_t mount_len = job.mount.size();
+    while (mount_len > 1 && job.mount[mount_len - 1] == '/') {
+        mount_len--;
+    }
+    size_t dest_len = job.dest.size();
+    while (dest_len > 1 && job.dest[dest_len - 1] == '/') {
+        dest_len--;
+    }
+    if (job.dest.size() < mount_len ||
+        job.dest.compare(0, mount_len, job.mount, 0, mount_len) != 0 ||
+        (job.dest.size() > mount_len && job.dest[mount_len] != '/')) {
+        *err = "destination " + job.dest + " is not under mount " + job.mount;
+        return false;
+    }
+    if (dest_len == mount_len && job.dest.compare(0, mount_len, job.mount, 0, mount_len) == 0) {
+        *err = "destination must be a subdirectory of mount";
+        return false;
+    }
+    return true;
+}
+
 static bool parse_config(const std::string &path, Config *cfg, std::string *err) {
     try {
         YAML::Node root = YAML::LoadFile(path);
@@ -187,6 +266,10 @@ static bool parse_config(const std::string &path, Config *cfg, std::string *err)
                 for (const auto &ex : node["excludes"]) {
                     job.excludes.push_back(ex.as<std::string>());
                 }
+            }
+            if (!validate_job_paths_config(job, cfg->mount_prefix, err)) {
+                *err = "job " + job.name + ": " + *err;
+                return false;
             }
             cfg->jobs.push_back(job);
         }
@@ -348,6 +431,16 @@ static bool verify_destination(const Job &job, const std::string &mount_prefix, 
     }
     if (std::strcmp(mount_real, "/") == 0) {
         *err = "mount resolves to /";
+        return false;
+    }
+    size_t mount_len = std::strlen(mount_real);
+    if (std::strncmp(dest_real, mount_real, mount_len) != 0 ||
+        (dest_real[mount_len] != '/' && dest_real[mount_len] != '\0')) {
+        *err = "destination " + std::string(dest_real) + " is not under mount " + std::string(mount_real);
+        return false;
+    }
+    if (dest_real[mount_len] == '\0') {
+        *err = "destination must be a subdirectory of mount";
         return false;
     }
     if (!mount_is_mounted(mount_real)) {
