@@ -207,15 +207,15 @@ static int run_nice_ionice(char *const args[], size_t args_count, struct RunMode
     return run_command(argv, mode);
 }
 
-static int lock_file(void) {
+static int lock_file_path(const char *path) {
     for (int attempt = 0; attempt < 3; attempt++) {
-        int fd = open(LOCK_FILE, O_CREAT | O_EXCL | O_WRONLY, 0644);
+        int fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0644);
         if (fd >= 0) {
             char buf[32];
             int len = snprintf(buf, sizeof(buf), "%d\n", (int)getpid());
             if (len <= 0 || write(fd, buf, (size_t)len) != len) {
                 close(fd);
-                unlink(LOCK_FILE);
+                unlink(path);
                 return -1;
             }
             close(fd);
@@ -225,7 +225,7 @@ static int lock_file(void) {
             return -1;
         }
 
-        FILE *f = fopen(LOCK_FILE, "r");
+        FILE *f = fopen(path, "r");
         if (!f) {
             if (errno == ENOENT) {
                 continue;
@@ -248,7 +248,7 @@ static int lock_file(void) {
             }
         }
 
-        if (unlink(LOCK_FILE) != 0) {
+        if (unlink(path) != 0) {
             if (errno == ENOENT) {
                 continue;
             }
@@ -258,12 +258,12 @@ static int lock_file(void) {
     return 0;
 }
 
-static void unlock_file(void) {
+static void unlock_file_path(const char *path) {
     FILE *f;
     char buf[64];
     pid_t pid;
 
-    f = fopen(LOCK_FILE, "r");
+    f = fopen(path, "r");
     if (!f) return;
     if (fgets(buf, sizeof(buf), f)) {
         pid = (pid_t)atoi(buf);
@@ -271,11 +271,19 @@ static void unlock_file(void) {
             char proc_path[128];
             snprintf(proc_path, sizeof(proc_path), "/proc/%d", pid);
             if (pid == getpid() && access(proc_path, F_OK) == 0) {
-                unlink(LOCK_FILE);
+                unlink(path);
             }
         }
     }
     fclose(f);
+}
+
+static int lock_file(void) {
+    return lock_file_path(LOCK_FILE);
+}
+
+static void unlock_file(void) {
+    unlock_file_path(LOCK_FILE);
 }
 
 static char *strdup_safe(const char *s) {
@@ -698,6 +706,23 @@ static int compare_strings(const void *a, const void *b) {
     return strcmp(sa, sb);
 }
 
+static int is_safe_job_name(const char *name) {
+    size_t i;
+    if (!name || !*name) return 0;
+    if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) return 0;
+    for (i = 0; name[i] != '\0'; i++) {
+        unsigned char c = (unsigned char)name[i];
+        if ((c >= 'a' && c <= 'z') ||
+            (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') ||
+            c == '-' || c == '_' || c == '.') {
+            continue;
+        }
+        return 0;
+    }
+    return 1;
+}
+
 static const char *run_policy_label(RunPolicy policy) {
     switch (policy) {
         case RUN_AUTO:
@@ -763,6 +788,10 @@ static int validate_job_names(const struct Config *cfg, char *err, size_t err_le
         size_t j;
         if (!cfg->jobs[i].name || !*cfg->jobs[i].name) {
             snprintf(err, err_len, "job name is required for dependency ordering");
+            return 0;
+        }
+        if (!is_safe_job_name(cfg->jobs[i].name)) {
+            snprintf(err, err_len, "job %s name must use only letters, digits, '.', '-', '_'", cfg->jobs[i].name);
             return 0;
         }
         for (j = i + 1; j < cfg->jobs_count; j++) {
@@ -1174,14 +1203,23 @@ static int backup_jobs(struct Job *jobs, size_t jobs_count, char **rsync_extra, 
     for (j = 0; j < jobs_count; j++) {
         struct Job *job = &jobs[j];
         int job_locked = 0;
+        char lock_path[PATH_MAX];
         if (!mode.dry_run) {
-            int lock_rc = lock_file();
+            if (!is_safe_job_name(job->name)) {
+                printf("job %s name must use only letters, digits, '.', '-', '_'\n", job->name ? job->name : "<unnamed>");
+                return 2;
+            }
+            if (snprintf(lock_path, sizeof(lock_path), "/var/run/timevault.%s.pid", job->name) >= (int)sizeof(lock_path)) {
+                printf("lock path too long for job %s\n", job->name ? job->name : "<unnamed>");
+                return 2;
+            }
+            int lock_rc = lock_file_path(lock_path);
             if (lock_rc == 0) {
-                printf("timevault is already running\n");
+                printf("job %s is already running\n", job->name ? job->name : "<unnamed>");
                 return 3;
             }
             if (lock_rc < 0) {
-                printf("failed to lock %s: %s (need write permission; try sudo or adjust permissions)\n", LOCK_FILE, strerror(errno));
+                printf("failed to lock %s: %s (need write permission; try sudo or adjust permissions)\n", lock_path, strerror(errno));
                 return 2;
             }
             job_locked = 1;
@@ -1221,13 +1259,13 @@ static int backup_jobs(struct Job *jobs, size_t jobs_count, char **rsync_extra, 
 
         if (!job->mount || !*job->mount) {
             printf("skip job %s: mount is required for all jobs\n", job->name ? job->name : "<unnamed>");
-            if (job_locked) unlock_file();
+            if (job_locked) unlock_file_path(lock_path);
             continue;
         }
         char err[256] = {0};
         if (!ensure_unmounted(job->mount, mode, err, sizeof(err))) {
             printf("skip job %s: %s\n", job->name ? job->name : "<unnamed>", err);
-            if (job_locked) unlock_file();
+            if (job_locked) unlock_file_path(lock_path);
             continue;
         }
         char *mount_args[] = { (char *)"mount", job->mount, NULL };
@@ -1250,7 +1288,7 @@ static int backup_jobs(struct Job *jobs, size_t jobs_count, char **rsync_extra, 
             char *umount_args[] = { (char *)"umount", job->mount, NULL };
             run_command(umount_args, mode);
             untrack_mount(job->mount);
-            if (job_locked) unlock_file();
+            if (job_locked) unlock_file_path(lock_path);
             continue;
         }
 
@@ -1261,7 +1299,7 @@ static int backup_jobs(struct Job *jobs, size_t jobs_count, char **rsync_extra, 
             char *umount_args[] = { (char *)"umount", job->mount, NULL };
             run_command(umount_args, mode);
             untrack_mount(job->mount);
-            if (job_locked) unlock_file();
+            if (job_locked) unlock_file_path(lock_path);
             continue;
         }
 
@@ -1352,7 +1390,7 @@ static int backup_jobs(struct Job *jobs, size_t jobs_count, char **rsync_extra, 
         char *umount_args[] = { (char *)"umount", job->mount, NULL };
         run_command(umount_args, mode);
         untrack_mount(job->mount);
-        if (job_locked) unlock_file();
+        if (job_locked) unlock_file_path(lock_path);
     }
     return 0;
 }

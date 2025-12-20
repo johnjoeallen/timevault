@@ -1,8 +1,14 @@
 # Example configuration for Timevault.
-# mount is required for all jobs; .timevault must exist at the mount root.
-# mount points must be present in /etc/fstab.
-# job run policy: auto | demand | off
-mount_prefix: "/mnt/backup/"
+# Backup disks are enrolled by filesystem UUID and stay offline by default.
+
+mountBase: "/run/timevault/mounts"
+userMountBase: "/run/timevault/user-mounts"
+backupDisks:
+  - diskId: "primary"
+    fsUuid: "REPLACE-WITH-UUID"
+    label: "primary-backup"
+    mountOptions: "rw,nodev,nosuid,noexec"
+
 excludes:
   - "/proc"
   - "/sys"
@@ -16,19 +22,12 @@ excludes:
 jobs:
   - name: "etc-snapshots"
     source: "/etc"
-    dest: "/mnt/backup/primary/etc"
     copies: 14
-    mount: "/mnt/backup/primary"
     run: "demand"
-    depends_on: []
     excludes: []
   - name: "home-weekly"
     source: "/home"
-    dest: "/mnt/backup/primary/home"
     copies: 8
-    mount: "/mnt/backup/primary"
     run: "auto"
-    depends_on:
-      - "etc-snapshots"
     excludes:
       - "/home/*/.cache"

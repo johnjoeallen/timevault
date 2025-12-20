@@ -1,7 +1,11 @@
-# mount is required for all jobs; .timevault must exist at the mount root.
-# mount points must be present in /etc/fstab.
 # job run policy: auto | demand | off
-mount_prefix: "/mnt/backup/"
+mountBase: "/run/timevault/mounts"
+userMountBase: "/run/timevault/user-mounts"
+backupDisks:
+  - diskId: "primary"
+    fsUuid: "REPLACE-WITH-UUID"
+    label: "primary-backup"
+    mountOptions: "rw,nodev,nosuid,noexec"
 excludes:
   - "/backups"
   - "/proc"
@@ -34,35 +38,11 @@ excludes:
 jobs:
   - name: "spitfire-primary"
     source: "/"
-    dest: "/mnt/backup/1/dublinux"
     copies: 30
-    mount: "/mnt/backup/1"
     run: "auto"
-    depends_on: []
     excludes: []
   - name: "bf109-primary"
     source: "root@mail.moyville.net:/"
-    dest: "/mnt/backup/1/bf109"
     copies: 30
-    mount: "/mnt/backup/1"
     run: "auto"
-    depends_on: []
-    excludes: []
-  - name: "spitfire-secondary"
-    source: "/mnt/backup/1/dublinux/current/"
-    dest: "/mnt/backup/2/dublinux"
-    copies: 30
-    mount: "/mnt/backup/2"
-    run: "off"
-    depends_on:
-      - "spitfire-primary"
-    excludes: []
-  - name: "bf109-secondary"
-    source: "/mnt/backup/1/bf109/current/"
-    dest: "/mnt/backup/2/bf109"
-    copies: 30
-    mount: "/mnt/backup/2"
-    run: "off"
-    depends_on:
-      - "bf109-primary"
     excludes: []

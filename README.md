@@ -1,15 +1,16 @@
 # Timevault
 
-Timevault is a safe, rsync-based backup tool with mount validation and snapshot rotation. It uses a YAML config file, requires a `.timevault` marker on backup devices, and supports dry-run/safe modes.
+Timevault is a safe, rsync-based backup tool with snapshot rotation. It uses a YAML config file, enrolls backup disks by filesystem UUID, and supports dry-run/safe modes. Backup disks stay offline by default and are mounted only when needed.
 
 ## Features
 - YAML config at `/etc/timevault.yaml` (override with `--config`)
-- Mount verification via `/etc/fstab` and `/proc/mounts`
-- `.timevault` marker required on the mount root
+- Enrolled backup disks by filesystem UUID
+- Mounts only during backup or explicit restore mounts
+- `.timevault` identity file required at the disk root
 - Snapshot rotation with `current` symlink
 - `--dry-run` and `--safe` modes
 - `--job` selection for targeted runs
-- `--init` / `--force-init` to initialize a mount
+- `disk add`/`disk enroll`, `disk discover`, `mount`, `umount` commands for disk lifecycle
 
 ## Install (Cargo)
 
@@ -39,7 +40,13 @@ sudo systemctl enable --now timevault.timer
 Example `/etc/timevault.yaml`:
 
 ```yaml
-mount_prefix: "/mnt/backup/"
+mountBase: "/run/timevault/mounts"
+userMountBase: "/run/timevault/user-mounts"
+backupDisks:
+  - diskId: "primary"
+    fsUuid: "REPLACE-WITH-UUID"
+    label: "primary-backup"
+    mountOptions: "rw,nodev,nosuid,noexec"
 excludes:
   - "/proc"
   - "/sys"
@@ -48,13 +55,12 @@ excludes:
 jobs:
   - name: "primary"
     source: "/"
-    dest: "/mnt/backup/1/host"
     copies: 30
-    mount: "/mnt/backup/1"
     run: "auto"   # auto | demand | off
-    depends_on: [] # optional job dependencies
     excludes: []
 ```
+
+Backup directory is `/<job name>` at the mounted backup disk root.
 
 Run policy:
 - `auto`: run when no explicit jobs are requested
@@ -69,10 +75,70 @@ Run all `auto` jobs:
 timevault
 ```
 
+Run an explicit backup (same as default):
+
+```bash
+timevault backup
+```
+
+Enroll a disk:
+
+```bash
+timevault disk add --disk-id primary --fs-uuid <uuid>
+```
+
+Or:
+
+```bash
+timevault --disk-enroll --disk-id primary --fs-uuid <uuid>
+```
+
+Discover candidate disks:
+
+```bash
+timevault disk discover
+```
+
+Or:
+
+```bash
+timevault --disk-discover
+```
+
 Run specific jobs:
 
 ```bash
 timevault --job primary --job secondary
+```
+
+Mount an enrolled disk for restore (read-only by default):
+
+```bash
+timevault mount
+```
+
+If multiple disks are connected, specify a disk:
+
+```bash
+timevault mount --disk-id primary
+```
+
+Mount to a specific location (optional):
+
+```bash
+timevault mount --mountpoint /mnt/timevault-restore
+```
+
+Mount read/write (optional):
+
+```bash
+timevault mount --read-write
+```
+
+Unmount a restore mount:
+
+```bash
+timevault umount --mountpoint /mnt/timevault-restore
 ```
 
 Pass rsync options (everything after `--rsync` is forwarded to rsync):
@@ -81,7 +147,7 @@ Pass rsync options (everything after `--rsync` is forwarded to rsync):
 timevault --rsync --delete --exclude='*.tmp'
 ```
 
-Print resolved job order (including dependencies) and exit with full job details:
+Print resolved job order and exit with full job details:
 
 ```bash
 timevault --print-order
@@ -111,19 +177,7 @@ Show version (includes license and project URL):
 timevault --version
 ```
 
-Initialize a timevault device:
-
-```bash
-timevault --init /mnt/backup/1
-```
-
-Force init on a non-empty mount:
-
-```bash
-timevault --force-init /mnt/backup/1
-```
-
 ## Notes
-- The mount point must exist in `/etc/fstab`.
-- The mount root must contain `.timevault`.
+- Backup disks are identified by UUID and must contain `/.timevault`.
+- Backup disks are mounted on demand under `/run/timevault`.
 - Requires `rsync`, `util-linux` (mount/umount), and `coreutils`.

@@ -175,15 +175,15 @@ static int run_nice_ionice(const std::vector<std::string> &args, const RunMode &
     return run_command(argv, mode);
 }
 
-static int lock_file() {
+static int lock_file_path(const std::string &path) {
     for (int attempt = 0; attempt < 3; attempt++) {
-        int fd = ::open(LOCK_FILE, O_CREAT | O_EXCL | O_WRONLY, 0644);
+        int fd = ::open(path.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0644);
         if (fd >= 0) {
             char buf[32];
             int len = std::snprintf(buf, sizeof(buf), "%d\n", static_cast<int>(getpid()));
             if (len <= 0 || ::write(fd, buf, static_cast<size_t>(len)) != len) {
                 ::close(fd);
-                ::unlink(LOCK_FILE);
+                ::unlink(path.c_str());
                 return -1;
             }
             ::close(fd);
@@ -191,7 +191,7 @@ static int lock_file() {
         }
         if (errno != EEXIST) return -1;
 
-        FILE *f = std::fopen(LOCK_FILE, "r");
+        FILE *f = std::fopen(path.c_str(), "r");
         if (!f) {
             if (errno == ENOENT) {
                 continue;
@@ -224,8 +224,8 @@ static int lock_file() {
     return 0;
 }
 
-static void unlock_file() {
-    FILE *f = std::fopen(LOCK_FILE, "r");
+static void unlock_file_path(const std::string &path) {
+    FILE *f = std::fopen(path.c_str(), "r");
     if (!f) return;
     char buf[64] = {0};
     if (std::fgets(buf, sizeof(buf), f)) {
@@ -234,11 +234,19 @@ static void unlock_file() {
             char proc_path[128];
             std::snprintf(proc_path, sizeof(proc_path), "/proc/%d", pid);
             if (pid == getpid() && access(proc_path, F_OK) == 0) {
-                unlink(LOCK_FILE);
+                unlink(path.c_str());
             }
         }
     }
     std::fclose(f);
+}
+
+static int lock_file() {
+    return lock_file_path(LOCK_FILE);
+}
+
+static void unlock_file() {
+    unlock_file_path(LOCK_FILE);
 }
 
 static RunPolicy parse_run_policy(const std::string &value, bool *ok) {
@@ -647,11 +655,29 @@ static bool job_depends_on(const Job &job, const std::string &name) {
     return false;
 }
 
+static bool is_safe_job_name(const std::string &name) {
+    if (name.empty() || name == "." || name == "..") return false;
+    for (char c : name) {
+        if ((c >= 'a' && c <= 'z') ||
+            (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') ||
+            c == '-' || c == '_' || c == '.') {
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
 static bool validate_job_names(const Config &cfg, std::string *err) {
     std::unordered_set<std::string> names;
     for (const auto &job : cfg.jobs) {
         if (job.name.empty()) {
             *err = "job name is required for dependency ordering";
+            return false;
+        }
+        if (!is_safe_job_name(job.name)) {
+            *err = "job " + job.name + " name must use only letters, digits, '.', '-', '_'";
             return false;
         }
         if (!names.insert(job.name).second) {
@@ -860,14 +886,20 @@ static void format_day(char *buf, size_t len, time_t t) {
 static void backup_jobs(const std::vector<Job> &jobs, const std::vector<std::string> &rsync_extra, const RunMode &mode, const std::string &mount_prefix) {
     for (const auto &job : jobs) {
         bool job_locked = false;
+        std::string lock_path;
         if (!mode.dry_run) {
-            int lock_rc = lock_file();
+            if (!is_safe_job_name(job.name)) {
+                std::printf("job %s name must use only letters, digits, '.', '-', '_'\n", job.name.empty() ? "<unnamed>" : job.name.c_str());
+                std::exit(2);
+            }
+            lock_path = "/var/run/timevault." + job.name + ".pid";
+            int lock_rc = lock_file_path(lock_path);
             if (lock_rc == 0) {
-                std::printf("timevault is already running\n");
+                std::printf("job %s is already running\n", job.name.c_str());
                 std::exit(3);
             }
             if (lock_rc < 0) {
-                std::printf("failed to lock %s: %s (need write permission; try sudo or adjust permissions)\n", LOCK_FILE, std::strerror(errno));
+                std::printf("failed to lock %s: %s (need write permission; try sudo or adjust permissions)\n", lock_path.c_str(), std::strerror(errno));
                 std::exit(2);
             }
             job_locked = true;
@@ -907,13 +939,13 @@ static void backup_jobs(const std::vector<Job> &jobs, const std::vector<std::str
 
         if (job.mount.empty()) {
             std::printf("skip job %s: mount is required for all jobs\n", job.name.c_str());
-            if (job_locked) unlock_file();
+            if (job_locked) unlock_file_path(lock_path);
             continue;
         }
         std::string err;
         if (!ensure_unmounted(job.mount, mode, &err)) {
             std::printf("skip job %s: %s\n", job.name.c_str(), err.c_str());
-            if (job_locked) unlock_file();
+            if (job_locked) unlock_file_path(lock_path);
             continue;
         }
         run_command({"mount", job.mount}, mode);
@@ -932,7 +964,7 @@ static void backup_jobs(const std::vector<Job> &jobs, const std::vector<std::str
             run_command({"mount", "-oremount,ro", job.mount}, mode);
             run_command({"umount", job.mount}, mode);
             untrack_mount(job.mount);
-            if (job_locked) unlock_file();
+            if (job_locked) unlock_file_path(lock_path);
             continue;
         }
 
@@ -941,7 +973,7 @@ static void backup_jobs(const std::vector<Job> &jobs, const std::vector<std::str
             run_command({"mount", "-oremount,ro", job.mount}, mode);
             run_command({"umount", job.mount}, mode);
             untrack_mount(job.mount);
-            if (job_locked) unlock_file();
+            if (job_locked) unlock_file_path(lock_path);
             continue;
         }
 
@@ -1013,7 +1045,7 @@ static void backup_jobs(const std::vector<Job> &jobs, const std::vector<std::str
         run_command({"mount", "-oremount,ro", job.mount}, mode);
         run_command({"umount", job.mount}, mode);
         untrack_mount(job.mount);
-        if (job_locked) unlock_file();
+        if (job_locked) unlock_file_path(lock_path);
     }
 }
 
