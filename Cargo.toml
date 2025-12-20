@@ -1,7 +1,7 @@
 [package]
 name = "timevault"
 version = "0.1.1"
-edition = "2021"
+edition = "2024"
 description = "Safe rsync-based backup tool with mount validation and snapshot rotation"
 license = "GPL-3.0-or-later"
 
@@ -11,6 +11,7 @@ serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 signal-hook = "0.3"
 walkdir = "2"
+clap = {version="4.5.53", features=["derive"]}
 
 [package.metadata.deb]
 maintainer = "Timevault Maintainers"
