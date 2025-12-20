@@ -20,6 +20,7 @@ jobs:
     copies: 14
     mount: "/mnt/backup/primary"
     run: "demand"
+    depends_on: []
     excludes: []
   - name: "home-weekly"
     source: "/home"
@@ -27,5 +28,7 @@ jobs:
     copies: 8
     mount: "/mnt/backup/primary"
     run: "auto"
+    depends_on:
+      - "etc-snapshots"
     excludes:
       - "/home/*/.cache"

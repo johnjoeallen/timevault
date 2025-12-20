@@ -21,40 +21,24 @@ excludes:
   - "/var/spool/squid"
   - "/var/cache"
   - "/sys"
-  - "/var/ftp/pub/DVD"
-  - "/var/ftp/backup"
-  - "/var/ftp/pub/mirrors"
-  - "/var/ftp/pub/iso"
-  - "/var/ftp/pub/debian"
-  - "/var/ftp/tmp"
+  - "/data/docker"
+  - "/data/mirrors"
+  - "/data/swapfile"
+  - "/data/venomsoft"
+  - "/data/pub/backups"
   - "/media"
   - ".thumbnails"
   - "/run"
-  - "/var/ftp/swapfile"
-  - "/var/ftp/venomsoft"
   - "/root/tmp"
 
 jobs:
-  - name: "test"
-    source: "/etc"
-    dest: "/mnt/backup/test"
-    copies: 7
-    mount: "/mnt/backup/test"
-    run: "demand"
-    excludes: []
   - name: "spitfire-primary"
     source: "/"
     dest: "/mnt/backup/1/dublinux"
     copies: 30
     mount: "/mnt/backup/1"
     run: "auto"
-    excludes: []
-  - name: "spitfire-secondary"
-    source: "/mnt/backup/1/dublinux/current/"
-    dest: "/mnt/backup/2/dublinux"
-    copies: 30
-    mount: "/mnt/backup/2"
-    run: "off"
+    depends_on: []
     excludes: []
   - name: "bf109-primary"
     source: "root@mail.moyville.net:/"
@@ -62,6 +46,16 @@ jobs:
     copies: 30
     mount: "/mnt/backup/1"
     run: "auto"
+    depends_on: []
+    excludes: []
+  - name: "spitfire-secondary"
+    source: "/mnt/backup/1/dublinux/current/"
+    dest: "/mnt/backup/2/dublinux"
+    copies: 30
+    mount: "/mnt/backup/2"
+    run: "off"
+    depends_on:
+      - "spitfire-primary"
     excludes: []
   - name: "bf109-secondary"
     source: "/mnt/backup/1/bf109/current/"
@@ -69,4 +63,6 @@ jobs:
     copies: 30
     mount: "/mnt/backup/2"
     run: "off"
+    depends_on:
+      - "bf109-primary"
     excludes: []

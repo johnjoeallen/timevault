@@ -52,6 +52,7 @@ jobs:
     copies: 30
     mount: "/mnt/backup/1"
     run: "auto"   # auto | demand | off
+    depends_on: [] # optional job dependencies
     excludes: []
 ```
 
@@ -74,6 +75,18 @@ Run specific jobs:
 timevault --job primary --job secondary
 ```
 
+Pass rsync options (everything after `--rsync` is forwarded to rsync):
+
+```bash
+timevault --rsync --delete --exclude='*.tmp'
+```
+
+Print resolved job order (including dependencies) and exit with full job details:
+
+```bash
+timevault --print-order
+```
+
 Dry run (no writes, but mounts/umounts still run):
 
 ```bash
@@ -92,6 +105,12 @@ Verbose logging:
 timevault --verbose
 ```
 
+Show version (includes license and project URL):
+
+```bash
+timevault --version
+```
+
 Initialize a timevault device:
 
 ```bash
@@ -108,4 +127,3 @@ timevault --force-init /mnt/backup/1
 - The mount point must exist in `/etc/fstab`.
 - The mount root must contain `.timevault`.
 - Requires `rsync`, `util-linux` (mount/umount), and `coreutils`.
-

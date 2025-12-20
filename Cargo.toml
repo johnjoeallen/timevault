@@ -1,12 +1,15 @@
 [package]
 name = "timevault"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
+description = "Safe rsync-based backup tool with mount validation and snapshot rotation"
+license = "GPL-3.0-or-later"
 
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
+signal-hook = "0.3"
 walkdir = "2"
 
 [package.metadata.deb]

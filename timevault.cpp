@@ -5,6 +5,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <csignal>
+#include <fcntl.h>
 #include <dirent.h>
 #include <ftw.h>
 #include <limits.h>
@@ -12,15 +14,22 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <yaml-cpp/yaml.h>
 
-static const char *LOCK_FILE = "/var/run/gbackup.pid";
+static const char *LOCK_FILE = "/var/run/timevault.pid";
 static const char *DEFAULT_CONFIG = "/etc/timevault.yaml";
 static const char *TIMEVAULT_MARKER = ".timevault";
+static const char *TIMEVAULT_VERSION = "0.1.0";
+static const char *TIMEVAULT_LICENSE = "GNU GPL v3 or later";
+static const char *TIMEVAULT_COPYRIGHT = "Copyright (C) 2025 John Allen (john.joe.alleN@gmail.com)";
+static const char *TIMEVAULT_PROJECT_URL = "https://github.com/johnjoeallen/timevault";
+
+static std::vector<std::string> tracked_mounts;
 
 struct RunMode {
     bool dry_run = false;
@@ -42,6 +51,7 @@ struct Job {
     std::string mount;
     RunPolicy run_policy = RunPolicy::Auto;
     std::vector<std::string> excludes;
+    std::vector<std::string> depends_on;
 };
 
 struct Config {
@@ -82,6 +92,79 @@ static int run_command(const std::vector<std::string> &argv, const RunMode &mode
     return 1;
 }
 
+static void print_banner() {
+    std::printf("TimeVault %s\n", TIMEVAULT_VERSION);
+}
+
+static void print_copyright() {
+    std::printf("%s\n", TIMEVAULT_COPYRIGHT);
+}
+
+static const char *run_policy_label(RunPolicy policy) {
+    switch (policy) {
+        case RunPolicy::Auto:
+            return "auto";
+        case RunPolicy::Demand:
+            return "demand";
+        case RunPolicy::Off:
+            return "off";
+        default:
+            return "unknown";
+    }
+}
+
+static void print_string_list(const char *label, const std::vector<std::string> &items) {
+    if (items.empty()) {
+        std::printf("  %s: <none>\n", label);
+        return;
+    }
+    std::printf("  %s: ", label);
+    for (size_t i = 0; i < items.size(); i++) {
+        if (i > 0) std::printf(", ");
+        std::printf("%s", items[i].c_str());
+    }
+    std::printf("\n");
+}
+
+static void print_job_details(const Job &job) {
+    std::printf("job: %s\n", job.name.empty() ? "<unnamed>" : job.name.c_str());
+    std::printf("  source: %s\n", job.source.c_str());
+    std::printf("  dest: %s\n", job.dest.c_str());
+    std::printf("  copies: %d\n", job.copies);
+    std::printf("  mount: %s\n", job.mount.empty() ? "<unset>" : job.mount.c_str());
+    std::printf("  run: %s\n", run_policy_label(job.run_policy));
+    print_string_list("depends_on", job.depends_on);
+    print_string_list("excludes", job.excludes);
+}
+
+static void track_mount(const std::string &mount) {
+    if (mount.empty()) return;
+    if (std::find(tracked_mounts.begin(), tracked_mounts.end(), mount) != tracked_mounts.end()) {
+        return;
+    }
+    tracked_mounts.push_back(mount);
+}
+
+static void untrack_mount(const std::string &mount) {
+    auto it = std::find(tracked_mounts.begin(), tracked_mounts.end(), mount);
+    if (it != tracked_mounts.end()) {
+        tracked_mounts.erase(it);
+    }
+}
+
+static void cleanup_mounts() {
+    for (const auto &mount : tracked_mounts) {
+        umount(mount.c_str());
+    }
+    tracked_mounts.clear();
+}
+
+static void handle_signal(int signum) {
+    (void)signum;
+    cleanup_mounts();
+    _exit(1);
+}
+
 static int run_nice_ionice(const std::vector<std::string> &args, const RunMode &mode) {
     std::vector<std::string> argv = {"nice", "-n", "19", "ionice", "-c", "3", "-n7"};
     argv.insert(argv.end(), args.begin(), args.end());
@@ -93,28 +176,52 @@ static int run_nice_ionice(const std::vector<std::string> &args, const RunMode &
 }
 
 static int lock_file() {
-    FILE *f = std::fopen(LOCK_FILE, "r");
-    if (f) {
-        char buf[64] = {0};
-        if (std::fgets(buf, sizeof(buf), f)) {
-            pid_t pid = static_cast<pid_t>(std::atoi(buf));
-            if (pid > 0) {
-                char proc_path[128];
-                std::snprintf(proc_path, sizeof(proc_path), "/proc/%d", pid);
-                if (access(proc_path, F_OK) == 0) {
-                    std::fclose(f);
-                    return 0;
-                }
+    for (int attempt = 0; attempt < 3; attempt++) {
+        int fd = ::open(LOCK_FILE, O_CREAT | O_EXCL | O_WRONLY, 0644);
+        if (fd >= 0) {
+            char buf[32];
+            int len = std::snprintf(buf, sizeof(buf), "%d\n", static_cast<int>(getpid()));
+            if (len <= 0 || ::write(fd, buf, static_cast<size_t>(len)) != len) {
+                ::close(fd);
+                ::unlink(LOCK_FILE);
+                return -1;
             }
+            ::close(fd);
+            return 1;
+        }
+        if (errno != EEXIST) return -1;
+
+        FILE *f = std::fopen(LOCK_FILE, "r");
+        if (!f) {
+            if (errno == ENOENT) {
+                continue;
+            }
+            return -1;
+        }
+
+        char buf[64] = {0};
+        pid_t pid = 0;
+        if (std::fgets(buf, sizeof(buf), f)) {
+            pid = static_cast<pid_t>(std::atoi(buf));
         }
         std::fclose(f);
-    }
 
-    f = std::fopen(LOCK_FILE, "w");
-    if (!f) return -1;
-    std::fprintf(f, "%d\n", static_cast<int>(getpid()));
-    std::fclose(f);
-    return 1;
+        if (pid > 0) {
+            char proc_path[128];
+            std::snprintf(proc_path, sizeof(proc_path), "/proc/%d", pid);
+            if (access(proc_path, F_OK) == 0) {
+                return 0;
+            }
+        }
+
+        if (::unlink(LOCK_FILE) != 0) {
+            if (errno == ENOENT) {
+                continue;
+            }
+            return -1;
+        }
+    }
+    return 0;
 }
 
 static void unlock_file() {
@@ -126,7 +233,7 @@ static void unlock_file() {
         if (pid > 0) {
             char proc_path[128];
             std::snprintf(proc_path, sizeof(proc_path), "/proc/%d", pid);
-            if (access(proc_path, F_OK) == 0) {
+            if (pid == getpid() && access(proc_path, F_OK) == 0) {
                 unlink(LOCK_FILE);
             }
         }
@@ -267,6 +374,11 @@ static bool parse_config(const std::string &path, Config *cfg, std::string *err)
                     job.excludes.push_back(ex.as<std::string>());
                 }
             }
+            if (node["depends_on"]) {
+                for (const auto &dep : node["depends_on"]) {
+                    job.depends_on.push_back(dep.as<std::string>());
+                }
+            }
             if (!validate_job_paths_config(job, cfg->mount_prefix, err)) {
                 *err = "job " + job.name + ": " + *err;
                 return false;
@@ -327,6 +439,68 @@ static bool mount_is_mounted(const std::string &mount) {
     }
     std::fclose(f);
     return false;
+}
+
+static int mount_is_readonly(const std::string &mount) {
+    FILE *f = std::fopen("/proc/mounts", "r");
+    char line[1024];
+    if (!f) return -1;
+    while (std::fgets(line, sizeof(line), f)) {
+        char *p = line;
+        char *fields[6];
+        int n = 0;
+        while (*p && n < 6) {
+            while (*p == ' ' || *p == '\t') p++;
+            if (!*p || *p == '\n') break;
+            fields[n++] = p;
+            while (*p && *p != ' ' && *p != '\t' && *p != '\n') p++;
+            if (*p) { *p = '\0'; p++; }
+        }
+        if (n >= 4 && mount == fields[1]) {
+            char opts[1024];
+            std::strncpy(opts, fields[3], sizeof(opts) - 1);
+            opts[sizeof(opts) - 1] = '\0';
+            char *token = std::strtok(opts, ",");
+            while (token) {
+                if (std::strcmp(token, "ro") == 0) {
+                    std::fclose(f);
+                    return 1;
+                }
+                token = std::strtok(nullptr, ",");
+            }
+            std::fclose(f);
+            return 0;
+        }
+    }
+    std::fclose(f);
+    return -1;
+}
+
+static bool ensure_unmounted(const std::string &mount, const RunMode &mode, std::string *err) {
+    if (!mount_is_mounted(mount)) {
+        if (mode.verbose) {
+            std::printf("mount not active, skip umount: %s\n", mount.c_str());
+        }
+        return true;
+    }
+    if (mode.verbose) {
+        std::printf("unmounting %s\n", mount.c_str());
+    }
+    int rc = run_command({"umount", mount}, mode);
+    if (rc != 0) {
+        if (err) {
+            *err = "umount " + mount + " failed with exit code " + std::to_string(rc);
+        }
+        return false;
+    }
+    if (mount_is_mounted(mount)) {
+        if (err) {
+            *err = "umount " + mount + " did not detach";
+        }
+        return false;
+    }
+    untrack_mount(mount);
+    return true;
 }
 
 static int remove_cb(const char *fpath, const struct stat *sb, int typeflag, struct FTW *ftwbuf) {
@@ -459,6 +633,127 @@ static bool verify_destination(const Job &job, const std::string &mount_prefix, 
     return true;
 }
 
+static int find_job_index(const Config &cfg, const std::string &name) {
+    for (size_t i = 0; i < cfg.jobs.size(); i++) {
+        if (cfg.jobs[i].name == name) return static_cast<int>(i);
+    }
+    return -1;
+}
+
+static bool job_depends_on(const Job &job, const std::string &name) {
+    for (const auto &dep : job.depends_on) {
+        if (dep == name) return true;
+    }
+    return false;
+}
+
+static bool validate_job_names(const Config &cfg, std::string *err) {
+    std::unordered_set<std::string> names;
+    for (const auto &job : cfg.jobs) {
+        if (job.name.empty()) {
+            *err = "job name is required for dependency ordering";
+            return false;
+        }
+        if (!names.insert(job.name).second) {
+            *err = "duplicate job name " + job.name;
+            return false;
+        }
+    }
+    return true;
+}
+
+struct StackItem {
+    int idx;
+    int parent;
+    bool has_parent;
+};
+
+static bool collect_jobs_with_deps(
+    const Config &cfg,
+    const std::vector<std::string> &roots,
+    std::vector<int> *included,
+    std::string *err
+) {
+    std::vector<StackItem> stack;
+    for (const auto &name : roots) {
+        int idx = find_job_index(cfg, name);
+        if (idx < 0) {
+            *err = "job not found: " + name;
+            return false;
+        }
+        stack.push_back({idx, -1, false});
+    }
+    while (!stack.empty()) {
+        StackItem item = stack.back();
+        stack.pop_back();
+        if ((*included)[item.idx]) continue;
+        const Job &job = cfg.jobs[item.idx];
+        if (job.run_policy == RunPolicy::Off) {
+            if (item.has_parent && item.parent >= 0) {
+                *err = "job disabled (off): " + job.name + " (required by " + cfg.jobs[item.parent].name + ")";
+            } else {
+                *err = "job disabled (off): " + job.name;
+            }
+            return false;
+        }
+        (*included)[item.idx] = 1;
+        for (const auto &dep : job.depends_on) {
+            int dep_idx = find_job_index(cfg, dep);
+            if (dep_idx < 0) {
+                *err = "dependency " + dep + " not found for job " + job.name;
+                return false;
+            }
+            stack.push_back({dep_idx, item.idx, true});
+        }
+    }
+    return true;
+}
+
+static bool topo_sort_jobs(
+    const Config &cfg,
+    const std::vector<int> &included,
+    std::vector<Job> *out,
+    std::string *err
+) {
+    std::vector<int> indegree(cfg.jobs.size(), 0);
+    std::vector<int> processed(cfg.jobs.size(), 0);
+    size_t subset_count = 0;
+    for (size_t i = 0; i < cfg.jobs.size(); i++) {
+        if (!included[i]) continue;
+        subset_count++;
+        for (const auto &dep : cfg.jobs[i].depends_on) {
+            int dep_idx = find_job_index(cfg, dep);
+            if (dep_idx < 0 || !included[dep_idx]) {
+                *err = "dependency " + dep + " not found for job " + cfg.jobs[i].name;
+                return false;
+            }
+            indegree[i]++;
+        }
+    }
+    out->clear();
+    while (out->size() < subset_count) {
+        bool found = false;
+        for (size_t i = 0; i < cfg.jobs.size(); i++) {
+            if (!included[i] || processed[i]) continue;
+            if (indegree[i] != 0) continue;
+            out->push_back(cfg.jobs[i]);
+            processed[i] = 1;
+            found = true;
+            for (size_t j = 0; j < cfg.jobs.size(); j++) {
+                if (!included[j] || processed[j]) continue;
+                if (job_depends_on(cfg.jobs[j], cfg.jobs[i].name)) {
+                    indegree[j]--;
+                }
+            }
+        }
+        if (!found) {
+            *err = "job dependencies contain a cycle";
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool init_timevault(const std::string &mount, const std::string &mount_prefix, const RunMode &mode, bool force_init, std::string *err) {
     if (mount.empty()) {
         *err = "mount path is empty";
@@ -481,7 +776,9 @@ static bool init_timevault(const std::string &mount, const std::string &mount_pr
         *err = "mount " + std::string(mount_real) + " not found in /etc/fstab";
         return false;
     }
-
+    if (!ensure_unmounted(mount, mode, err)) {
+        return false;
+    }
     if (run_command({"mount", mount}, mode) != 0) {
         *err = "mount " + mount + " failed";
         return false;
@@ -490,8 +787,21 @@ static bool init_timevault(const std::string &mount, const std::string &mount_pr
         *err = "mount " + std::string(mount_real) + " is not mounted";
         return false;
     }
+    track_mount(mount);
     if (run_command({"mount", "-oremount,rw", mount}, mode) != 0) {
         *err = "remount rw " + mount + " failed";
+        return false;
+    }
+    int ro = mount_is_readonly(mount_real);
+    if (ro != 0) {
+        if (ro < 0) {
+            *err = "mount " + std::string(mount_real) + " is not mounted";
+        } else {
+            *err = "mount " + std::string(mount_real) + " is read-only";
+        }
+        run_command({"mount", "-oremount,ro", mount}, mode);
+        run_command({"umount", mount}, mode);
+        untrack_mount(mount);
         return false;
     }
 
@@ -530,6 +840,7 @@ static bool init_timevault(const std::string &mount, const std::string &mount_pr
 
     run_command({"mount", "-oremount,ro", mount}, mode);
     run_command({"umount", mount}, mode);
+    untrack_mount(mount);
 
     return err->empty();
 }
@@ -548,6 +859,19 @@ static void format_day(char *buf, size_t len, time_t t) {
 
 static void backup_jobs(const std::vector<Job> &jobs, const std::vector<std::string> &rsync_extra, const RunMode &mode, const std::string &mount_prefix) {
     for (const auto &job : jobs) {
+        bool job_locked = false;
+        if (!mode.dry_run) {
+            int lock_rc = lock_file();
+            if (lock_rc == 0) {
+                std::printf("timevault is already running\n");
+                std::exit(3);
+            }
+            if (lock_rc < 0) {
+                std::printf("failed to lock %s: %s (need write permission; try sudo or adjust permissions)\n", LOCK_FILE, std::strerror(errno));
+                std::exit(2);
+            }
+            job_locked = true;
+        }
         if (mode.verbose) {
             const char *policy = job.run_policy == RunPolicy::Auto ? "auto" : (job.run_policy == RunPolicy::Demand ? "demand" : "off");
             std::printf("job: %s\n", job.name.c_str());
@@ -567,7 +891,7 @@ static void backup_jobs(const std::vector<Job> &jobs, const std::vector<std::str
             mkdir(tmp_dir, 0755);
         }
         char excludes_path[PATH_MAX];
-        std::snprintf(excludes_path, sizeof(excludes_path), "%s/gbackup.excludes", tmp_dir);
+        std::snprintf(excludes_path, sizeof(excludes_path), "%s/timevault.excludes", tmp_dir);
         if (mode.dry_run) {
             std::printf("dry-run: would write excludes file %s\n", excludes_path);
         } else {
@@ -583,16 +907,41 @@ static void backup_jobs(const std::vector<Job> &jobs, const std::vector<std::str
 
         if (job.mount.empty()) {
             std::printf("skip job %s: mount is required for all jobs\n", job.name.c_str());
+            if (job_locked) unlock_file();
+            continue;
+        }
+        std::string err;
+        if (!ensure_unmounted(job.mount, mode, &err)) {
+            std::printf("skip job %s: %s\n", job.name.c_str(), err.c_str());
+            if (job_locked) unlock_file();
             continue;
         }
         run_command({"mount", job.mount}, mode);
+        if (mount_is_mounted(job.mount)) {
+            track_mount(job.mount);
+        }
         run_command({"mount", "-oremount,rw", job.mount}, mode);
 
-        std::string err;
+        int ro = mount_is_readonly(job.mount);
+        if (ro != 0) {
+            if (ro < 0) {
+                std::printf("skip job %s: mount %s is not mounted\n", job.name.c_str(), job.mount.c_str());
+            } else {
+                std::printf("skip job %s: mount %s is read-only\n", job.name.c_str(), job.mount.c_str());
+            }
+            run_command({"mount", "-oremount,ro", job.mount}, mode);
+            run_command({"umount", job.mount}, mode);
+            untrack_mount(job.mount);
+            if (job_locked) unlock_file();
+            continue;
+        }
+
         if (!verify_destination(job, mount_prefix, &err)) {
             std::printf("skip job %s: %s\n", job.name.c_str(), err.c_str());
             run_command({"mount", "-oremount,ro", job.mount}, mode);
             run_command({"umount", job.mount}, mode);
+            untrack_mount(job.mount);
+            if (job_locked) unlock_file();
             continue;
         }
 
@@ -663,6 +1012,8 @@ static void backup_jobs(const std::vector<Job> &jobs, const std::vector<std::str
 
         run_command({"mount", "-oremount,ro", job.mount}, mode);
         run_command({"umount", job.mount}, mode);
+        untrack_mount(job.mount);
+        if (job_locked) unlock_file();
     }
 }
 
@@ -673,9 +1024,21 @@ int main(int argc, char **argv) {
     bool force_init = false;
     std::vector<std::string> rsync_extra;
     std::vector<std::string> selected_jobs;
+    bool print_order = false;
+    bool show_version = false;
+    bool have_lock = false;
+    bool rsync_passthrough = false;
+
+    std::atexit(cleanup_mounts);
+    std::signal(SIGINT, handle_signal);
+    std::signal(SIGTERM, handle_signal);
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
+        if (rsync_passthrough) {
+            rsync_extra.push_back(arg);
+            continue;
+        }
         if (arg == "--backup") {
             continue;
         } else if (arg == "--dry-run") {
@@ -713,19 +1076,26 @@ int main(int argc, char **argv) {
                 return 2;
             }
             selected_jobs.push_back(argv[++i]);
+        } else if (arg == "--print-order") {
+            print_order = true;
+        } else if (arg == "--version") {
+            show_version = true;
+        } else if (arg == "--rsync") {
+            rsync_passthrough = true;
+        } else if (!arg.empty() && arg[0] == '-') {
+            std::printf("unknown option %s\n", arg.c_str());
+            return 2;
         } else {
             rsync_extra.push_back(arg);
         }
     }
 
-    int lock_rc = lock_file();
-    if (lock_rc == 0) {
-        std::printf("gbackup is already running\n");
-        return 3;
-    }
-    if (lock_rc < 0) {
-        std::printf("failed to lock %s: %s (need write permission; try sudo or adjust permissions)\n", LOCK_FILE, std::strerror(errno));
-        return 2;
+    print_banner();
+    if (show_version) {
+        print_copyright();
+        std::printf("Project: %s\n", TIMEVAULT_PROJECT_URL);
+        std::printf("License: %s\n", TIMEVAULT_LICENSE);
+        return 0;
     }
 
     char timebuf[64];
@@ -733,24 +1103,36 @@ int main(int argc, char **argv) {
     std::printf("%s\n", timebuf);
 
     if (!init_mount.empty()) {
+        if (!mode.dry_run && !print_order) {
+            int lock_rc = lock_file();
+            if (lock_rc == 0) {
+                std::printf("timevault is already running\n");
+                return 3;
+            }
+            if (lock_rc < 0) {
+                std::printf("failed to lock %s: %s (need write permission; try sudo or adjust permissions)\n", LOCK_FILE, std::strerror(errno));
+                return 2;
+            }
+            have_lock = true;
+        }
         Config cfg;
         std::string err;
         std::string mount_prefix;
         if (access(config_path.c_str(), F_OK) == 0) {
             if (!parse_config(config_path, &cfg, &err)) {
                 std::printf("failed to load config %s: %s\n", config_path.c_str(), err.c_str());
-                unlock_file();
+                if (have_lock) unlock_file();
                 return 2;
             }
             mount_prefix = cfg.mount_prefix;
         }
         if (!init_timevault(init_mount, mount_prefix, mode, force_init, &err)) {
             std::printf("init failed: %s\n", err.c_str());
-            unlock_file();
+            if (have_lock) unlock_file();
             return 2;
         }
         std::printf("initialized timevault at %s\n", init_mount.c_str());
-        unlock_file();
+        if (have_lock) unlock_file();
         format_time(timebuf, sizeof(timebuf), std::time(nullptr));
         std::printf("%s\n", timebuf);
         return 0;
@@ -760,36 +1142,59 @@ int main(int argc, char **argv) {
     std::string err;
     if (!parse_config(config_path, &cfg, &err)) {
         std::printf("failed to load config %s: %s\n", config_path.c_str(), err.c_str());
-        unlock_file();
+        if (have_lock) unlock_file();
         return 2;
     }
+    if (!validate_job_names(cfg, &err)) {
+        std::printf("failed to load config %s: %s\n", config_path.c_str(), err.c_str());
+        if (have_lock) unlock_file();
+        return 2;
+    }
+    if (!cfg.jobs.empty()) {
+        std::vector<int> all_included(cfg.jobs.size(), 1);
+        std::vector<Job> ordered;
+        if (!topo_sort_jobs(cfg, all_included, &ordered, &err)) {
+            std::printf("failed to load config %s: %s\n", config_path.c_str(), err.c_str());
+            if (have_lock) unlock_file();
+            return 2;
+        }
+    }
 
-    std::vector<Job> jobs_to_run;
+    std::vector<std::string> roots;
     if (selected_jobs.empty()) {
         for (const auto &job : cfg.jobs) {
-            if (job.run_policy == RunPolicy::Auto) jobs_to_run.push_back(job);
+            if (job.run_policy == RunPolicy::Auto) {
+                roots.push_back(job.name);
+            }
         }
     } else {
-        std::unordered_map<std::string, Job> by_name;
-        for (const auto &job : cfg.jobs) by_name[job.name] = job;
         std::unordered_set<std::string> seen;
         for (const auto &name : selected_jobs) {
-            if (!seen.insert(name).second) continue;
-            auto it = by_name.find(name);
-            if (it == by_name.end()) {
-                std::printf("job not found: %s\n", name.c_str());
-                std::printf("no such job(s) found; aborting\n");
-                unlock_file();
-                return 2;
+            if (seen.insert(name).second) {
+                roots.push_back(name);
             }
-            if (it->second.run_policy == RunPolicy::Off) {
-                std::printf("job disabled (off): %s\n", name.c_str());
-                std::printf("requested job(s) are disabled; aborting\n");
-                unlock_file();
-                return 2;
-            }
-            jobs_to_run.push_back(it->second);
         }
+    }
+    std::vector<int> included(cfg.jobs.size(), 0);
+    err.clear();
+    if (!collect_jobs_with_deps(cfg, roots, &included, &err)) {
+        if (err.rfind("job not found:", 0) == 0) {
+            std::printf("%s\n", err.c_str());
+            std::printf("no such job(s) found; aborting\n");
+        } else if (err.rfind("job disabled (off):", 0) == 0) {
+            std::printf("%s\n", err.c_str());
+            std::printf("requested job(s) are disabled; aborting\n");
+        } else {
+            std::printf("dependency order failed: %s\n", err.c_str());
+        }
+        if (have_lock) unlock_file();
+        return 2;
+    }
+    std::vector<Job> jobs_to_run;
+    if (!topo_sort_jobs(cfg, included, &jobs_to_run, &err)) {
+        std::printf("dependency order failed: %s\n", err.c_str());
+        if (have_lock) unlock_file();
+        return 2;
     }
 
     if (jobs_to_run.empty()) {
@@ -798,8 +1203,15 @@ int main(int argc, char **argv) {
         } else {
             std::printf("no jobs matched selection; aborting\n");
         }
-        unlock_file();
+        if (have_lock) unlock_file();
         return 2;
+    }
+    if (print_order) {
+        for (const auto &job : jobs_to_run) {
+            print_job_details(job);
+        }
+        if (have_lock) unlock_file();
+        return 0;
     }
 
     if (mode.verbose) {
@@ -811,7 +1223,7 @@ int main(int argc, char **argv) {
 
     backup_jobs(jobs_to_run, rsync_extra, mode, cfg.mount_prefix);
 
-    unlock_file();
+    if (have_lock) unlock_file();
     if (!mode.dry_run) {
         run_command({"sync"}, mode);
     }

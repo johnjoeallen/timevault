@@ -1,24 +1,41 @@
-use chrono::{Duration, Local};
-use std::env;
 use std::collections::HashSet;
-use std::fs;
-use std::fs::File;
+use std::env;
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::symlink;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
+use std::thread;
 use walkdir::WalkDir;
 use serde::Deserialize;
+use chrono::{Duration, Local};
+use signal_hook::consts::signal::{SIGINT, SIGTERM};
+use signal_hook::iterator::Signals;
 
-const LOCK_FILE: &str = "/var/run/gbackup.pid";
+const LOCK_FILE: &str = "/var/run/timevault.pid";
 const CONFIG_FILE: &str = "/etc/timevault.yaml";
 const TIMEVAULT_MARKER: &str = ".timevault";
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+const LICENSE_NAME: &str = "GNU GPL v3 or later";
+const COPYRIGHT: &str = "Copyright (C) 2025 John Allen (john.joe.allen@gmail.com)";
+const PROJECT_URL: &str = "https://github.com/johnjoeallen/timevault";
+
+type MountTracker = Arc<Mutex<HashSet<String>>>;
 
 #[derive(Debug, Clone, Copy)]
 struct RunMode {
     dry_run: bool,
     safe_mode: bool,
     verbose: bool,
+}
+
+struct LockGuard;
+
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        let _ = unlock();
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -30,6 +47,7 @@ struct Job {
     mount: Option<String>,
     run_policy: RunPolicy,
     excludes: Vec<String>,
+    depends_on: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +78,8 @@ struct JobConfig {
     run: String,
     #[serde(default)]
     excludes: Vec<String>,
+    #[serde(default)]
+    depends_on: Vec<String>,
 }
 
 fn default_run_policy() -> String {
@@ -67,24 +87,47 @@ fn default_run_policy() -> String {
 }
 
 fn lock() -> io::Result<bool> {
-    let pid = fs::read_to_string(LOCK_FILE).ok();
-    if let Some(pid) = pid {
-        let pid = pid.trim();
-        if !pid.is_empty() && Path::new("/proc").join(pid).exists() {
-            return Ok(false);
+    for _ in 0..3 {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(LOCK_FILE)
+        {
+            Ok(mut f) => {
+                writeln!(f, "{}", std::process::id())?;
+                return Ok(true);
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                let pid = match fs::read_to_string(LOCK_FILE) {
+                    Ok(text) => text.trim().parse::<u32>().ok(),
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                    Err(err) => return Err(err),
+                };
+                if let Some(pid) = pid {
+                    if Path::new("/proc").join(pid.to_string()).exists() {
+                        return Ok(false);
+                    }
+                }
+                match fs::remove_file(LOCK_FILE) {
+                    Ok(()) => continue,
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                    Err(err) => return Err(err),
+                }
+            }
+            Err(err) => return Err(err),
         }
     }
-
-    let mut f = File::create(LOCK_FILE)?;
-    writeln!(f, "{}", std::process::id())?;
-    Ok(true)
+    Ok(false)
 }
 
 fn unlock() -> io::Result<()> {
     let pid = fs::read_to_string(LOCK_FILE).ok();
     if let Some(pid) = pid {
         let pid = pid.trim();
-        if !pid.is_empty() && Path::new("/proc").join(pid).exists() {
+        if !pid.is_empty()
+            && pid == std::process::id().to_string()
+            && Path::new("/proc").join(pid).exists()
+        {
             let _ = fs::remove_file(LOCK_FILE);
         }
     }
@@ -173,10 +216,94 @@ fn parse_config_yaml(path: &str) -> io::Result<(Vec<Job>, Option<String>)> {
             mount: job.mount,
             run_policy,
             excludes,
+            depends_on: job.depends_on,
         });
     }
 
+    if let Err(err) = validate_dependencies(&jobs) {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, err));
+    }
     Ok((jobs, mount_prefix))
+}
+
+fn validate_dependencies(jobs: &[Job]) -> Result<(), String> {
+    let mut names = HashSet::new();
+    for job in jobs {
+        if !names.insert(job.name.clone()) {
+            return Err(format!("duplicate job name {}", job.name));
+        }
+    }
+    for job in jobs {
+        for dep in &job.depends_on {
+            if dep == &job.name {
+                return Err(format!("job {} depends on itself", job.name));
+            }
+            if !names.contains(dep) {
+                return Err(format!(
+                    "job {} depends on missing job {}",
+                    job.name, dep
+                ));
+            }
+        }
+    }
+    let _ = topo_sort_jobs(jobs.to_vec())?;
+    Ok(())
+}
+
+fn topo_sort_jobs(jobs: Vec<Job>) -> Result<Vec<Job>, String> {
+    let mut by_name = std::collections::HashMap::new();
+    let mut order = Vec::new();
+    for job in jobs {
+        if by_name.contains_key(&job.name) {
+            return Err(format!("duplicate job name {}", job.name));
+        }
+        order.push(job.name.clone());
+        by_name.insert(job.name.clone(), job);
+    }
+    let mut indegree: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut dependents: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    for name in &order {
+        indegree.insert(name.clone(), 0);
+    }
+    for name in &order {
+        let job = by_name
+            .get(name)
+            .ok_or_else(|| format!("missing job {}", name))?;
+        for dep in &job.depends_on {
+            if !by_name.contains_key(dep) {
+                return Err(format!("job {} depends on missing job {}", name, dep));
+            }
+            *indegree.entry(name.clone()).or_insert(0) += 1;
+            dependents.entry(dep.clone()).or_default().push(name.clone());
+        }
+    }
+    let mut queue = std::collections::VecDeque::new();
+    for name in &order {
+        if indegree.get(name).copied().unwrap_or(0) == 0 {
+            queue.push_back(name.clone());
+        }
+    }
+    let mut out = Vec::new();
+    while let Some(name) = queue.pop_front() {
+        let job = by_name
+            .remove(&name)
+            .ok_or_else(|| format!("missing job {}", name))?;
+        out.push(job);
+        if let Some(children) = dependents.get(&name) {
+            for child in children {
+                if let Some(count) = indegree.get_mut(child) {
+                    *count -= 1;
+                    if *count == 0 {
+                        queue.push_back(child.clone());
+                    }
+                }
+            }
+        }
+    }
+    if out.len() != order.len() {
+        return Err("job dependencies contain a cycle".to_string());
+    }
+    Ok(out)
 }
 
 fn parse_run_policy(value: &str) -> Result<RunPolicy, String> {
@@ -280,6 +407,7 @@ fn init_timevault(
     mount_prefix: Option<&str>,
     run_mode: RunMode,
     force_init: bool,
+    mounts: &MountTracker,
 ) -> Result<(), String> {
     if mount.trim().is_empty() {
         return Err("mount path is empty".to_string());
@@ -312,6 +440,7 @@ fn init_timevault(
         println!("mount is present in /etc/fstab");
     }
 
+    ensure_unmounted(mount, &mount_canonical, run_mode, mounts)?;
     let mut cmd = Command::new("mount");
     cmd.arg(mount);
     let _ =
@@ -323,6 +452,7 @@ fn init_timevault(
             mount_canonical.display()
         ));
     }
+    track_mount(mount, mounts);
     if run_mode.verbose {
         println!("mount is active");
     }
@@ -336,6 +466,9 @@ fn init_timevault(
     }
 
     let result = (|| {
+        if mount_is_readonly(&mount_canonical)? {
+            return Err(format!("mount {} is read-only", mount_canonical.display()));
+        }
         let mut is_empty = true;
         for entry in fs::read_dir(&mount_canonical).map_err(|e| {
             format!(
@@ -383,6 +516,7 @@ fn init_timevault(
     let mut cmd = Command::new("umount");
     cmd.arg(mount);
     let _ = run_command(&mut cmd, run_mode).map_err(|e| format!("umount {}: {}", mount, e))?;
+    untrack_mount(mount, mounts);
     result?;
 
     Ok(())
@@ -401,6 +535,63 @@ fn mount_is_mounted(mount: &Path) -> Result<bool, String> {
         }
     }
     Ok(false)
+}
+
+fn mount_is_readonly(mount: &Path) -> Result<bool, String> {
+    let contents =
+        fs::read_to_string("/proc/mounts").map_err(|e| format!("read /proc/mounts: {}", e))?;
+    for line in contents.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 4 {
+            continue;
+        }
+        if Path::new(fields[1]) == mount {
+            let mut opts = fields[3].split(',');
+            return Ok(opts.any(|opt| opt == "ro"));
+        }
+    }
+    Err(format!("mount {} is not mounted", mount.display()))
+}
+
+fn ensure_unmounted(
+    mount: &str,
+    mount_path: &Path,
+    run_mode: RunMode,
+    mounts: &MountTracker,
+) -> Result<(), String> {
+    let is_mounted = mount_is_mounted(mount_path)?;
+    if !is_mounted {
+        if run_mode.verbose {
+            println!("mount not active, skip umount: {}", mount);
+        }
+        return Ok(());
+    }
+    if run_mode.verbose {
+        println!("unmounting {}", mount);
+    }
+    let mut cmd = Command::new("umount");
+    cmd.arg(mount);
+    let rc = run_command(&mut cmd, run_mode).map_err(|e| format!("umount {}: {}", mount, e))?;
+    if rc != 0 {
+        return Err(format!("umount {} failed with exit code {}", mount, rc));
+    }
+    if mount_is_mounted(mount_path)? {
+        return Err(format!("umount {} did not detach", mount));
+    }
+    untrack_mount(mount, mounts);
+    Ok(())
+}
+
+fn track_mount(mount: &str, mounts: &MountTracker) {
+    if let Ok(mut set) = mounts.lock() {
+        set.insert(mount.to_string());
+    }
+}
+
+fn untrack_mount(mount: &str, mounts: &MountTracker) {
+    if let Ok(mut set) = mounts.lock() {
+        set.remove(mount);
+    }
 }
 
 fn mount_in_fstab(mount: &Path) -> Result<bool, String> {
@@ -522,13 +713,72 @@ fn run_nice_ionice(args: &[String], run_mode: RunMode) -> io::Result<i32> {
     }
 }
 
+fn print_banner() {
+    println!("TimeVault {}", VERSION);
+}
+
+fn print_copyright() {
+    println!("{}", COPYRIGHT);
+}
+
+fn acquire_lock_for_job(run_mode: RunMode) -> io::Result<Option<LockGuard>> {
+    if run_mode.dry_run {
+        return Ok(None);
+    }
+    match lock() {
+        Ok(true) => Ok(Some(LockGuard)),
+        Ok(false) => Err(io::Error::new(
+            io::ErrorKind::Other,
+            "timevault is already running",
+        )),
+        Err(e) => Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("failed to lock {}: {}", LOCK_FILE, e),
+        )),
+    }
+}
+
+fn run_policy_label(policy: RunPolicy) -> &'static str {
+    match policy {
+        RunPolicy::Auto => "auto",
+        RunPolicy::Demand => "demand",
+        RunPolicy::Off => "off",
+    }
+}
+
+fn print_job_details(job: &Job) {
+    let depends = if job.depends_on.is_empty() {
+        "<none>".to_string()
+    } else {
+        job.depends_on.join(", ")
+    };
+    let excludes = if job.excludes.is_empty() {
+        "<none>".to_string()
+    } else {
+        job.excludes.join(", ")
+    };
+    println!("job: {}", job.name);
+    println!("  source: {}", job.source);
+    println!("  dest: {}", job.dest);
+    println!("  copies: {}", job.copies);
+    println!(
+        "  mount: {}",
+        job.mount.as_deref().unwrap_or("<unset>")
+    );
+    println!("  run: {}", run_policy_label(job.run_policy));
+    println!("  depends_on: {}", depends);
+    println!("  excludes: {}", excludes);
+}
+
 fn backup(
     jobs: Vec<Job>,
     rsync_extra: &[String],
     run_mode: RunMode,
     mount_prefix: Option<&str>,
+    mounts: &MountTracker,
 ) -> io::Result<()> {
     for job in jobs {
+        let _lock = acquire_lock_for_job(run_mode)?;
         if run_mode.verbose {
             let policy = match job.run_policy {
                 RunPolicy::Auto => "auto",
@@ -551,7 +801,7 @@ fn backup(
         if !run_mode.dry_run {
             fs::create_dir_all(&tmp_dir)?;
         }
-        let excludes_file = tmp_dir.join("gbackup.excludes");
+        let excludes_file = tmp_dir.join("timevault.excludes");
         if run_mode.dry_run {
             println!("dry-run: would write excludes file {}", excludes_file.display());
         } else {
@@ -570,13 +820,32 @@ fn backup(
                 continue;
             }
         };
+        let mount_path = Path::new(mount);
+        if let Err(err) = ensure_unmounted(mount, mount_path, run_mode, mounts) {
+            println!("skip job {}: {}", job.name, err);
+            continue;
+        }
         let mut cmd = Command::new("mount");
         cmd.arg(mount);
         let _ = run_command(&mut cmd, run_mode);
+        if let Ok(true) = mount_is_mounted(mount_path) {
+            track_mount(mount, mounts);
+        }
 
         let mut cmd = Command::new("mount");
         cmd.arg("-oremount,rw").arg(mount);
         let _ = run_command(&mut cmd, run_mode);
+        if let Ok(true) = mount_is_readonly(mount_path) {
+            println!("skip job {}: mount {} is read-only", job.name, mount);
+            let mut cmd = Command::new("mount");
+            cmd.arg("-oremount,ro").arg(mount);
+            let _ = run_command(&mut cmd, run_mode);
+            let mut cmd = Command::new("umount");
+            cmd.arg(mount);
+            let _ = run_command(&mut cmd, run_mode);
+            untrack_mount(mount, mounts);
+            continue;
+        }
 
         let dest = match verify_destination(&job, mount_prefix) {
             Ok(dest) => dest,
@@ -585,6 +854,10 @@ fn backup(
                 let mut cmd = Command::new("mount");
                 cmd.arg("-oremount,ro").arg(mount);
                 let _ = run_command(&mut cmd, run_mode);
+                let mut cmd = Command::new("umount");
+                cmd.arg(mount);
+                let _ = run_command(&mut cmd, run_mode);
+                untrack_mount(mount, mounts);
                 continue;
             }
         };
@@ -666,11 +939,37 @@ fn backup(
         let mut cmd = Command::new("umount");
         cmd.arg(mount);
         let _ = run_command(&mut cmd, run_mode);
+        untrack_mount(mount, mounts);
     }
     Ok(())
 }
 
 fn main() -> io::Result<()> {
+    let mounts: MountTracker = Arc::new(Mutex::new(HashSet::new()));
+    let mounts_for_signals = Arc::clone(&mounts);
+    thread::spawn(move || {
+        let mut signals = match Signals::new([SIGINT, SIGTERM]) {
+            Ok(signals) => signals,
+            Err(err) => {
+                eprintln!("signal handler setup failed: {}", err);
+                return;
+            }
+        };
+        for _ in signals.forever() {
+            let mut list: Vec<String> = match mounts_for_signals.lock() {
+                Ok(set) => set.iter().cloned().collect(),
+                Err(_) => Vec::new(),
+            };
+            list.sort_by_key(|m| std::cmp::Reverse(m.len()));
+            for mount in list {
+                let mut cmd = Command::new("umount");
+                cmd.arg(&mount);
+                let _ = cmd.status();
+            }
+            std::process::exit(1);
+        }
+    });
+
     let mut rsync_extra = Vec::new();
     let mut run_mode = RunMode {
         dry_run: false,
@@ -681,8 +980,15 @@ fn main() -> io::Result<()> {
     let mut init_mount: Option<String> = None;
     let mut force_init = false;
     let mut selected_jobs: Vec<String> = Vec::new();
+    let mut print_order = false;
+    let mut show_version = false;
+    let mut rsync_passthrough = false;
     let mut args = env::args().skip(1).peekable();
     while let Some(arg) = args.next() {
+        if rsync_passthrough {
+            rsync_extra.push(arg);
+            continue;
+        }
         if arg == "--backup" {
             continue;
         } else if arg == "--dry-run" {
@@ -737,27 +1043,52 @@ fn main() -> io::Result<()> {
                 }
             }
             continue;
+        } else if arg == "--print-order" {
+            print_order = true;
+            continue;
+        } else if arg == "--version" {
+            show_version = true;
+            continue;
+        } else if arg == "--rsync" {
+            rsync_passthrough = true;
+            continue;
+        }
+        if arg.starts_with('-') {
+            println!("unknown option {}", arg);
+            std::process::exit(2);
         }
         rsync_extra.push(arg);
     }
 
-    match lock() {
-        Ok(true) => {}
-        Ok(false) => {
-            println!("gbackup is already running");
-            std::process::exit(3);
-        }
-        Err(e) => {
-            println!(
-                "failed to lock {}: {} (need write permission; try sudo or adjust permissions)",
-                LOCK_FILE, e
-            );
-            std::process::exit(2);
-        }
+    print_banner();
+    if show_version {
+        print_copyright();
+        println!("Project: {}", PROJECT_URL);
+        println!("License: {}", LICENSE_NAME);
+        return Ok(());
     }
 
+    let mut have_lock = false;
     println!("{}", Local::now().format("%d-%m-%Y %H:%M"));
     if let Some(mount) = init_mount {
+        if !run_mode.dry_run && !print_order {
+            match lock() {
+                Ok(true) => {
+                    have_lock = true;
+                }
+                Ok(false) => {
+                    println!("timevault is already running");
+                    std::process::exit(3);
+                }
+                Err(e) => {
+                    println!(
+                        "failed to lock {}: {} (need write permission; try sudo or adjust permissions)",
+                        LOCK_FILE, e
+                    );
+                    std::process::exit(2);
+                }
+            }
+        }
         if run_mode.verbose {
             println!("init requested for mount {}", mount);
         }
@@ -765,21 +1096,33 @@ fn main() -> io::Result<()> {
             Ok(prefix) => prefix,
             Err(e) => {
                 println!("failed to load config {}: {}", config_path, e);
-                let _ = unlock();
+                if have_lock {
+                    let _ = unlock();
+                }
                 std::process::exit(2);
             }
         };
-        match init_timevault(&mount, mount_prefix.as_deref(), run_mode, force_init) {
+        match init_timevault(
+            &mount,
+            mount_prefix.as_deref(),
+            run_mode,
+            force_init,
+            &mounts,
+        ) {
             Ok(()) => {
                 println!("initialized timevault at {}", mount);
             }
             Err(e) => {
                 println!("init failed: {}", e);
-                let _ = unlock();
+                if have_lock {
+                    let _ = unlock();
+                }
                 std::process::exit(2);
             }
         }
-        let _ = unlock();
+        if have_lock {
+            let _ = unlock();
+        }
         println!("{}", Local::now().format("%d-%m-%Y %H:%M"));
         return Ok(());
     }
@@ -788,69 +1131,130 @@ fn main() -> io::Result<()> {
         Ok(cfg) => cfg,
         Err(e) => {
             println!("failed to load config {}: {}", config_path, e);
-            let _ = unlock();
+            if have_lock {
+                let _ = unlock();
+            }
             std::process::exit(2);
         }
     };
 
     let (jobs, mount_prefix) = config;
     let selected_set: HashSet<String> = selected_jobs.iter().cloned().collect();
-    let (jobs_to_run, missing_jobs, off_jobs) = if selected_set.is_empty() {
-        let jobs_to_run: Vec<Job> = jobs
-            .into_iter()
-            .filter(|j| j.run_policy == RunPolicy::Auto)
-            .collect();
-        (jobs_to_run, Vec::new(), Vec::new())
-    } else {
-        let mut by_name = std::collections::HashMap::new();
-        for job in jobs {
-            by_name.insert(job.name.clone(), job);
-        }
-        let mut out = Vec::new();
+    let mut jobs_by_name = std::collections::HashMap::new();
+    for job in &jobs {
+        jobs_by_name.insert(job.name.clone(), job.clone());
+    }
+    if !selected_set.is_empty() {
         let mut missing = Vec::new();
-        let mut off = Vec::new();
         let mut seen = HashSet::new();
         for name in &selected_jobs {
             if !seen.insert(name.clone()) {
                 continue;
             }
-            match by_name.remove(name) {
-                Some(job) => {
-                    if job.run_policy == RunPolicy::Off {
-                        off.push(name.clone());
-                    } else {
-                        out.push(job);
-                    }
-                }
-                None => missing.push(name.clone()),
+            if !jobs_by_name.contains_key(name) {
+                missing.push(name.clone());
             }
         }
-        (out, missing, off)
+        if !missing.is_empty() {
+            for name in &missing {
+                println!("job not found: {}", name);
+            }
+            println!("no such job(s) found; aborting");
+            if have_lock {
+                let _ = unlock();
+            }
+            std::process::exit(2);
+        }
+    }
+    let mut roots = Vec::new();
+    if selected_set.is_empty() {
+        for job in &jobs {
+            if job.run_policy == RunPolicy::Auto {
+                roots.push(job.name.clone());
+            }
+        }
+    } else {
+        let mut seen = HashSet::new();
+        for name in &selected_jobs {
+            if seen.insert(name.clone()) {
+                roots.push(name.clone());
+            }
+        }
+    }
+    let mut included = HashSet::new();
+    let mut stack: Vec<(String, Option<String>)> =
+        roots.into_iter().map(|n| (n, None)).collect();
+    while let Some((name, parent)) = stack.pop() {
+        if included.contains(&name) {
+            continue;
+        }
+        let job = match jobs_by_name.get(&name) {
+            Some(job) => job,
+            None => {
+                println!("job not found: {}", name);
+                if have_lock {
+                    let _ = unlock();
+                }
+                std::process::exit(2);
+            }
+        };
+        if job.run_policy == RunPolicy::Off {
+            if let Some(parent) = parent {
+                println!("job disabled (off): {} (required by {})", name, parent);
+            } else {
+                println!("job disabled (off): {}", name);
+            }
+            println!("requested job(s) are disabled; aborting");
+            if have_lock {
+                let _ = unlock();
+            }
+            std::process::exit(2);
+        }
+        included.insert(name.clone());
+        for dep in &job.depends_on {
+            if !jobs_by_name.contains_key(dep) {
+                println!("dependency {} not found for job {}", dep, job.name);
+                if have_lock {
+                    let _ = unlock();
+                }
+                std::process::exit(2);
+            }
+            stack.push((dep.clone(), Some(job.name.clone())));
+        }
+    }
+    let selected_jobs_vec: Vec<Job> = jobs
+        .into_iter()
+        .filter(|job| included.contains(&job.name))
+        .collect();
+    let jobs_to_run = match topo_sort_jobs(selected_jobs_vec) {
+        Ok(jobs) => jobs,
+        Err(err) => {
+            println!("dependency order failed: {}", err);
+            if have_lock {
+                let _ = unlock();
+            }
+            std::process::exit(2);
+        }
     };
-    if !missing_jobs.is_empty() {
-        for name in &missing_jobs {
-            println!("job not found: {}", name);
-        }
-        println!("no such job(s) found; aborting");
-        let _ = unlock();
-        std::process::exit(2);
-    }
-    if !off_jobs.is_empty() {
-        for name in &off_jobs {
-            println!("job disabled (off): {}", name);
-        }
-        println!("requested job(s) are disabled; aborting");
-        let _ = unlock();
-        std::process::exit(2);
-    }
     if jobs_to_run.is_empty() {
         if selected_set.is_empty() {
             println!("no jobs matched (no auto jobs enabled); aborting");
         } else {
             println!("no jobs matched selection; aborting");
         }
-        let _ = unlock();
+        if have_lock {
+            let _ = unlock();
+        }
         std::process::exit(2);
+    }
+    if print_order {
+        for job in &jobs_to_run {
+            print_job_details(job);
+        }
+        if have_lock {
+            let _ = unlock();
+        }
+        std::process::exit(0);
     }
     if run_mode.verbose {
         println!(
@@ -862,11 +1266,28 @@ fn main() -> io::Result<()> {
             println!("mount prefix: {}", prefix);
         }
     }
-    if let Err(e) = backup(jobs_to_run, &rsync_extra, run_mode, mount_prefix.as_deref()) {
-        println!("backup failed: {}", e);
+    if let Err(e) = backup(
+        jobs_to_run,
+        &rsync_extra,
+        run_mode,
+        mount_prefix.as_deref(),
+        &mounts,
+    ) {
+        let message = e.to_string();
+        if message == "timevault is already running" {
+            println!("{}", message);
+            std::process::exit(3);
+        }
+        if message.starts_with("failed to lock ") {
+            println!(
+                "{} (need write permission; try sudo or adjust permissions)",
+                message
+            );
+            std::process::exit(2);
+        }
+        println!("backup failed: {}", message);
+        std::process::exit(1);
     }
-
-    let _ = unlock();
     if !run_mode.dry_run {
         let mut sync_cmd = Command::new("sync");
         let _ = run_command(&mut sync_cmd, run_mode);
