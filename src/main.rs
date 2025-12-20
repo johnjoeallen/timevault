@@ -237,6 +237,7 @@ fn validate_dependencies(jobs: &[Job]) -> Result<(), String> {
 fn topo_sort_jobs(jobs: Vec<Job>) -> Result<Vec<Job>, String> {
     let mut by_name = std::collections::HashMap::new();
     let mut order = Vec::new();
+
     for job in jobs {
         if by_name.contains_key(&job.name) {
             return Err(format!("duplicate job name {}", job.name));
@@ -244,12 +245,15 @@ fn topo_sort_jobs(jobs: Vec<Job>) -> Result<Vec<Job>, String> {
         order.push(job.name.clone());
         by_name.insert(job.name.clone(), job);
     }
-    let mut indegree: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+
     let mut dependents: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
-    for name in &order {
-        indegree.insert(name.clone(), 0);
-    }
+
+    let mut indegree: std::collections::HashMap<String, usize> = order
+        .iter()
+        .map(|name| (name.clone(), 0))
+        .collect::<std::collections::HashMap<_, _>>();
+
     for name in &order {
         let job = by_name
             .get(name)
