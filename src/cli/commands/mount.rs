@@ -11,7 +11,7 @@ use crate::mount::inspect::mountpoint_is_mounted;
 use crate::mount::ops::mount_device;
 use crate::util::paths::{create_temp_dir, ensure_base_dir};
 
-pub fn run_mount(config_path: &Path, args: MountArgs, disk_id: Option<&str>) -> Result<()> {
+pub fn run_mount(config_path: &Path, _args: MountArgs, disk_id: Option<&str>) -> Result<()> {
     let cfg = load_config(config_path.to_string_lossy().as_ref())?;
     let disk = match select_disk(&cfg.backup_disks, disk_id) {
         Ok(disk) => disk,
@@ -25,16 +25,8 @@ pub fn run_mount(config_path: &Path, args: MountArgs, disk_id: Option<&str>) -> 
     }
     ensure_disk_not_mounted(&device)?;
 
-    let mountpoint = if let Some(path) = args.mountpoint {
-        if !path.exists() {
-            std::fs::create_dir_all(&path)
-                .map_err(|e| TimevaultError::message(format!("create {}: {}", path.display(), e)))?;
-        }
-        path
-    } else {
-        ensure_base_dir(Path::new(&cfg.user_mount_base))?;
-        create_temp_dir(Path::new(&cfg.user_mount_base), "tv")?
-    };
+    ensure_base_dir(Path::new(&cfg.user_mount_base))?;
+    let mountpoint = create_temp_dir(Path::new(&cfg.user_mount_base), "tv")?;
 
     if mountpoint_is_mounted(&mountpoint)? {
         return Err(DiskError::Other(format!(
@@ -44,7 +36,7 @@ pub fn run_mount(config_path: &Path, args: MountArgs, disk_id: Option<&str>) -> 
         .into());
     }
 
-    let options = mount_options_for_restore(&disk, args.read_write);
+    let options = mount_options_for_restore(&disk);
     mount_device(&device, &mountpoint, &options)?;
     let identity_path = identity_path(&mountpoint);
     if !identity_path.exists() {

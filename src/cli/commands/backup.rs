@@ -104,48 +104,51 @@ pub fn run_backup_command(
         }
     };
 
-    let identity_path = identity_path(&mountpoint);
-    if !identity_path.exists() {
-        drop(disk_guard);
-        exit_for_disk_error(&DiskError::IdentityMismatch(format!(
-            "file missing at {}; expected diskId {} fsUuid {} (run `timevault disk enroll ...`)",
-            identity_path.display(),
-            selected_disk.disk_id,
-            selected_disk.fs_uuid
-        )));
-    }
-    let identity = match read_identity(&identity_path) {
-        Ok(identity) => identity,
-        Err(err) => {
+    if !run_mode.dry_run {
+        let identity_path = identity_path(&mountpoint);
+        if !identity_path.exists() {
             drop(disk_guard);
-            return Err(TimevaultError::message(format!("identity file invalid: {}", err)));
+            exit_for_disk_error(&DiskError::IdentityMismatch(format!(
+                "file missing at {}; expected diskId {} fsUuid {} (run `timevault disk enroll ...`)",
+                identity_path.display(),
+                selected_disk.disk_id,
+                selected_disk.fs_uuid
+            )));
         }
-    };
-    if let Err(err) = verify_identity(&identity, &selected_disk.disk_id, &selected_disk.fs_uuid) {
-        drop(disk_guard);
-        if let TimevaultError::Disk(disk_err) = err {
-            exit_for_disk_error(&disk_err);
+        let identity = match read_identity(&identity_path) {
+            Ok(identity) => identity,
+            Err(err) => {
+                drop(disk_guard);
+                return Err(TimevaultError::message(format!("identity file invalid: {}", err)));
+            }
+        };
+        if let Err(err) = verify_identity(&identity, &selected_disk.disk_id, &selected_disk.fs_uuid)
+        {
+            drop(disk_guard);
+            if let TimevaultError::Disk(disk_err) = err {
+                exit_for_disk_error(&disk_err);
+            }
+            return Err(err);
         }
-        return Err(err);
-    }
 
-    let device = device_path_for_uuid(&selected_disk.fs_uuid);
-    let fs_type = detect_fs_type(device.to_string_lossy().as_ref())?;
-    if !fs_type.is_allowed() {
-        drop(disk_guard);
-        return Err(TimevaultError::Disk(DiskError::Other(format!(
-            "unsupported filesystem type {}",
-            fs_type
-        ))));
-    }
-    if let Some(identity_type) = identity.fs_type {
-        if identity_type != fs_type {
+        let device = device_path_for_uuid(&selected_disk.fs_uuid);
+        let fs_type = detect_fs_type(device.to_string_lossy().as_ref())?;
+        if !fs_type.is_allowed() {
             drop(disk_guard);
-            return Err(TimevaultError::Disk(DiskError::IdentityMismatch(format!(
-                "fsType mismatch: expected {}, got {}",
-                identity_type,
+            return Err(TimevaultError::Disk(DiskError::Other(format!(
+                "unsupported filesystem type {}",
                 fs_type
             ))));
+        }
+        if let Some(identity_type) = identity.fs_type {
+            if identity_type != fs_type {
+                drop(disk_guard);
+                return Err(TimevaultError::Disk(DiskError::IdentityMismatch(format!(
+                    "fsType mismatch: expected {}, got {}",
+                    identity_type,
+                    fs_type
+                ))));
+            }
         }
     }
 

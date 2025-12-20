@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand, Args};
+use clap::{Args, Parser, Subcommand};
 
 #[derive(Parser, Debug)]
 #[command(name = "timevault", disable_help_flag = true, disable_version_flag = true)]
@@ -38,15 +38,15 @@ pub enum Command {
         #[command(subcommand)]
         command: DiskCommand,
     },
-    Mount(MountArgs),
-    Umount(UmountArgs),
 }
 
 #[derive(Subcommand, Debug, Clone)]
 pub enum DiskCommand {
-    Add(DiskAddArgs),
     Enroll(DiskAddArgs),
     Discover,
+    Mount(MountArgs),
+    #[command(alias = "unmount", alias = "umount")]
+    Umount(UmountArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -77,14 +77,8 @@ impl Default for DiskAddArgs {
 
 #[derive(Args, Debug, Clone)]
 pub struct MountArgs {
-    #[arg(long)]
-    pub mountpoint: Option<PathBuf>,
-    #[arg(long)]
-    pub read_write: bool,
 }
 
 #[derive(Args, Debug, Clone)]
 pub struct UmountArgs {
-    #[arg(long)]
-    pub mountpoint: Option<PathBuf>,
 }

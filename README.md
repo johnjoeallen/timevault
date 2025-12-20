@@ -10,7 +10,7 @@ Timevault is a safe, rsync-based backup tool with snapshot rotation. It uses a Y
 - Snapshot rotation with `current` symlink
 - `--dry-run` and `--safe` modes
 - `--job` selection for targeted runs
-- `disk add`/`disk enroll`, `disk discover`, `mount`, `umount` commands for disk lifecycle
+- `disk enroll`, `disk discover`, `mount`, `umount` commands for disk lifecycle
 
 ## Install (Cargo)
 
@@ -84,13 +84,7 @@ timevault backup
 Enroll a disk:
 
 ```bash
-timevault disk add --disk-id primary --fs-uuid <uuid>
-```
-
-Or:
-
-```bash
-timevault --disk-enroll --disk-id primary --fs-uuid <uuid>
+timevault disk enroll --disk-id primary --fs-uuid <uuid>
 ```
 
 Discover candidate disks:
@@ -99,46 +93,28 @@ Discover candidate disks:
 timevault disk discover
 ```
 
-Or:
-
-```bash
-timevault --disk-discover
-```
-
 Run specific jobs:
 
 ```bash
 timevault --job primary --job secondary
 ```
 
-Mount an enrolled disk for restore (read-only by default):
+Mount an enrolled disk for restore (read-only):
 
 ```bash
-timevault mount
+timevault disk mount
 ```
 
 If multiple disks are connected, specify a disk:
 
 ```bash
-timevault mount --disk-id primary
-```
-
-Mount to a specific location (optional):
-
-```bash
-timevault mount --mountpoint /mnt/timevault-restore
-```
-
-Mount read/write (optional):
-
-```bash
-timevault mount --read-write
+timevault disk mount --disk-id primary
 ```
 
 Unmount a restore mount:
 
 ```bash
-timevault umount --mountpoint /mnt/timevault-restore
+timevault disk umount
 ```
 
 Pass rsync options (everything after `--rsync` is forwarded to rsync):

@@ -54,7 +54,7 @@ pub fn run() -> Result<()> {
             &rsync_extra,
         )?,
         Command::Disk { command } => match command {
-            DiskCommand::Add(args) | DiskCommand::Enroll(args) => {
+            DiskCommand::Enroll(args) => {
                 if let Err(err) = disk_add::run_enroll(&config_path, cli.disk_id.as_deref(), args)
                 {
                     exit_for_error(&err);
@@ -65,17 +65,17 @@ pub fn run() -> Result<()> {
                     exit_for_error(&err);
                 }
             }
+            DiskCommand::Mount(args) => {
+                if let Err(err) = mount::run_mount(&config_path, args, cli.disk_id.as_deref()) {
+                    exit_for_error(&err);
+                }
+            }
+            DiskCommand::Umount(args) => {
+                if let Err(err) = umount::run_umount(&config_path, args) {
+                    exit_for_error(&err);
+                }
+            }
         },
-        Command::Mount(args) => {
-            if let Err(err) = mount::run_mount(&config_path, args, cli.disk_id.as_deref()) {
-                exit_for_error(&err);
-            }
-        }
-        Command::Umount(args) => {
-            if let Err(err) = umount::run_umount(&config_path, args) {
-                exit_for_error(&err);
-            }
-        }
     }
 
     Ok(())
@@ -83,8 +83,7 @@ pub fn run() -> Result<()> {
 
 fn parse_cli() -> Result<(Cli, Vec<String>)> {
     let raw: Vec<String> = env::args().collect();
-    let preprocessed = preprocess_args(raw);
-    let (args, rsync_extra) = split_rsync_args(preprocessed);
+    let (args, rsync_extra) = split_rsync_args(raw);
     match Cli::try_parse_from(args) {
         Ok(cli) => Ok((cli, rsync_extra)),
         Err(err) => {
@@ -116,31 +115,6 @@ fn parse_cli() -> Result<(Cli, Vec<String>)> {
             std::process::exit(2);
         }
     }
-}
-
-fn preprocess_args(raw: Vec<String>) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut iter = raw.into_iter();
-    if let Some(bin) = iter.next() {
-        out.push(bin);
-    }
-    for arg in iter {
-        if arg == "--disk-enroll" {
-            out.push("disk".to_string());
-            out.push("enroll".to_string());
-            continue;
-        }
-        if arg == "--disk-discover" {
-            out.push("disk".to_string());
-            out.push("discover".to_string());
-            continue;
-        }
-        if arg == "--backup" {
-            continue;
-        }
-        out.push(arg);
-    }
-    out
 }
 
 fn split_rsync_args(raw: Vec<String>) -> (Vec<String>, Vec<String>) {
@@ -176,13 +150,10 @@ fn print_copyright() {
 fn print_help() {
     println!("Usage:");
     println!("  timevault [backup] [options]");
-    println!("  timevault --disk-discover");
-    println!("  timevault --disk-enroll --disk-id <id> [--fs-uuid <uuid> | --device <path>] [--label <label>] [--mount-options <opts>] [--force]");
-    println!("  timevault disk add --disk-id <id> [--fs-uuid <uuid> | --device <path>] [--label <label>] [--mount-options <opts>] [--force]");
     println!("  timevault disk enroll --disk-id <id> [--fs-uuid <uuid> | --device <path>] [--label <label>] [--mount-options <opts>] [--force]");
     println!("  timevault disk discover");
-    println!("  timevault mount [--disk-id <id>] [--mountpoint <path>] [--read-write]");
-    println!("  timevault umount [--mountpoint <path>]");
+    println!("  timevault disk mount [--disk-id <id>]");
+    println!("  timevault disk umount");
     println!("  timevault --version");
     println!();
     println!("Options:");
@@ -194,13 +165,11 @@ fn print_help() {
     println!("  --print-order          Print resolved job order and exit");
     println!("  --rsync <args...>      Pass remaining args to rsync");
     println!("  --disk-id <id>         Select enrolled backup disk");
-    println!("  --fs-uuid <uuid>       Filesystem UUID (disk add/enroll)");
-    println!("  --device <path>        Block device path (disk add/enroll)");
-    println!("  --label <label>        Optional disk label (disk add/enroll)");
-    println!("  --mount-options <opt>  Mount options (disk add/enroll)");
-    println!("  --force                Force disk add/enroll on non-empty root or existing identity");
-    println!("  --mountpoint <path>    Mountpoint for mount/umount");
-    println!("  --read-write           Mount disk read/write (restore)");
+    println!("  --fs-uuid <uuid>       Filesystem UUID (disk enroll)");
+    println!("  --device <path>        Block device path (disk enroll)");
+    println!("  --label <label>        Optional disk label (disk enroll)");
+    println!("  --mount-options <opt>  Mount options (disk enroll)");
+    println!("  --force                Force disk enroll on non-empty root or existing identity");
 }
 
 fn init_tracing() {

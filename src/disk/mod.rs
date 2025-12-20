@@ -24,14 +24,8 @@ pub fn mount_options_for_backup(disk: &BackupDiskConfig) -> String {
         .unwrap_or_else(|| DEFAULT_BACKUP_MOUNT_OPTS.to_string())
 }
 
-pub fn mount_options_for_restore(disk: &BackupDiskConfig, read_write: bool) -> String {
-    if read_write {
-        disk.mount_options
-            .clone()
-            .unwrap_or_else(|| DEFAULT_BACKUP_MOUNT_OPTS.to_string())
-    } else {
-        DEFAULT_RESTORE_MOUNT_OPTS.to_string()
-    }
+pub fn mount_options_for_restore(_disk: &BackupDiskConfig) -> String {
+    DEFAULT_RESTORE_MOUNT_OPTS.to_string()
 }
 
 pub fn device_path_for_uuid(uuid: &str) -> PathBuf {

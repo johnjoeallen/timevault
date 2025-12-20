@@ -11,10 +11,9 @@ must_have() {
 }
 
 must_have "disk enroll"
-must_have "disk add"
 must_have "disk discover"
-must_have "--disk-enroll"
-must_have "--disk-discover"
+must_have "disk mount"
+must_have "disk umount"
 must_have "--disk-id"
 must_have "--fs-uuid"
 must_have "--device"
