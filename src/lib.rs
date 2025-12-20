@@ -1,24 +1,23 @@
+mod command;
 mod configuration;
 mod data;
+mod mount;
+mod signal_handler;
 use std::{
     collections::HashSet,
     env,
     fs::{self, File},
-    io::{self, Read, Write},
+    io::{self, Error, Read, Write},
     os::unix::fs::symlink,
     path::{Component, Path, PathBuf},
-    process::Command,
     sync::{Arc, Mutex},
-    thread,
 };
 
 use chrono::{Duration, Local};
 
+use command::Mount;
 pub use configuration::{Configuration, RunMode, get_configuration, print_banner, print_copyright};
-use signal_hook::{
-    consts::{SIGINT, SIGTERM},
-    iterator::Signals,
-};
+
 use walkdir::WalkDir;
 
 use crate::data::{Config, Job, JobConfig, LockGuard, MountTracker, RunPolicy, lock, unlock};
@@ -77,7 +76,7 @@ fn validate_job_paths(job: &JobConfig, mount_prefix: Option<&str>) -> Result<(),
 fn parse_config_yaml(path: &PathBuf) -> io::Result<(Vec<Job>, Option<String>)> {
     let mut contents = String::new();
     File::open(path)?.read_to_string(&mut contents)?;
-    let cfg: Config = serde_yaml::from_str(&contents).map_err(io::Error::other)?;
+    let cfg: Config = serde_yaml::from_str(&contents).map_err(Error::other)?;
 
     let global_excludes = cfg.excludes;
     let mount_prefix = cfg.mount_prefix;
@@ -85,13 +84,13 @@ fn parse_config_yaml(path: &PathBuf) -> io::Result<(Vec<Job>, Option<String>)> {
     let mut jobs = Vec::new();
     for job in cfg.jobs {
         let run_policy = parse_run_policy(&job.run).map_err(|e| {
-            io::Error::new(
+            Error::new(
                 io::ErrorKind::InvalidData,
                 format!("job {}: {}", job.name, e),
             )
         })?;
         if let Err(e) = validate_job_paths(&job, mount_prefix.as_deref()) {
-            return Err(io::Error::new(
+            return Err(Error::new(
                 io::ErrorKind::InvalidData,
                 format!("job {}: {}", job.name, e),
             ));
@@ -111,7 +110,7 @@ fn parse_config_yaml(path: &PathBuf) -> io::Result<(Vec<Job>, Option<String>)> {
     }
 
     if let Err(err) = validate_dependencies(&jobs) {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, err));
+        return Err(Error::new(io::ErrorKind::InvalidData, err));
     }
     Ok((jobs, mount_prefix))
 }
@@ -270,7 +269,8 @@ fn verify_destination(job: &Job, mount_prefix: Option<&str>) -> Result<PathBuf, 
     if dest_canonical == mount_canonical {
         return Err("destination must be a subdirectory of mount".to_string());
     }
-    if !mount_is_mounted(&mount_canonical)? {
+
+    if !mount::MountEntry::new(mount_path)?.is_mounted()? {
         return Err(format!(
             "mount {} is not mounted",
             mount_canonical.display()
@@ -331,11 +331,12 @@ fn init_timevault(
     }
 
     ensure_unmounted(mount, &mount_canonical, &run_mode, mounts)?;
-    let mut cmd = Command::new("mount");
-    cmd.arg(mount);
-    let _ = run_command(&mut cmd, &run_mode).map_err(|e| format!("mount {mount:?}: {e}"))?;
 
-    if !mount_is_mounted(&mount_canonical)? {
+    let _ = command::Mount(mount)
+        .run(&run_mode)
+        .map_err(|e| format!("mount {mount:?}: {e}"))?;
+
+    if !mount::MountEntry::new(&mount_canonical)?.is_mounted()? {
         return Err(format!(
             "mount {} is not mounted",
             mount_canonical.display()
@@ -346,15 +347,10 @@ fn init_timevault(
         println!("mount is active");
     }
 
-    let mut cmd = Command::new("mount");
-    cmd.arg("-oremount,rw").arg(mount);
-    let _ = run_command(&mut cmd, &run_mode).map_err(|e| format!("remount rw {mount:?}: {e}"))?;
-    if run_mode.verbose {
-        println!("remounted read/write");
-    }
+    let _ = command::ReMount(mount).run(&run_mode);
 
     let result = (|| {
-        if mount_is_readonly(&mount_canonical)? {
+        if mount::MountEntry::new(&mount_canonical)?.is_readonly()? {
             return Err(format!("mount {} is read-only", mount_canonical.display()));
         }
         let mut is_empty = true;
@@ -394,48 +390,18 @@ fn init_timevault(
         Ok(())
     })();
 
-    let mut cmd = Command::new("mount");
-    cmd.arg("-oremount,ro").arg(mount);
-    let _ = run_command(&mut cmd, &run_mode).map_err(|e| format!("remount ro {mount:?}: {e}"))?;
+    let _ = command::Mount(mount)
+        .run(&run_mode)
+        .map_err(|e| format!("remount ro {mount:?}: {e}"))?;
 
-    let mut cmd = Command::new("umount");
-    cmd.arg(mount);
-    let _ = run_command(&mut cmd, &run_mode).map_err(|e| format!("umount {mount:?}: {e}"))?;
+    let _ = command::UnMount(mount)
+        .run(&run_mode)
+        .map_err(|e| format!("umount {mount:?}: {e}"))?;
+
     untrack_mount(mount, mounts);
     result?;
 
     Ok(())
-}
-
-fn mount_is_mounted(mount: &Path) -> Result<bool, String> {
-    let contents =
-        fs::read_to_string("/proc/mounts").map_err(|e| format!("read /proc/mounts: {e}"))?;
-    for line in contents.lines() {
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        if fields.len() < 2 {
-            continue;
-        }
-        if Path::new(fields[1]) == mount {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-fn mount_is_readonly(mount: &Path) -> Result<bool, String> {
-    let contents =
-        fs::read_to_string("/proc/mounts").map_err(|e| format!("read /proc/mounts: {e}"))?;
-    for line in contents.lines() {
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        if fields.len() < 4 {
-            continue;
-        }
-        if Path::new(fields[1]) == mount {
-            let mut opts = fields[3].split(',');
-            return Ok(opts.any(|opt| opt == "ro"));
-        }
-    }
-    Err(format!("mount {} is not mounted", mount.display()))
 }
 
 fn ensure_unmounted(
@@ -444,7 +410,7 @@ fn ensure_unmounted(
     run_mode: &RunMode,
     mounts: &MountTracker,
 ) -> Result<(), String> {
-    let is_mounted = mount_is_mounted(mount_path)?;
+    let is_mounted = mount::MountEntry::new(mount_path)?.is_mounted()?;
     if !is_mounted {
         if run_mode.verbose {
             println!("mount not active, skip umount: {:?}", mount);
@@ -454,13 +420,16 @@ fn ensure_unmounted(
     if run_mode.verbose {
         println!("unmounting {:?}", mount);
     }
-    let mut cmd = Command::new("umount");
-    cmd.arg(mount);
-    let rc = run_command(&mut cmd, run_mode).map_err(|e| format!("umount {mount:?}: {e}"))?;
+
+    let rc = command::UnMount(mount)
+        .run(run_mode)
+        .map_err(|e| format!("umount {mount:?}: {e}"))?;
+
     if rc != 0 {
         return Err(format!("umount {mount:?} failed with exit code {rc}"));
     }
-    if mount_is_mounted(mount_path)? {
+
+    if mount::MountEntry::new(mount_path)?.is_mounted()? {
         return Err(format!("umount {mount:?} did not detach"));
     }
     untrack_mount(mount, mounts);
@@ -561,54 +530,14 @@ fn delete_symlinks(root: &Path, run_mode: &RunMode) -> io::Result<()> {
     Ok(())
 }
 
-fn maybe_print_command(cmd: &Command, run_mode: &RunMode) {
-    if !run_mode.dry_run && !run_mode.verbose {
-        return;
-    }
-    let program = cmd.get_program().to_string_lossy();
-    let args: Vec<String> = cmd
-        .get_args()
-        .map(|a| a.to_string_lossy().to_string())
-        .collect();
-    println!("{} {}", program, args.join(" "));
-}
-
-fn run_command(cmd: &mut Command, run_mode: &RunMode) -> io::Result<i32> {
-    maybe_print_command(cmd, run_mode);
-    let status = cmd.status()?;
-    Ok(status.code().unwrap_or(1))
-}
-
-fn run_nice_ionice(args: &[String], run_mode: &RunMode) -> io::Result<i32> {
-    let mut cmd = Command::new("nice");
-    cmd.arg("-n")
-        .arg("19")
-        .arg("ionice")
-        .arg("-c")
-        .arg("3")
-        .arg("-n7");
-    for arg in args {
-        cmd.arg(arg);
-    }
-    if run_mode.dry_run {
-        maybe_print_command(&cmd, run_mode);
-        Ok(0)
-    } else {
-        run_command(&mut cmd, run_mode)
-    }
-}
-
 fn acquire_lock_for_job(run_mode: &RunMode) -> io::Result<Option<LockGuard>> {
     if run_mode.dry_run {
         return Ok(None);
     }
     match lock() {
         Ok(true) => Ok(Some(LockGuard)),
-        Ok(false) => Err(io::Error::other("timevault is already running")),
-        Err(e) => Err(io::Error::other(format!(
-            "failed to lock {}: {}",
-            LOCK_FILE, e
-        ))),
+        Ok(false) => Err(Error::other("timevault is already running")),
+        Err(e) => Err(Error::other(format!("failed to lock {}: {}", LOCK_FILE, e))),
     }
 }
 
@@ -647,7 +576,7 @@ fn backup(
     run_mode: &RunMode,
     mount_prefix: Option<&str>,
     mounts: &MountTracker,
-) -> io::Result<()> {
+) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
     for job in jobs {
         let _lock = acquire_lock_for_job(run_mode)?;
         if run_mode.verbose {
@@ -683,7 +612,7 @@ fn backup(
             .format("%Y%m%d")
             .to_string();
         if run_mode.verbose {
-            println!("  backup day: {}", backup_day);
+            println!("backup day: {}", backup_day);
         }
 
         let Some(mount) = job.mount.clone() else {
@@ -695,24 +624,19 @@ fn backup(
             println!("skip job {}: {err}", job.name);
             continue;
         }
-        let mut cmd = Command::new("mount");
-        cmd.arg(mount.clone());
-        let _ = run_command(&mut cmd, run_mode);
-        if let Ok(true) = mount_is_mounted(mount_path) {
+
+        let _ = Mount(&mount).run(run_mode);
+
+        if let Ok(true) = mount::MountEntry::new(mount_path)?.is_mounted() {
             track_mount(&mount, mounts);
         }
 
-        let mut cmd = Command::new("mount");
-        cmd.arg("-oremount,rw").arg(mount.clone());
-        let _ = run_command(&mut cmd, run_mode);
-        if let Ok(true) = mount_is_readonly(mount_path) {
+        let _ = command::ReMount(&mount).run(run_mode);
+
+        if let Ok(true) = mount::MountEntry::new(mount_path)?.is_readonly() {
             println!("skip job {}: mount {mount:?} is read-only", job.name);
-            let mut cmd = Command::new("mount");
-            cmd.arg("-oremount,ro").arg(mount.clone());
-            let _ = run_command(&mut cmd, run_mode);
-            let mut cmd = Command::new("umount");
-            cmd.arg(mount.clone());
-            let _ = run_command(&mut cmd, run_mode);
+            let _ = command::ReMount(&mount).run(run_mode);
+            let _ = command::UnMount(&mount).run(run_mode);
             untrack_mount(&mount, mounts);
             continue;
         }
@@ -721,12 +645,8 @@ fn backup(
             Ok(dest) => dest,
             Err(err) => {
                 println!("skip job {}: {}", job.name, err);
-                let mut cmd = Command::new("mount");
-                cmd.arg("-oremount,ro").arg(mount.clone());
-                let _ = run_command(&mut cmd, run_mode);
-                let mut cmd = Command::new("umount");
-                cmd.arg(mount.clone());
-                let _ = run_command(&mut cmd, run_mode);
+                let _ = command::ReMount(&mount).run(run_mode);
+                let _ = command::UnMount(&mount).run(run_mode);
                 untrack_mount(&mount, mounts);
                 continue;
             }
@@ -749,7 +669,7 @@ fn backup(
                 format!("{}/.", current.display()),
                 backup_dir.to_string_lossy().to_string(),
             ];
-            let _ = run_nice_ionice(&args, run_mode);
+            let _ = command::IoNice(&args).run(run_mode);
             delete_symlinks(&backup_dir, run_mode)?;
         }
 
@@ -769,7 +689,7 @@ fn backup(
 
         let mut rc = 1;
         for _ in 0..3 {
-            rc = run_nice_ionice(&rsync_args, run_mode)?;
+            rc = command::IoNice(&rsync_args).run(run_mode)?;
         }
 
         if rc == 0 && backup_dir.exists() {
@@ -801,47 +721,20 @@ fn backup(
             }
         }
 
-        let mut cmd = Command::new("mount");
-        cmd.arg("-oremount,ro").arg(mount.clone());
-        let _ = run_command(&mut cmd, run_mode);
+        let _ = command::Mount(&mount).run(run_mode);
+        let _ = command::UnMount(&mount).run(run_mode);
 
-        let mut cmd = Command::new("umount");
-        cmd.arg(mount.clone());
-        let _ = run_command(&mut cmd, run_mode);
         untrack_mount(&mount, mounts);
     }
     Ok(())
 }
 
 pub fn run() -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+    let configuration = get_configuration();
     let mounts: MountTracker = Arc::new(Mutex::new(HashSet::new()));
-    let mounts_for_signals = Arc::clone(&mounts);
-    thread::spawn(move || {
-        let mut signals = match Signals::new([SIGINT, SIGTERM]) {
-            Ok(signals) => signals,
-            Err(err) => {
-                eprintln!("signal handler setup failed: {}", err);
-                return;
-            }
-        };
-        if signals.forever().next().is_some() {
-            let mut list: Vec<_> = match mounts_for_signals.lock() {
-                Ok(set) => set.iter().cloned().collect(),
-                Err(_) => Vec::new(),
-            };
-            list.sort_by_key(|m| std::cmp::Reverse(m.as_os_str().len()));
-            for mount in list {
-                let mut cmd = Command::new("umount");
-                cmd.arg(&mount);
-                let _ = cmd.status();
-            }
-            std::process::exit(1);
-        }
-    });
-
+    signal_handler::signal_handler(&mounts);
     let rsync_extra = Vec::new();
 
-    let configuration = get_configuration();
     let selected_jobs: Vec<String> = Vec::new();
     let force_init = configuration.force_init.is_some();
 
@@ -1070,10 +963,9 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync 
         println!("backup failed: {}", message);
         std::process::exit(1);
     }
-    if !run_mode.dry_run {
-        let mut sync_cmd = Command::new("sync");
-        let _ = run_command(&mut sync_cmd, &run_mode);
-    }
+
+    let _ = command::SyncCommand.run(&run_mode);
+
     println!("{}", Local::now().format("%d-%m-%Y %H:%M"));
 
     Ok(())
