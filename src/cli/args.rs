@@ -50,6 +50,7 @@ pub enum DiskCommand {
     #[command(alias = "unmount", alias = "umount")]
     Umount(UmountArgs),
     Unenroll(DiskUnenrollArgs),
+    Inspect(DiskInspectArgs),
     Rename(DiskRenameArgs),
 }
 
@@ -93,6 +94,10 @@ pub struct DiskUnenrollArgs {
     pub disk_id: Option<String>,
     #[arg(long)]
     pub fs_uuid: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct DiskInspectArgs {
 }
 
 #[derive(Args, Debug, Clone)]

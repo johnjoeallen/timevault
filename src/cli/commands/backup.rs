@@ -15,6 +15,7 @@ use crate::error::{DiskError, Result, TimevaultError};
 use crate::mount::guard::MountGuard;
 use crate::types::RunMode;
 use crate::util::command::run_command;
+use std::collections::HashMap;
 
 pub fn run_backup_command(
     config_path: &std::path::Path,
@@ -77,6 +78,15 @@ pub fn run_backup_command(
         std::process::exit(2);
     }
 
+    let disk_filter = disk_id.map(|id| id.to_string());
+    if let Some(ref disk_filter) = disk_filter {
+        jobs_to_run.retain(|job| job_requires_disk(job, disk_filter));
+        if jobs_to_run.is_empty() {
+            println!("no jobs matched disk selection; aborting");
+            std::process::exit(2);
+        }
+    }
+
     if print_order {
         for job in &jobs_to_run {
             print_job_details(job);
@@ -93,57 +103,66 @@ pub fn run_backup_command(
     }
 
     let connected = connected_disks_in_order(&backup_disks);
-    let primary_disk = match select_first_connected(&backup_disks, disk_id) {
-        Ok(disk) => disk,
-        Err(TimevaultError::Disk(err)) => exit_for_disk_error(&err),
-        Err(err) => return Err(err),
-    };
-
-    let mut disks_to_run = Vec::new();
-    if cascade {
-        disks_to_run.push(primary_disk.clone());
-        for disk in connected {
-            if disk.fs_uuid != primary_disk.fs_uuid {
-                disks_to_run.push(disk);
-            }
-        }
-    } else {
-        disks_to_run.push(primary_disk.clone());
+    if connected.is_empty() {
+        exit_for_disk_error(&DiskError::NoDiskConnected);
     }
 
-    let (primary_guard, primary_mount) =
-        mount_and_verify(&primary_disk, &mount_base, run_mode)?;
-    let primary_current_base = primary_mount.clone();
-
-    if let Some((code, message)) =
-        run_backup_checked(jobs_to_run.clone(), rsync_extra, run_mode, &primary_mount)
-    {
-        drop(primary_guard);
-        println!("{}", message);
-        std::process::exit(code);
-    }
-
-    for disk in disks_to_run.iter().skip(1) {
-        let (guard, mountpoint) = mount_and_verify(disk, &mount_base, run_mode)?;
-        let mut cascaded_jobs = Vec::new();
-        for job in &jobs_to_run {
-            let mut job_override = job.clone();
-            let source = primary_current_base.join(&job.name).join("current");
-            job_override.source = source.to_string_lossy().to_string();
-            cascaded_jobs.push(job_override);
+    if let Some(disk_id) = disk_id {
+        let primary_disk = match select_first_connected(&backup_disks, Some(disk_id)) {
+            Ok(disk) => disk,
+            Err(TimevaultError::Disk(err)) => exit_for_disk_error(&err),
+            Err(err) => return Err(err),
+        };
+        jobs_to_run.retain(|job| job_requires_disk(job, disk_id));
+        if jobs_to_run.is_empty() {
+            println!("no jobs matched disk selection; aborting");
+            std::process::exit(2);
         }
-        if let Some((code, message)) =
-            run_backup_checked(cascaded_jobs, rsync_extra, run_mode, &mountpoint)
-        {
-            drop(guard);
-            drop(primary_guard);
+        if let Some((code, message)) = run_jobs_for_primary(
+            &primary_disk,
+            jobs_to_run,
+            &connected,
+            cascade,
+            run_mode,
+            rsync_extra,
+            &mount_base,
+        )? {
             println!("{}", message);
             std::process::exit(code);
         }
-        drop(guard);
-    }
+    } else {
+        let mut groups: HashMap<String, Vec<crate::config::model::Job>> = HashMap::new();
+        for job in jobs_to_run {
+            let allowed = allowed_disks_for_job(&job, &connected);
+            if allowed.is_empty() {
+                println!("job {} has no connected disks; aborting", job.name);
+                std::process::exit(2);
+            }
+            let primary = allowed[0].clone();
+            groups
+                .entry(primary.disk_id.clone())
+                .or_default()
+                .push(job);
+        }
 
-    drop(primary_guard);
+        for disk in &connected {
+            let Some(jobs) = groups.remove(&disk.disk_id) else {
+                continue;
+            };
+            if let Some((code, message)) = run_jobs_for_primary(
+                disk,
+                jobs,
+                &connected,
+                cascade,
+                run_mode,
+                rsync_extra,
+                &mount_base,
+            )? {
+                println!("{}", message);
+                std::process::exit(code);
+            }
+        }
+    }
 
     if !run_mode.dry_run {
         let mut sync_cmd = Command::new("sync");
@@ -152,6 +171,193 @@ pub fn run_backup_command(
     println!("{}", Local::now().format("%d-%m-%Y %H:%M"));
 
     Ok(())
+}
+
+fn job_requires_disk(job: &crate::config::model::Job, disk_id: &str) -> bool {
+    match &job.disk_ids {
+        Some(ids) => ids.iter().any(|id| id == disk_id),
+        None => false,
+    }
+}
+
+fn allowed_disks_for_job(
+    job: &crate::config::model::Job,
+    connected: &[crate::config::model::BackupDiskConfig],
+) -> Vec<crate::config::model::BackupDiskConfig> {
+    match &job.disk_ids {
+        Some(ids) => connected
+            .iter()
+            .filter(|disk| ids.iter().any(|id| id == &disk.disk_id))
+            .cloned()
+            .collect(),
+        None => connected.to_vec(),
+    }
+}
+
+fn run_jobs_for_primary(
+    primary_disk: &crate::config::model::BackupDiskConfig,
+    jobs: Vec<crate::config::model::Job>,
+    connected: &[crate::config::model::BackupDiskConfig],
+    cascade: bool,
+    run_mode: RunMode,
+    rsync_extra: &[String],
+    mount_base: &std::path::Path,
+) -> Result<Option<(i32, String)>> {
+    let (primary_guard, primary_mount) = mount_and_verify(primary_disk, mount_base, run_mode)?;
+    let primary_current_base = primary_mount.clone();
+
+    if let Some((code, message)) =
+        run_backup_checked(jobs.clone(), rsync_extra, run_mode, &primary_mount)
+    {
+        drop(primary_guard);
+        return Ok(Some((code, message)));
+    }
+
+    if cascade {
+        let mut cascades: HashMap<String, Vec<crate::config::model::Job>> = HashMap::new();
+        for job in &jobs {
+            let allowed = allowed_disks_for_job(job, connected);
+            for disk in allowed {
+                if disk.fs_uuid == primary_disk.fs_uuid {
+                    continue;
+                }
+                cascades
+                    .entry(disk.disk_id.clone())
+                    .or_default()
+                    .push(job.clone());
+            }
+        }
+
+        for disk in connected {
+            let Some(job_list) = cascades.get(&disk.disk_id) else {
+                continue;
+            };
+            let (guard, mountpoint) = mount_and_verify(disk, mount_base, run_mode)?;
+            let mut cascaded_jobs = Vec::new();
+            for job in job_list {
+                let mut job_override = job.clone();
+                let source = primary_current_base.join(&job.name).join("current");
+                if !run_mode.dry_run && !source.exists() {
+                    drop(guard);
+                    drop(primary_guard);
+                    return Ok(Some((
+                        1,
+                        format!(
+                            "missing cascade source {}; primary disk did not produce current snapshot",
+                            source.display()
+                        ),
+                    )));
+                }
+                if run_mode.dry_run && !source.exists() {
+                    println!("dry-run: skip cascade (missing {})", source.display());
+                    continue;
+                }
+                job_override.source = source.to_string_lossy().to_string();
+                cascaded_jobs.push(job_override);
+            }
+            if cascaded_jobs.is_empty() {
+                drop(guard);
+                continue;
+            }
+            if let Some((code, message)) =
+                run_backup_checked(cascaded_jobs, rsync_extra, run_mode, &mountpoint)
+            {
+                drop(guard);
+                drop(primary_guard);
+                return Ok(Some((code, message)));
+            }
+            drop(guard);
+        }
+    }
+
+    drop(primary_guard);
+    Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::RunPolicy;
+
+    #[test]
+    fn job_requires_disk_needs_explicit_match() {
+        let job = crate::config::model::Job {
+            name: "job".to_string(),
+            source: "/".to_string(),
+            copies: 1,
+            run_policy: RunPolicy::Auto,
+            excludes: Vec::new(),
+            disk_ids: None,
+        };
+        assert!(!job_requires_disk(&job, "disk-a"));
+        let job = crate::config::model::Job {
+            name: "job".to_string(),
+            source: "/".to_string(),
+            copies: 1,
+            run_policy: RunPolicy::Auto,
+            excludes: Vec::new(),
+            disk_ids: Some(vec!["disk-a".to_string()]),
+        };
+        assert!(job_requires_disk(&job, "disk-a"));
+        assert!(!job_requires_disk(&job, "disk-b"));
+    }
+
+    #[test]
+    fn allowed_disks_for_job_filters_connected() {
+        let connected = vec![
+            crate::config::model::BackupDiskConfig {
+                disk_id: "disk-a".to_string(),
+                fs_uuid: "uuid-a".to_string(),
+                label: None,
+                mount_options: None,
+            },
+            crate::config::model::BackupDiskConfig {
+                disk_id: "disk-b".to_string(),
+                fs_uuid: "uuid-b".to_string(),
+                label: None,
+                mount_options: None,
+            },
+        ];
+        let job = crate::config::model::Job {
+            name: "job".to_string(),
+            source: "/".to_string(),
+            copies: 1,
+            run_policy: RunPolicy::Auto,
+            excludes: Vec::new(),
+            disk_ids: Some(vec!["disk-b".to_string()]),
+        };
+        let allowed = allowed_disks_for_job(&job, &connected);
+        assert_eq!(allowed.len(), 1);
+        assert_eq!(allowed[0].disk_id, "disk-b");
+    }
+
+    #[test]
+    fn allowed_disks_for_job_without_filter_returns_all() {
+        let connected = vec![
+            crate::config::model::BackupDiskConfig {
+                disk_id: "disk-a".to_string(),
+                fs_uuid: "uuid-a".to_string(),
+                label: None,
+                mount_options: None,
+            },
+            crate::config::model::BackupDiskConfig {
+                disk_id: "disk-b".to_string(),
+                fs_uuid: "uuid-b".to_string(),
+                label: None,
+                mount_options: None,
+            },
+        ];
+        let job = crate::config::model::Job {
+            name: "job".to_string(),
+            source: "/".to_string(),
+            copies: 1,
+            run_policy: RunPolicy::Auto,
+            excludes: Vec::new(),
+            disk_ids: None,
+        };
+        let allowed = allowed_disks_for_job(&job, &connected);
+        assert_eq!(allowed.len(), 2);
+    }
 }
 
 fn mount_and_verify(

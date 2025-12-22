@@ -1,0 +1,12 @@
+jobs:
+- name: config
+  source: /etc
+  copies: 7
+  run: auto
+  excludes: []
+excludes: []
+backupDisks:
+- diskId: usb-b
+  fsUuid: 7b85bde0-7ec6-4fd5-a5fb-c48b28daa835
+- diskId: usb-a
+  fsUuid: 39d0cce0-1af3-430e-b271-60947927fe0a

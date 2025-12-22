@@ -3,7 +3,7 @@ use std::io::Read;
 
 use crate::config::model::{Config, Job, RuntimeConfig};
 use crate::error::{ConfigError, Result, TimevaultError};
-use crate::types::RunPolicy;
+use crate::types::{DiskId, RunPolicy};
 use crate::util::paths::is_safe_name;
 
 const DEFAULT_MOUNT_BASE: &str = "/run/timevault/mounts";
@@ -25,6 +25,32 @@ fn parse_runtime(cfg: Config) -> Result<RuntimeConfig> {
     let mut jobs = Vec::new();
     let mut names = std::collections::HashSet::new();
 
+    let mut disk_ids = std::collections::HashSet::new();
+    let mut duplicate_disk_ids = std::collections::HashSet::new();
+    let mut fs_uuids = std::collections::HashSet::new();
+    for disk in &cfg.backup_disks {
+        if !disk_ids.insert(disk.disk_id.clone()) {
+            duplicate_disk_ids.insert(disk.disk_id.clone());
+        }
+        if !fs_uuids.insert(disk.fs_uuid.clone()) {
+            return Err(ConfigError::Invalid(format!(
+                "duplicate fs-uuid {}; remove or fix duplicates",
+                disk.fs_uuid
+            ))
+            .into());
+        }
+    }
+    if !duplicate_disk_ids.is_empty() {
+        let mut list: Vec<String> = duplicate_disk_ids.iter().cloned().collect();
+        list.sort();
+        println!();
+        println!(
+            "WARNING: duplicate disk-id(s) found: {} (rename with `timevault disk rename --fs-uuid <uuid> --new-id <id>`)",
+            list.join(", ")
+        );
+        println!();
+    }
+
     for job in cfg.jobs {
         let run_policy = RunPolicy::parse(&job.run)
             .map_err(|e| ConfigError::Invalid(format!("job {}: {}", job.name, e)))?;
@@ -44,6 +70,37 @@ fn parse_runtime(cfg: Config) -> Result<RuntimeConfig> {
         if !names.insert(job.name.clone()) {
             return Err(ConfigError::Invalid(format!("duplicate job name {}", job.name)).into());
         }
+        let disk_ids_for_job = if let Some(raw_ids) = job.disk_ids {
+            let mut seen = std::collections::HashSet::new();
+            let mut parsed = Vec::new();
+            for raw_id in raw_ids {
+                let id = raw_id.parse::<DiskId>().map_err(|e| {
+                    ConfigError::Invalid(format!("job {}: disk-id {}: {}", job.name, raw_id, e))
+                })?;
+                if duplicate_disk_ids.contains(id.as_str()) {
+                    return Err(ConfigError::Invalid(format!(
+                        "job {}: disk-id {} is duplicated in config",
+                        job.name,
+                        id.as_str()
+                    ))
+                    .into());
+                }
+                if !disk_ids.contains(id.as_str()) {
+                    return Err(ConfigError::Invalid(format!(
+                        "job {}: disk-id {} not found in backupDisks",
+                        job.name,
+                        id.as_str()
+                    ))
+                    .into());
+                }
+                if seen.insert(id.as_str().to_string()) {
+                    parsed.push(id.as_str().to_string());
+                }
+            }
+            Some(parsed)
+        } else {
+            None
+        };
         let mut excludes = global_excludes.clone();
         excludes.extend(job.excludes);
         jobs.push(Job {
@@ -52,33 +109,8 @@ fn parse_runtime(cfg: Config) -> Result<RuntimeConfig> {
             copies: job.copies,
             run_policy,
             excludes,
+            disk_ids: disk_ids_for_job,
         });
-    }
-
-    let mut disk_ids = std::collections::HashSet::new();
-    let mut duplicate_disk_ids = std::collections::HashSet::new();
-    let mut fs_uuids = std::collections::HashSet::new();
-    for disk in &cfg.backup_disks {
-        if !disk_ids.insert(disk.disk_id.clone()) {
-            duplicate_disk_ids.insert(disk.disk_id.clone());
-        }
-        if !fs_uuids.insert(disk.fs_uuid.clone()) {
-            return Err(ConfigError::Invalid(format!(
-                "duplicate fs-uuid {}; remove or fix duplicates",
-                disk.fs_uuid
-            ))
-            .into());
-        }
-    }
-    if !duplicate_disk_ids.is_empty() {
-        let mut list: Vec<String> = duplicate_disk_ids.into_iter().collect();
-        list.sort();
-        println!();
-        println!(
-            "WARNING: duplicate disk-id(s) found: {} (rename with `timevault disk rename --fs-uuid <uuid> --new-id <id>`)",
-            list.join(", ")
-        );
-        println!();
     }
 
     Ok(RuntimeConfig {
@@ -117,5 +149,67 @@ jobs:
         let cfg = load_config(file.path().to_string_lossy().as_ref()).expect("load");
         assert_eq!(cfg.backup_disks.len(), 1);
         assert_eq!(cfg.jobs.len(), 1);
+    }
+
+    #[test]
+    fn load_config_with_job_disk_ids() {
+        let mut file = NamedTempFile::new().expect("tempfile");
+        let yaml = r#"
+backupDisks:
+  - diskId: "primary"
+    fsUuid: "uuid-1"
+jobs:
+  - name: "job1"
+    source: "/"
+    copies: 2
+    run: "auto"
+    diskIds: ["primary"]
+    excludes: []
+"#;
+        file.write_all(yaml.as_bytes()).expect("write");
+        let cfg = load_config(file.path().to_string_lossy().as_ref()).expect("load");
+        assert_eq!(cfg.jobs.len(), 1);
+        assert_eq!(
+            cfg.jobs[0].disk_ids,
+            Some(vec!["primary".to_string()])
+        );
+    }
+
+    #[test]
+    fn load_config_rejects_unknown_job_disk_id() {
+        let mut file = NamedTempFile::new().expect("tempfile");
+        let yaml = r#"
+backupDisks:
+  - diskId: "primary"
+    fsUuid: "uuid-1"
+jobs:
+  - name: "job1"
+    source: "/"
+    copies: 2
+    run: "auto"
+    diskIds: ["missing"]
+    excludes: []
+"#;
+        file.write_all(yaml.as_bytes()).expect("write");
+        assert!(load_config(file.path().to_string_lossy().as_ref()).is_err());
+    }
+
+    #[test]
+    fn load_config_rejects_invalid_job_disk_id() {
+        let mut file = NamedTempFile::new().expect("tempfile");
+        let yaml = r#"
+backupDisks:
+  - diskId: "primary"
+    fsUuid: "uuid-1"
+jobs:
+  - name: "job1"
+    source: "/"
+    copies: 2
+    run: "auto"
+    diskIds: ["bad id"]
+    excludes: []
+"#;
+        file.write_all(yaml.as_bytes()).expect("write");
+        assert!(load_config(file.path().to_string_lossy().as_ref()).is_err());
     }
 }

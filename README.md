@@ -82,6 +82,8 @@ jobs:
     source: "/"
     copies: 30
     run: "auto"
+    # Optional disk allowlist for this job:
+    # diskIds: ["primary"]
     excludes: []
   - name: "remote-primary"
     source: "root@example.com:/"
@@ -96,6 +98,9 @@ Run policy:
 - `auto`: run when no explicit jobs are requested
 - `demand`: only run when explicitly requested via `--job`
 - `off`: never run, even if explicitly requested
+
+Optional job disk allowlist:
+- `diskIds`: restricts the job to specific enrolled disk IDs; without `--disk-id`, TimeVault picks the first connected disk in this list as the primary and cascades to the other connected disks in the list. With `--disk-id`, only jobs that include that disk in `diskIds` will run.
 
 ## Usage
 
@@ -117,6 +122,12 @@ Cascade a backup across all connected disks (uses the first connected disk's `cu
 timevault --cascade
 ```
 
+When `--disk-id` is provided, only jobs that list that disk in `diskIds` will run:
+
+```bash
+timevault --disk-id primary
+```
+
 Enroll a disk:
 
 ```bash
@@ -133,6 +144,12 @@ Discover candidate disks:
 
 ```bash
 timevault disk discover
+```
+
+Inspect an enrolled disk (mounts read-only, opens a shell in the mount, unmounts on exit):
+
+```bash
+timevault disk inspect --disk-id primary
 ```
 
 Rename a disk (updates config, and identity if connected):

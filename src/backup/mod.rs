@@ -33,12 +33,17 @@ pub fn print_job_details(job: &Job) {
     } else {
         job.excludes.join(", ")
     };
+    let disk_ids = match &job.disk_ids {
+        Some(ids) if !ids.is_empty() => ids.join(", "),
+        _ => "<any>".to_string(),
+    };
     println!("job: {}", job.name);
     println!("  source: {}", job.source);
     println!("  backup dir: {}", job.name);
     println!("  copies: {}", job.copies);
     println!("  run: {}", job.run_policy.as_str());
     println!("  excludes: {}", excludes);
+    println!("  disks: {}", disk_ids);
 }
 
 pub fn run_backup(
@@ -74,6 +79,14 @@ pub fn run_backup(
             println!("  backup dir: {}", dest.display());
             println!("  copies: {}", job.copies);
             println!("  excludes: {}", job.excludes.len());
+        }
+
+        if !dest.exists() {
+            if run_mode.dry_run {
+                println!("dry-run: mkdir -p {}", dest.display());
+            } else {
+                fs::create_dir_all(&dest)?;
+            }
         }
 
         expire_old_backups(&job, &dest, run_mode)?;

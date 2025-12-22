@@ -6,7 +6,7 @@ use clap::error::ErrorKind;
 use clap::Parser;
 
 use crate::cli::args::{Cli, Command, DiskCommand};
-use crate::cli::commands::{backup, disk_add, exit_for_error, mount, umount};
+use crate::cli::commands::{backup, disk_add, disk_inspect, exit_for_error, mount, umount};
 use crate::types::RunMode;
 
 const CONFIG_FILE: &str = "/etc/timevault.yaml";
@@ -73,6 +73,11 @@ pub fn run() -> Result<()> {
             }
             DiskCommand::Umount(args) => {
                 if let Err(err) = umount::run_umount(&config_path, args) {
+                    exit_for_error(&err);
+                }
+            }
+            DiskCommand::Inspect(args) => {
+                if let Err(err) = disk_inspect::run_inspect(&config_path, args, cli.disk_id.as_deref()) {
                     exit_for_error(&err);
                 }
             }
@@ -165,6 +170,7 @@ fn print_help() {
     println!("  timevault disk discover");
     println!("  timevault disk mount [--disk-id <id>]");
     println!("  timevault disk umount");
+    println!("  timevault disk inspect [--disk-id <id>]");
     println!("  timevault disk unenroll [--disk-id <id> | --fs-uuid <uuid>]");
     println!("  timevault disk rename [--disk-id <id> | --fs-uuid <uuid>] --new-id <id>");
     println!("  timevault --version");

@@ -24,6 +24,8 @@ pub struct JobConfig {
     pub run: String,
     #[serde(default)]
     pub excludes: Vec<String>,
+    #[serde(default, rename = "diskIds", skip_serializing_if = "Option::is_none")]
+    pub disk_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -45,6 +47,7 @@ pub struct Job {
     pub copies: usize,
     pub run_policy: RunPolicy,
     pub excludes: Vec<String>,
+    pub disk_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone)]

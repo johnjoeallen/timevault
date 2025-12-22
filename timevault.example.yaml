@@ -43,6 +43,8 @@ jobs:
     source: "/"
     copies: 30
     run: "auto"
+    # Optional disk allowlist for this job:
+    # diskIds: ["primary"]
     excludes: []
   - name: "remote-primary"
     source: "root@example.com:/"
