@@ -23,6 +23,12 @@ target/debian/*.deb
 sudo dpkg -i target/debian/*.deb
 ```
 
+You can also use apt with a local file (supports install and reinstall):
+
+```bash
+sudo apt install ./target/debian/*.deb
+```
+
 ## Notes
 - The package installs the binary to `/usr/bin/timevault`.
 - Example config and docs are installed under `/usr/share/doc/timevault/`.
