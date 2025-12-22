@@ -1,8 +1,12 @@
-# Packaging TimeVault (.deb)
+# Packaging Timevault (.deb)
 
 ## Requirements
 - Rust toolchain
 - `cargo-deb` (`cargo install cargo-deb`)
+
+## Other docs
+- [README](README.md)
+- [User Guide](USER_GUIDE.md)
 
 ## Build and package
 

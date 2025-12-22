@@ -1301,7 +1301,7 @@ fn run_nice_ionice(args: &[String], run_mode: RunMode) -> io::Result<i32> {
 }
 
 fn print_banner() {
-    println!("TimeVault {}", VERSION);
+    println!("Timevault {}", VERSION);
 }
 
 fn print_copyright() {

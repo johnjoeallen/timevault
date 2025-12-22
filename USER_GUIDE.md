@@ -1,18 +1,22 @@
-# TimeVault User Guide
+# Timevault User Guide
 
 ## Philosophy
-TimeVault is built around a few principles:
+Timevault is built around a few principles:
 - Safe by default: disks stay offline, mounts are short-lived, and destructive actions are explicit.
 - Identifiable media: backup disks carry a `.timevault` identity tied to filesystem UUIDs.
 - Repeatable results: snapshots are rotated consistently, and `current` points to the latest snapshot.
 - Minimal moving parts: it is just rsync, mount, and a small config file.
 
+## Other docs
+- [README](README.md)
+- [Packaging](PACKAGING.md)
+
 ## Configuration
-TimeVault reads a YAML config file (default `/etc/timevault.yaml`).
+Timevault reads a YAML config file (default `/etc/timevault.yaml`).
 
 ### Top-level options
-- `mountBase`: Where TimeVault mounts backup disks for backups. Default: `/run/timevault/mounts`.
-- `userMountBase`: Where TimeVault mounts disks for user inspection. Default: `/run/timevault/user-mounts`.
+- `mountBase`: Where Timevault mounts backup disks for backups. Default: `/run/timevault/mounts`.
+- `userMountBase`: Where Timevault mounts disks for user inspection. Default: `/run/timevault/user-mounts`.
 - `backupDisks`: List of enrolled backup disks (required for backups).
 - `excludes`: Global exclude paths applied to all jobs.
 - `jobs`: List of backup jobs.
@@ -159,7 +163,7 @@ Global options:
 
 ## Job disk allowlists (`diskIds`)
 - If `diskIds` is set for a job, it will only run on those disks.
-- Without `--disk-id`, TimeVault chooses the first connected disk in that list as the primary and cascades to the other connected disks in the list.
+- Without `--disk-id`, Timevault chooses the first connected disk in that list as the primary and cascades to the other connected disks in the list.
 - With `--disk-id`, only jobs that include that disk in `diskIds` will run.
 
 ## Typical setup workflow
@@ -193,7 +197,7 @@ sudo timevault --verbose
 ```
 
 ## Systemd service and timer
-TimeVault ships with a systemd service and timer:
+Timevault ships with a systemd service and timer:
 - `timevault.service`: Runs `timevault` (default backup).
 - `timevault.timer`: Runs daily (default: 2am).
 

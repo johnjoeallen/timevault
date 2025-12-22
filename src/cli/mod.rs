@@ -156,7 +156,7 @@ fn split_rsync_args(raw: Vec<String>) -> (Vec<String>, Vec<String>) {
 }
 
 fn print_banner() {
-    println!("TimeVault {}", VERSION);
+    println!("Timevault {}", VERSION);
 }
 
 fn print_copyright() {

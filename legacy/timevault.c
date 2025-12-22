@@ -128,7 +128,7 @@ static int run_command(char *const argv[], struct RunMode mode) {
 }
 
 static void print_banner(void) {
-    printf("TimeVault %s\n", TIMEVAULT_VERSION);
+    printf("Timevault %s\n", TIMEVAULT_VERSION);
 }
 
 static void print_copyright(void) {

@@ -93,7 +93,7 @@ static int run_command(const std::vector<std::string> &argv, const RunMode &mode
 }
 
 static void print_banner() {
-    std::printf("TimeVault %s\n", TIMEVAULT_VERSION);
+    std::printf("Timevault %s\n", TIMEVAULT_VERSION);
 }
 
 static void print_copyright() {
