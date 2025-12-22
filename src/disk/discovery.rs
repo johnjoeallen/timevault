@@ -16,6 +16,7 @@ pub struct DiskCandidate {
     pub uuid: String,
     pub device: PathBuf,
     pub mounted_at: Option<PathBuf>,
+    pub capacity_bytes: Option<u64>,
     pub empty: Option<bool>,
     pub removable: Option<bool>,
     pub reasons: Vec<String>,
@@ -62,6 +63,7 @@ pub fn list_candidates(
         let enrolled_flag = enrolled.contains(&uuid);
         let mut temp_mount: Option<PathBuf> = None;
         let mut mounted_path: Option<PathBuf> = None;
+        let capacity_bytes = disk_capacity_bytes(&device);
         let mountpoint = match find_device_mountpoint(&device)? {
             Some(path) => {
                 mounted_path = Some(path.clone());
@@ -81,6 +83,7 @@ pub fn list_candidates(
                             uuid,
                             device,
                             mounted_at: None,
+                            capacity_bytes,
                             empty: None,
                             removable,
                             reasons,
@@ -104,30 +107,34 @@ pub fn list_candidates(
             None
         };
         let removable = is_removable_device(&device);
+        let removable_ok = removable == Some(true);
+        let empty_ok = empty == Some(true);
+        let identity_ok = identity.is_some();
         let mut reasons = Vec::new();
-        if removable == Some(true) {
-            reasons.push("removable".to_string());
-        }
-        if empty == Some(true) {
-            reasons.push("mounted-empty".to_string());
-        }
-        if identity.is_some() {
-            reasons.push("timevault-identity".to_string());
-        }
         if enrolled_flag {
             reasons.push("enrolled".to_string());
+        }
+        if removable_ok {
+            reasons.push("removable".to_string());
+        }
+        if empty_ok {
+            reasons.push("mounted-empty".to_string());
+        }
+        if identity_ok {
+            reasons.push("timevault-identity".to_string());
         }
         if let Some(temp) = temp_mount {
             let _ = crate::mount::ops::unmount_path(&temp);
             let _ = fs::remove_dir(&temp);
         }
-        if reasons.is_empty() {
+        if !enrolled_flag && !removable_ok && !empty_ok && !identity_ok {
             continue;
         }
         candidates.push(DiskCandidate {
             uuid,
             device,
             mounted_at: mounted_path,
+            capacity_bytes,
             empty,
             removable,
             reasons,
@@ -173,6 +180,24 @@ fn base_block_device_name(dev: &Path) -> Option<String> {
     } else {
         Some(trimmed.to_string())
     }
+}
+
+fn disk_capacity_bytes(device: &Path) -> Option<u64> {
+    let name = device.file_name()?.to_string_lossy().to_string();
+    let sector_path = Path::new("/sys/class/block").join(&name).join("size");
+    let sectors = fs::read_to_string(&sector_path)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok());
+    if let Some(sectors) = sectors {
+        return Some(sectors.saturating_mul(512));
+    }
+
+    let base = base_block_device_name(device)?;
+    let sector_path = Path::new("/sys/class/block").join(base).join("size");
+    let sectors = fs::read_to_string(&sector_path)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok());
+    sectors.map(|value| value.saturating_mul(512))
 }
 
 fn is_removable_device(device: &Path) -> Option<bool> {

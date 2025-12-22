@@ -40,6 +40,7 @@ sudo systemctl enable --now timevault.timer
 Example `/etc/timevault.yaml`:
 
 ```yaml
+# job run policy: auto | demand | off
 mountBase: "/run/timevault/mounts"
 userMountBase: "/run/timevault/user-mounts"
 backupDisks:
@@ -48,15 +49,44 @@ backupDisks:
     label: "primary-backup"
     mountOptions: "rw,nodev,nosuid,noexec"
 excludes:
+  - "/backups"
   - "/proc"
-  - "/sys"
+  - "/var/run"
+  - "/var/log"
+  - "/var/tmp"
   - "/tmp"
+  - "/mnt"
+  - "/net"
+  - "/dev"
+  - "/initrd"
+  - "/var/lib/imap/proc"
+  - "/var/spool/postfix/active"
+  - "/var/spool/postfix/defer"
+  - "/var/spool/postfix/deferred"
+  - "/var/spool/postfix/maildrop"
+  - "/var/spool/squid"
+  - "/var/cache"
+  - "/sys"
+  - "/data/docker"
+  - "/data/mirrors"
+  - "/data/swapfile"
+  - "/data/venomsoft"
+  - "/data/pub/backups"
+  - "/media"
+  - ".thumbnails"
+  - "/run"
+  - "/root/tmp"
 
 jobs:
   - name: "primary"
     source: "/"
     copies: 30
-    run: "auto"   # auto | demand | off
+    run: "auto"
+    excludes: []
+  - name: "remote-primary"
+    source: "root@example.com:/"
+    copies: 30
+    run: "auto"
     excludes: []
 ```
 
@@ -81,16 +111,46 @@ Run an explicit backup (same as default):
 timevault backup
 ```
 
+Cascade a backup across all connected disks (uses the first connected disk's `current` snapshot for the others):
+
+```bash
+timevault --cascade
+```
+
 Enroll a disk:
 
 ```bash
 timevault disk enroll --disk-id primary --fs-uuid <uuid>
 ```
 
+If the disk already has a `.timevault` identity, `--disk-id` is optional:
+
+```bash
+timevault disk enroll --fs-uuid <uuid>
+```
+
 Discover candidate disks:
 
 ```bash
 timevault disk discover
+```
+
+Rename a disk (updates config, and identity if connected):
+
+```bash
+timevault disk rename --disk-id primary --new-id archive
+```
+
+If multiple disks share the same disk-id, use `--fs-uuid`:
+
+```bash
+timevault disk rename --fs-uuid <uuid> --new-id archive
+```
+
+Unenroll a disk (removes it from config):
+
+```bash
+timevault disk unenroll --fs-uuid <uuid>
 ```
 
 Run specific jobs:
@@ -129,7 +189,7 @@ Print resolved job order and exit with full job details:
 timevault --print-order
 ```
 
-Dry run (no writes, but mounts/umounts still run):
+Dry run (no writes and no mounts):
 
 ```bash
 timevault --dry-run
@@ -156,4 +216,6 @@ timevault --version
 ## Notes
 - Backup disks are identified by UUID and must contain `/.timevault`.
 - Backup disks are mounted on demand under `/run/timevault`.
+- When multiple enrolled disks are connected, `backup` uses the first disk in config order unless `--disk-id` is provided; `--cascade` runs across all connected disks.
+- Remote job sources require passwordless SSH (e.g., keys configured for the remote host).
 - Requires `rsync`, `util-linux` (mount/umount), and `coreutils`.

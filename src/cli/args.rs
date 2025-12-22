@@ -24,6 +24,8 @@ pub struct Cli {
 
     #[arg(long, global = true)]
     pub disk_id: Option<String>,
+    #[arg(long, global = true)]
+    pub cascade: bool,
 
     #[arg(long, short = 'h')]
     pub help: bool,
@@ -47,6 +49,8 @@ pub enum DiskCommand {
     Mount(MountArgs),
     #[command(alias = "unmount", alias = "umount")]
     Umount(UmountArgs),
+    Unenroll(DiskUnenrollArgs),
+    Rename(DiskRenameArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -81,4 +85,22 @@ pub struct MountArgs {
 
 #[derive(Args, Debug, Clone)]
 pub struct UmountArgs {
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct DiskUnenrollArgs {
+    #[arg(long)]
+    pub disk_id: Option<String>,
+    #[arg(long)]
+    pub fs_uuid: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct DiskRenameArgs {
+    #[arg(long)]
+    pub disk_id: Option<String>,
+    #[arg(long)]
+    pub fs_uuid: Option<String>,
+    #[arg(long)]
+    pub new_id: String,
 }

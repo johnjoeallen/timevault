@@ -50,6 +50,7 @@ pub fn run() -> Result<()> {
             &cli.job,
             cli.print_order,
             cli.disk_id.as_deref(),
+            cli.cascade,
             run_mode,
             &rsync_extra,
         )?,
@@ -72,6 +73,16 @@ pub fn run() -> Result<()> {
             }
             DiskCommand::Umount(args) => {
                 if let Err(err) = umount::run_umount(&config_path, args) {
+                    exit_for_error(&err);
+                }
+            }
+            DiskCommand::Unenroll(args) => {
+                if let Err(err) = disk_add::run_unenroll(&config_path, args) {
+                    exit_for_error(&err);
+                }
+            }
+            DiskCommand::Rename(args) => {
+                if let Err(err) = disk_add::run_rename(&config_path, args) {
                     exit_for_error(&err);
                 }
             }
@@ -154,6 +165,8 @@ fn print_help() {
     println!("  timevault disk discover");
     println!("  timevault disk mount [--disk-id <id>]");
     println!("  timevault disk umount");
+    println!("  timevault disk unenroll [--disk-id <id> | --fs-uuid <uuid>]");
+    println!("  timevault disk rename [--disk-id <id> | --fs-uuid <uuid>] --new-id <id>");
     println!("  timevault --version");
     println!();
     println!("Options:");
@@ -165,6 +178,7 @@ fn print_help() {
     println!("  --print-order          Print resolved job order and exit");
     println!("  --rsync <args...>      Pass remaining args to rsync");
     println!("  --disk-id <id>         Select enrolled backup disk");
+    println!("  --cascade              Run backup across all connected disks");
     println!("  --fs-uuid <uuid>       Filesystem UUID (disk enroll)");
     println!("  --device <path>        Block device path (disk enroll)");
     println!("  --label <label>        Optional disk label (disk enroll)");

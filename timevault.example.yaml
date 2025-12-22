@@ -1,6 +1,7 @@
 # Example configuration for Timevault.
 # Backup disks are enrolled by filesystem UUID and stay offline by default.
 
+# job run policy: auto | demand | off
 mountBase: "/run/timevault/mounts"
 userMountBase: "/run/timevault/user-mounts"
 backupDisks:
@@ -8,26 +9,43 @@ backupDisks:
     fsUuid: "REPLACE-WITH-UUID"
     label: "primary-backup"
     mountOptions: "rw,nodev,nosuid,noexec"
-
 excludes:
+  - "/backups"
   - "/proc"
-  - "/sys"
-  - "/dev"
-  - "/run"
-  - "/tmp"
+  - "/var/run"
+  - "/var/log"
   - "/var/tmp"
-  - "/var/cache"
+  - "/tmp"
   - "/mnt"
+  - "/net"
+  - "/dev"
+  - "/initrd"
+  - "/var/lib/imap/proc"
+  - "/var/spool/postfix/active"
+  - "/var/spool/postfix/defer"
+  - "/var/spool/postfix/deferred"
+  - "/var/spool/postfix/maildrop"
+  - "/var/spool/squid"
+  - "/var/cache"
+  - "/sys"
+  - "/data/docker"
+  - "/data/mirrors"
+  - "/data/swapfile"
+  - "/data/venomsoft"
+  - "/data/pub/backups"
+  - "/media"
+  - ".thumbnails"
+  - "/run"
+  - "/root/tmp"
 
 jobs:
-  - name: "etc-snapshots"
-    source: "/etc"
-    copies: 14
-    run: "demand"
-    excludes: []
-  - name: "home-weekly"
-    source: "/home"
-    copies: 8
+  - name: "primary"
+    source: "/"
+    copies: 30
     run: "auto"
-    excludes:
-      - "/home/*/.cache"
+    excludes: []
+  - name: "remote-primary"
+    source: "root@example.com:/"
+    copies: 30
+    run: "auto"
+    excludes: []

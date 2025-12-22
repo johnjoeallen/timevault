@@ -103,12 +103,19 @@ pub fn select_disk(
     disks: &[BackupDiskConfig],
     disk_id: Option<&str>,
 ) -> Result<BackupDiskConfig> {
-    let connected = disks
-        .iter()
-        .filter(|disk| device_path_for_uuid(&disk.fs_uuid).exists())
-        .map(|disk| disk.fs_uuid.clone())
+    let connected = connected_disks_in_order(disks)
+        .into_iter()
+        .map(|disk| disk.fs_uuid)
         .collect::<HashSet<_>>();
     select_disk_from_connected(disks, disk_id, &connected)
+}
+
+pub fn connected_disks_in_order(disks: &[BackupDiskConfig]) -> Vec<BackupDiskConfig> {
+    disks
+        .iter()
+        .filter(|disk| device_path_for_uuid(&disk.fs_uuid).exists())
+        .cloned()
+        .collect()
 }
 
 pub fn select_disk_from_connected(
@@ -142,6 +149,33 @@ pub fn select_disk_from_connected(
     }
     if connected.len() > 1 {
         return Err(DiskError::MultipleDisksConnected.into());
+    }
+    Ok(connected[0].clone())
+}
+
+pub fn select_first_connected(
+    disks: &[BackupDiskConfig],
+    disk_id: Option<&str>,
+) -> Result<BackupDiskConfig> {
+    let connected = connected_disks_in_order(disks);
+    if disks.is_empty() {
+        return Err(DiskError::Other(
+            "no backup disks enrolled; run `timevault disk enroll ...`".to_string(),
+        )
+        .into());
+    }
+    if let Some(disk_id) = disk_id {
+        let disk = disks
+            .iter()
+            .find(|disk| disk.disk_id == disk_id)
+            .ok_or_else(|| DiskError::Other(format!("disk-id {} not found in config", disk_id)))?;
+        if !connected.iter().any(|item| item.fs_uuid == disk.fs_uuid) {
+            return Err(DiskError::Other(format!("disk-id {} not connected", disk.disk_id)).into());
+        }
+        return Ok(disk.clone());
+    }
+    if connected.is_empty() {
+        return Err(DiskError::NoDiskConnected.into());
     }
     Ok(connected[0].clone())
 }

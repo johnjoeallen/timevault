@@ -55,6 +55,32 @@ fn parse_runtime(cfg: Config) -> Result<RuntimeConfig> {
         });
     }
 
+    let mut disk_ids = std::collections::HashSet::new();
+    let mut duplicate_disk_ids = std::collections::HashSet::new();
+    let mut fs_uuids = std::collections::HashSet::new();
+    for disk in &cfg.backup_disks {
+        if !disk_ids.insert(disk.disk_id.clone()) {
+            duplicate_disk_ids.insert(disk.disk_id.clone());
+        }
+        if !fs_uuids.insert(disk.fs_uuid.clone()) {
+            return Err(ConfigError::Invalid(format!(
+                "duplicate fs-uuid {}; remove or fix duplicates",
+                disk.fs_uuid
+            ))
+            .into());
+        }
+    }
+    if !duplicate_disk_ids.is_empty() {
+        let mut list: Vec<String> = duplicate_disk_ids.into_iter().collect();
+        list.sort();
+        println!();
+        println!(
+            "WARNING: duplicate disk-id(s) found: {} (rename with `timevault disk rename --fs-uuid <uuid> --new-id <id>`)",
+            list.join(", ")
+        );
+        println!();
+    }
+
     Ok(RuntimeConfig {
         jobs,
         backup_disks: cfg.backup_disks,
