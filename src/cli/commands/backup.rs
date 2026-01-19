@@ -2,7 +2,7 @@ use std::process::Command;
 
 use chrono::Local;
 
-use crate::backup::{print_job_details, run_backup};
+use crate::backup::{print_job_details, run_backup, run_pristine_only, BackupOptions};
 use crate::cli::commands::exit_for_disk_error;
 use crate::config::load::load_config;
 use crate::disk::{
@@ -24,7 +24,8 @@ pub fn run_backup_command(
     disk_id: Option<&str>,
     cascade: bool,
     run_mode: RunMode,
-    rsync_extra: &[String],
+    rsync_extra_cli: &[String],
+    options: BackupOptions,
 ) -> Result<()> {
     println!("{}", Local::now().format("%d-%m-%Y %H:%M"));
 
@@ -32,8 +33,20 @@ pub fn run_backup_command(
     let jobs = cfg.jobs.clone();
     let backup_disks = cfg.backup_disks.clone();
     let mount_base = std::path::PathBuf::from(cfg.mount_base.clone());
+    let mut rsync_extra = cfg.options.rsync.clone();
+    rsync_extra.extend(rsync_extra_cli.iter().cloned());
+    let run_mode = RunMode {
+        verbose: run_mode.verbose || cfg.options.verbose.unwrap_or(false),
+        safe_mode: run_mode.safe_mode || cfg.options.safe.unwrap_or(false),
+        ..run_mode
+    };
+    let cascade = cascade || cfg.options.cascade.unwrap_or(false);
+    let options = BackupOptions {
+        exclude_pristine: options.exclude_pristine || cfg.options.exclude_pristine.unwrap_or(false),
+        exclude_pristine_only: options.exclude_pristine_only,
+    };
 
-    if backup_disks.is_empty() {
+    if backup_disks.is_empty() && !options.exclude_pristine_only {
         return Err(TimevaultError::message(
             "no backup disks enrolled; run `timevault disk enroll ...`".to_string(),
         ));
@@ -101,6 +114,10 @@ pub fn run_backup_command(
             jobs_to_run.len()
         );
     }
+    if options.exclude_pristine_only {
+        run_pristine_only(jobs_to_run, run_mode, options)?;
+        return Ok(());
+    }
 
     let connected = connected_disks_in_order(&backup_disks);
     if connected.is_empty() {
@@ -124,8 +141,9 @@ pub fn run_backup_command(
             &connected,
             cascade,
             run_mode,
-            rsync_extra,
+            &rsync_extra,
             &mount_base,
+            options,
         )? {
             println!("{}", message);
             std::process::exit(code);
@@ -155,8 +173,9 @@ pub fn run_backup_command(
                 &connected,
                 cascade,
                 run_mode,
-                rsync_extra,
+                &rsync_extra,
                 &mount_base,
+                options,
             )? {
                 println!("{}", message);
                 std::process::exit(code);
@@ -202,12 +221,13 @@ fn run_jobs_for_primary(
     run_mode: RunMode,
     rsync_extra: &[String],
     mount_base: &std::path::Path,
+    options: BackupOptions,
 ) -> Result<Option<(i32, String)>> {
     let (primary_guard, primary_mount) = mount_and_verify(primary_disk, mount_base, run_mode)?;
     let primary_current_base = primary_mount.clone();
 
     if let Some((code, message)) =
-        run_backup_checked(jobs.clone(), rsync_extra, run_mode, &primary_mount)
+        run_backup_checked(jobs.clone(), rsync_extra, run_mode, &primary_mount, options)
     {
         drop(primary_guard);
         return Ok(Some((code, message)));
@@ -260,7 +280,7 @@ fn run_jobs_for_primary(
                 continue;
             }
             if let Some((code, message)) =
-                run_backup_checked(cascaded_jobs, rsync_extra, run_mode, &mountpoint)
+                run_backup_checked(cascaded_jobs, rsync_extra, run_mode, &mountpoint, options)
             {
                 drop(guard);
                 drop(primary_guard);
@@ -431,8 +451,9 @@ fn run_backup_checked(
     rsync_extra: &[String],
     run_mode: RunMode,
     mountpoint: &std::path::Path,
+    options: BackupOptions,
 ) -> Option<(i32, String)> {
-    let backup_result = run_backup(jobs, rsync_extra, run_mode, mountpoint);
+    let backup_result = run_backup(jobs, rsync_extra, run_mode, mountpoint, options);
     if let Err(err) = backup_result {
         let message = err.to_string();
         if message.starts_with("job ") && message.ends_with(" is already running") {
