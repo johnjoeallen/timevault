@@ -19,6 +19,7 @@ Timevault reads a YAML config file (default `/etc/timevault.yaml`).
 - `userMountBase`: Where Timevault mounts disks for user inspection. Default: `/run/timevault/user-mounts`.
 - `backupDisks`: List of enrolled backup disks (required for backups).
 - `excludes`: Global exclude paths applied to all jobs.
+- `options`: Optional defaults for CLI flags (currently `cascade`, `exclude-pristine`, `verbose`, `safe`, `rsync`). CLI flags still take precedence. `rsync` args from config are prepended to any CLI `--rsync` args.
 - `jobs`: List of backup jobs.
 
 ### backupDisks entries
@@ -96,6 +97,13 @@ excludes:
   - ".thumbnails"
   - "/run"
   - "/root/tmp"
+options:
+  cascade: false
+  exclude-pristine: false
+  verbose: false
+  safe: false
+  rsync:
+    - "--one-file-system"
 
 jobs:
   - name: "primary"
@@ -118,6 +126,8 @@ Global options:
 - `--safe`: Do not delete files; rsync without delete flags.
 - `--verbose`: More detailed logging.
 - `--print-order`: Print resolved job order and exit.
+- `--exclude-pristine`: Exclude pristine package-managed files.
+- `--exclude-pristine-only`: Generate pristine excludes and exit (no backup).
 - `--rsync <args...>`: Pass remaining args to rsync.
 - `--disk-id <id>`: Select a specific enrolled disk.
 - `--cascade`: Run backups across all connected disks.
@@ -133,7 +143,10 @@ Global options:
 - With `--cascade`, uses the primary disk’s `current` as the source for other disks.
 
 ### Disk enroll
-- `timevault disk enroll --disk-id <id> --fs-uuid <uuid>`
+- `timevault disk enroll --disk-id <id> [--fs-uuid <uuid> | --device <path>] [--label <label>] [--mount-options <opts>] [--force]`
+- `--fs-uuid` picks a disk by filesystem UUID; `--device` uses a block device path (alias `--block-id`).
+- `--label` sets a human-friendly label in the config.
+- `--mount-options` overrides the mount options stored for this disk (default `rw,nodev,nosuid,noexec`).
 - If the disk already contains a `.timevault` identity, `--disk-id` is optional.
 - `--force` reinitializes an existing identity or non-empty disk.
 
@@ -217,7 +230,8 @@ Override schedule or config:
 - Use `systemctl edit timevault.service` to set `--config` or other flags.
 
 ### Passing options to the systemd service
-To pass options (like `--config`, `--safe`, or `--rsync`), create a drop-in override for the service:
+Prefer `options` in `/etc/timevault.yaml` for routine flags (like `cascade`, `exclude-pristine`, or `verbose`). Use service overrides mainly for testing or one-off runs.
+To pass options (like `--config`, `--safe`, or `--rsync`) directly, create a drop-in override for the service:
 ```bash
 sudo systemctl edit timevault.service
 ```
@@ -233,6 +247,11 @@ sudo systemctl daemon-reload
 sudo systemctl restart timevault.service
 ```
 You can also set a different config for the timer run (the service is what the timer triggers).
+
+### Pristine exclude cache
+Pristine exclude caching uses:
+- `~/.cache/timevault/pristine-cache.json`
+Delete this file to force a full regeneration on the next run.
 ## Remote backups
 Remote job sources require passwordless SSH (keys configured for the remote host), and the remote host must have rsync installed.
 

@@ -37,6 +37,13 @@ excludes:
   - ".thumbnails"
   - "/run"
   - "/root/tmp"
+options:
+  cascade: false
+  exclude-pristine: false
+  verbose: false
+  safe: false
+  rsync:
+    - "--one-file-system"
 
 jobs:
   - name: "primary"

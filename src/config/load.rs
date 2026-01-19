@@ -120,6 +120,7 @@ fn parse_runtime(cfg: Config) -> Result<RuntimeConfig> {
         user_mount_base: cfg
             .user_mount_base
             .unwrap_or_else(|| DEFAULT_USER_MOUNT_BASE.to_string()),
+        options: cfg.options,
     })
 }
 

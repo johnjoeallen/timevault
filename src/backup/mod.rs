@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use chrono::{Duration, Local};
 use walkdir::WalkDir;
 
+use crate::backup::pristine::build_pristine_excludes;
 use crate::backup::rsync::run_rsync;
 use crate::config::model::Job;
 use crate::error::{Result, TimevaultError};
@@ -14,8 +15,15 @@ use crate::types::RunMode;
 use crate::util::paths::job_lock_path;
 
 pub mod rsync;
+pub mod pristine;
 
 const TIMEVAULT_MARKER: &str = ".timevault";
+
+#[derive(Debug, Clone, Copy)]
+pub struct BackupOptions {
+    pub exclude_pristine: bool,
+    pub exclude_pristine_only: bool,
+}
 
 struct LockGuard {
     path: PathBuf,
@@ -51,7 +59,13 @@ pub fn run_backup(
     rsync_extra: &[String],
     run_mode: RunMode,
     disk_mount: &Path,
+    options: BackupOptions,
 ) -> Result<()> {
+    let pristine_excludes = if options.exclude_pristine {
+        Some(build_pristine_excludes(run_mode.verbose)?)
+    } else {
+        None
+    };
     for job in jobs {
         let _lock = acquire_lock_for_job(&job.name, run_mode)?;
         let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
@@ -60,10 +74,20 @@ pub fn run_backup(
             fs::create_dir_all(&tmp_dir)?;
         }
         let excludes_file = tmp_dir.join("timevault.excludes");
+        let excludes = build_exclude_list(&job, pristine_excludes.as_deref())?;
         if run_mode.dry_run {
             println!("dry-run: would write excludes file {}", excludes_file.display());
         } else {
-            create_excludes_file(&job, &excludes_file)?;
+            create_excludes_file(&excludes, &excludes_file)?;
+        }
+        if options.exclude_pristine_only {
+            if run_mode.verbose {
+                println!(
+                    "pristine: exclude-only mode enabled; skipping backup for job {}",
+                    job.name
+                );
+            }
+            continue;
         }
 
         let backup_day = (Local::now() - Duration::days(1)).format("%Y%m%d").to_string();
@@ -147,9 +171,44 @@ pub fn run_backup(
     Ok(())
 }
 
-fn create_excludes_file(job: &Job, filename: &Path) -> io::Result<()> {
+pub fn run_pristine_only(jobs: Vec<Job>, run_mode: RunMode, options: BackupOptions) -> Result<()> {
+    if run_mode.verbose {
+        println!("pristine: exclude-only mode enabled; skipping backup");
+    }
+    let pristine_excludes = if options.exclude_pristine {
+        Some(build_pristine_excludes(run_mode.verbose)?)
+    } else {
+        None
+    };
+    for job in jobs {
+        let _lock = acquire_lock_for_job(&job.name, run_mode)?;
+        let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        let tmp_dir = Path::new(&home).join("tmp");
+        if !run_mode.dry_run {
+            fs::create_dir_all(&tmp_dir)?;
+        }
+        let excludes_file = tmp_dir.join("timevault.excludes");
+        let excludes = build_exclude_list(&job, pristine_excludes.as_deref())?;
+        if run_mode.dry_run {
+            println!("dry-run: would write excludes file {}", excludes_file.display());
+        } else {
+            create_excludes_file(&excludes, &excludes_file)?;
+        }
+    }
+    Ok(())
+}
+
+fn build_exclude_list(job: &Job, pristine_excludes: Option<&[String]>) -> Result<Vec<String>> {
+    let mut excludes = job.excludes.clone();
+    if let Some(pristine) = pristine_excludes {
+        excludes.extend(pristine.iter().cloned());
+    }
+    Ok(excludes)
+}
+
+fn create_excludes_file(excludes: &[String], filename: &Path) -> io::Result<()> {
     let mut f = File::create(filename)?;
-    for exclude in &job.excludes {
+    for exclude in excludes {
         writeln!(f, "{}", exclude)?;
     }
     Ok(())

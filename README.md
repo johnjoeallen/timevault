@@ -13,6 +13,7 @@ Timevault is a safe, rsync-based backup tool built for people who want dependabl
 - Disk enrollment by filesystem UUID with a `.timevault` identity file.
 - Snapshot rotation with date-stamped directories and a `current` symlink.
 - Safe and dry-run modes for validation before writing.
+- Optional pristine package excludes cached at `~/.cache/timevault/pristine-cache.json`.
 - Manual runs: target jobs with `--job`, select disks with `--disk-id`, or cascade with `--cascade`.
 - Systemd service + timer support for unattended schedules.
 

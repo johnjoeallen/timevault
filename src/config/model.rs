@@ -7,12 +7,28 @@ pub struct Config {
     pub jobs: Vec<JobConfig>,
     #[serde(default)]
     pub excludes: Vec<String>,
+    #[serde(default)]
+    pub options: ConfigOptions,
     #[serde(default, rename = "backupDisks")]
     pub backup_disks: Vec<BackupDiskConfig>,
     #[serde(default, rename = "mountBase", skip_serializing_if = "Option::is_none")]
     pub mount_base: Option<String>,
     #[serde(default, rename = "userMountBase", skip_serializing_if = "Option::is_none")]
     pub user_mount_base: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct ConfigOptions {
+    #[serde(rename = "exclude-pristine", skip_serializing_if = "Option::is_none")]
+    pub exclude_pristine: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cascade: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verbose: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub safe: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rsync: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -56,6 +72,7 @@ pub struct RuntimeConfig {
     pub backup_disks: Vec<BackupDiskConfig>,
     pub mount_base: String,
     pub user_mount_base: String,
+    pub options: ConfigOptions,
 }
 
 fn default_run_policy() -> String {

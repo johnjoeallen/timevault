@@ -8,6 +8,7 @@ use clap::Parser;
 use crate::cli::args::{Cli, Command, DiskCommand};
 use crate::cli::commands::{backup, disk_add, disk_inspect, exit_for_error, mount, umount};
 use crate::types::RunMode;
+use crate::backup::BackupOptions;
 
 const CONFIG_FILE: &str = "/etc/timevault.yaml";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -42,6 +43,10 @@ pub fn run() -> Result<()> {
         safe_mode: cli.safe,
         verbose: cli.verbose,
     };
+    let options = BackupOptions {
+        exclude_pristine: cli.exclude_pristine || cli.exclude_pristine_only,
+        exclude_pristine_only: cli.exclude_pristine_only,
+    };
 
     let command = cli.command.clone().unwrap_or(Command::Backup);
     match command {
@@ -53,6 +58,7 @@ pub fn run() -> Result<()> {
             cli.cascade,
             run_mode,
             &rsync_extra,
+            options,
         )?,
         Command::Disk { command } => match command {
             DiskCommand::Enroll(args) => {
@@ -181,6 +187,8 @@ fn print_help() {
     println!("  --dry-run              Do not write data");
     println!("  --safe                 Do not delete files");
     println!("  --verbose              Verbose logging");
+    println!("  --exclude-pristine     Exclude pristine package-managed files");
+    println!("  --exclude-pristine-only  Generate pristine excludes and exit");
     println!("  --print-order          Print resolved job order and exit");
     println!("  --rsync <args...>      Pass remaining args to rsync");
     println!("  --disk-id <id>         Select enrolled backup disk");

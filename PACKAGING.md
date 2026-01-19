@@ -38,3 +38,4 @@ sudo apt install ./target/debian/*.deb
 - Example config and docs are installed under `/usr/share/doc/timevault/`.
 - Systemd service + timer are installed under `/lib/systemd/system/`.
 - User config is not overwritten on upgrade.
+- Pristine exclude cache lives at `~/.cache/timevault/pristine-cache.json`.

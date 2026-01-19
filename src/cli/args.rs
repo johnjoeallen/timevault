@@ -21,6 +21,10 @@ pub struct Cli {
     pub job: Vec<String>,
     #[arg(long, global = true)]
     pub print_order: bool,
+    #[arg(long, global = true)]
+    pub exclude_pristine: bool,
+    #[arg(long, global = true)]
+    pub exclude_pristine_only: bool,
 
     #[arg(long, global = true)]
     pub disk_id: Option<String>,
