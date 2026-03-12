@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use chrono::Utc;
 use tempfile::Builder;
 
-use crate::cli::args::{DiskAddArgs, DiskUnenrollArgs};
+use crate::cli::args::{DiskAddArgs, DiskStateArgs, DiskUnenrollArgs};
 use crate::config::model::{BackupDiskConfig, Config};
 use crate::config::save::save_config;
 use crate::disk::discovery::list_candidates;
@@ -149,6 +149,8 @@ pub fn run_enroll(config_path: &Path, disk_id: Option<&str>, args: DiskAddArgs) 
         fs_uuid: fs_uuid.as_str().to_string(),
         label: args.label,
         mount_options: args.mount_options,
+        disabled: false,
+        rotated_out: false,
     });
     save_config(config_path.to_string_lossy().as_ref(), &cfg)?;
     Ok(())
@@ -164,6 +166,10 @@ pub fn run_discover(config_path: &Path) -> Result<()> {
         return Ok(());
     }
     for candidate in candidates {
+        let enrolled_disk = cfg
+            .backup_disks
+            .iter()
+            .find(|disk| disk.fs_uuid == candidate.uuid);
         println!("uuid: {}", candidate.uuid);
         println!("  device: {}", candidate.device.display());
         if let Some(mp) = candidate.mounted_at {
@@ -177,6 +183,19 @@ pub fn run_discover(config_path: &Path) -> Result<()> {
             println!("  capacity: unknown");
         }
         println!("  enrolled: {}", if candidate.enrolled { "yes" } else { "no" });
+        match enrolled_disk {
+            Some(disk) => {
+                println!("  enabled: {}", if disk.disabled { "no" } else { "yes" });
+                println!(
+                    "  rotation: {}",
+                    if disk.rotated_out { "out" } else { "in" }
+                );
+            }
+            None => {
+                println!("  enabled: n/a");
+                println!("  rotation: n/a");
+            }
+        }
         if let Some(identity) = candidate.identity {
             println!("  identity.diskId: {}", identity.disk_id);
             println!("  identity.fsUuid: {}", identity.fs_uuid);
@@ -456,6 +475,20 @@ pub fn run_rename(config_path: &Path, args: crate::cli::args::DiskRenameArgs) ->
     Ok(())
 }
 
+pub fn run_set_disabled(config_path: &Path, args: DiskStateArgs, disabled: bool) -> Result<()> {
+    let action = if disabled { "disk disable" } else { "disk enable" };
+    update_disk_state(config_path, args, action, |disk| disk.disabled = disabled)
+}
+
+pub fn run_set_rotated_out(config_path: &Path, args: DiskStateArgs, rotated_out: bool) -> Result<()> {
+    let action = if rotated_out {
+        "disk rotate-out"
+    } else {
+        "disk rotate-in"
+    };
+    update_disk_state(config_path, args, action, |disk| disk.rotated_out = rotated_out)
+}
+
 pub fn run_unenroll(config_path: &Path, args: DiskUnenrollArgs) -> Result<()> {
     let disk_id = match args.disk_id.as_deref() {
         Some(disk_id) => {
@@ -529,6 +562,94 @@ pub fn run_unenroll(config_path: &Path, args: DiskUnenrollArgs) -> Result<()> {
     ))
 }
 
+fn update_disk_state<F>(
+    config_path: &Path,
+    args: DiskStateArgs,
+    action: &str,
+    mut update: F,
+) -> Result<()>
+where
+    F: FnMut(&mut BackupDiskConfig),
+{
+    let mut contents = String::new();
+    File::open(config_path)
+        .map_err(|e| TimevaultError::message(format!("open config {}: {}", config_path.display(), e)))?
+        .read_to_string(&mut contents)
+        .map_err(|e| TimevaultError::message(format!("read config {}: {}", config_path.display(), e)))?;
+    let mut cfg: Config = serde_yaml::from_str(&contents)
+        .map_err(|e| TimevaultError::message(format!("parse config: {}", e)))?;
+
+    let idx = resolve_disk_index(&cfg, args.disk_id.as_deref(), args.fs_uuid.as_deref(), action)?;
+    update(&mut cfg.backup_disks[idx]);
+    save_config(config_path.to_string_lossy().as_ref(), &cfg)?;
+    Ok(())
+}
+
+fn resolve_disk_index(
+    cfg: &Config,
+    disk_id: Option<&str>,
+    fs_uuid: Option<&str>,
+    action: &str,
+) -> Result<usize> {
+    let disk_id = match disk_id {
+        Some(disk_id) => {
+            let parsed = disk_id.parse::<DiskId>().map_err(|_| {
+                TimevaultError::message(format!(
+                    "disk-id {} must use only letters, digits, '.', '-', '_'",
+                    disk_id
+                ))
+            })?;
+            Some(parsed.as_str().to_string())
+        }
+        None => None,
+    };
+
+    if disk_id.is_none() && fs_uuid.is_none() {
+        return Err(TimevaultError::message(format!(
+            "{} requires --disk-id or --fs-uuid",
+            action
+        )));
+    }
+
+    if let Some(fs_uuid) = fs_uuid {
+        return cfg
+            .backup_disks
+            .iter()
+            .position(|disk| {
+                disk.fs_uuid == fs_uuid
+                    && disk_id
+                        .as_deref()
+                        .map(|id| disk.disk_id == id)
+                        .unwrap_or(true)
+            })
+            .ok_or_else(|| TimevaultError::message("disk not found in config".to_string()));
+    }
+
+    let matches: Vec<usize> = cfg
+        .backup_disks
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, disk)| {
+            if disk_id.as_deref().map(|id| disk.disk_id == id).unwrap_or(false) {
+                Some(idx)
+            } else {
+                None
+            }
+        })
+        .collect();
+    if matches.is_empty() {
+        return Err(TimevaultError::message(
+            "disk-id not found in config; use --fs-uuid".to_string(),
+        ));
+    }
+    if matches.len() > 1 {
+        return Err(TimevaultError::message(
+            "multiple disks with disk-id; use --fs-uuid to disambiguate".to_string(),
+        ));
+    }
+    Ok(matches[0])
+}
+
 fn is_disk_empty(root: &Path) -> Result<bool> {
     let entries = crate::util::paths::list_entries(root)?;
     for entry in entries {
@@ -587,9 +708,12 @@ mod tests {
                 fs_uuid: "uuid-a".to_string(),
                 label: None,
                 mount_options: None,
+                disabled: false,
+                rotated_out: false,
             }],
             mount_base: "/run/timevault/mounts".to_string(),
             user_mount_base: "/run/timevault/user-mounts".to_string(),
+            options: crate::config::model::ConfigOptions::default(),
         };
         let candidates = vec![candidate_with_identity("disk-a", "uuid-a")];
         let dupes = find_duplicate_disk_ids(&cfg, &candidates);
@@ -605,9 +729,12 @@ mod tests {
                 fs_uuid: "uuid-a".to_string(),
                 label: None,
                 mount_options: None,
+                disabled: false,
+                rotated_out: false,
             }],
             mount_base: "/run/timevault/mounts".to_string(),
             user_mount_base: "/run/timevault/user-mounts".to_string(),
+            options: crate::config::model::ConfigOptions::default(),
         };
         let candidates = vec![candidate_with_identity("disk-a", "uuid-b")];
         let dupes = find_duplicate_disk_ids(&cfg, &candidates);
@@ -624,16 +751,21 @@ mod tests {
                     fs_uuid: "uuid-a".to_string(),
                     label: None,
                     mount_options: None,
+                    disabled: false,
+                    rotated_out: false,
                 },
                 BackupDiskConfig {
                     disk_id: "disk-a".to_string(),
                     fs_uuid: "uuid-b".to_string(),
                     label: None,
                     mount_options: None,
+                    disabled: false,
+                    rotated_out: false,
                 },
             ],
             mount_base: "/run/timevault/mounts".to_string(),
             user_mount_base: "/run/timevault/user-mounts".to_string(),
+            options: crate::config::model::ConfigOptions::default(),
         };
         let dupes = find_duplicate_disk_ids(&cfg, &[]);
         assert_eq!(dupes, vec!["disk-a".to_string()]);
@@ -646,18 +778,23 @@ mod tests {
         let cfg = Config {
             jobs: Vec::new(),
             excludes: Vec::new(),
+            options: crate::config::model::ConfigOptions::default(),
             backup_disks: vec![
                 BackupDiskConfig {
                     disk_id: "disk-a".to_string(),
                     fs_uuid: "uuid-a".to_string(),
                     label: None,
                     mount_options: None,
+                    disabled: false,
+                    rotated_out: false,
                 },
                 BackupDiskConfig {
                     disk_id: "disk-b".to_string(),
                     fs_uuid: "uuid-b".to_string(),
                     label: None,
                     mount_options: None,
+                    disabled: false,
+                    rotated_out: false,
                 },
             ],
             mount_base: None,
@@ -684,18 +821,23 @@ mod tests {
         let cfg = Config {
             jobs: Vec::new(),
             excludes: Vec::new(),
+            options: crate::config::model::ConfigOptions::default(),
             backup_disks: vec![
                 BackupDiskConfig {
                     disk_id: "disk-a".to_string(),
                     fs_uuid: "uuid-a".to_string(),
                     label: None,
                     mount_options: None,
+                    disabled: false,
+                    rotated_out: false,
                 },
                 BackupDiskConfig {
                     disk_id: "disk-b".to_string(),
                     fs_uuid: "uuid-b".to_string(),
                     label: None,
                     mount_options: None,
+                    disabled: false,
+                    rotated_out: false,
                 },
             ],
             mount_base: None,
@@ -722,6 +864,7 @@ mod tests {
         let cfg = Config {
             jobs: Vec::new(),
             excludes: Vec::new(),
+            options: crate::config::model::ConfigOptions::default(),
             backup_disks: Vec::new(),
             mount_base: None,
             user_mount_base: None,
@@ -742,18 +885,23 @@ mod tests {
         let cfg = Config {
             jobs: Vec::new(),
             excludes: Vec::new(),
+            options: crate::config::model::ConfigOptions::default(),
             backup_disks: vec![
                 BackupDiskConfig {
                     disk_id: "disk-a".to_string(),
                     fs_uuid: "uuid-a".to_string(),
                     label: None,
                     mount_options: None,
+                    disabled: false,
+                    rotated_out: false,
                 },
                 BackupDiskConfig {
                     disk_id: "disk-a".to_string(),
                     fs_uuid: "uuid-b".to_string(),
                     label: None,
                     mount_options: None,
+                    disabled: false,
+                    rotated_out: false,
                 },
             ],
             mount_base: None,
@@ -775,11 +923,14 @@ mod tests {
         let cfg = Config {
             jobs: Vec::new(),
             excludes: Vec::new(),
+            options: crate::config::model::ConfigOptions::default(),
             backup_disks: vec![BackupDiskConfig {
                 disk_id: "disk-a".to_string(),
                 fs_uuid: "uuid-a".to_string(),
                 label: None,
                 mount_options: None,
+                disabled: false,
+                rotated_out: false,
             }],
             mount_base: None,
             user_mount_base: None,
@@ -791,5 +942,69 @@ mod tests {
             fs_uuid: None,
         };
         assert!(run_unenroll(&config_path, args).is_err());
+    }
+
+    #[test]
+    fn disk_disable_updates_config() {
+        let dir = TempDir::new().expect("tempdir");
+        let config_path = dir.path().join("timevault.yaml");
+        let cfg = Config {
+            jobs: Vec::new(),
+            excludes: Vec::new(),
+            options: crate::config::model::ConfigOptions::default(),
+            backup_disks: vec![BackupDiskConfig {
+                disk_id: "disk-a".to_string(),
+                fs_uuid: "uuid-a".to_string(),
+                label: None,
+                mount_options: None,
+                disabled: false,
+                rotated_out: false,
+            }],
+            mount_base: None,
+            user_mount_base: None,
+        };
+        save_config(config_path.to_string_lossy().as_ref(), &cfg).expect("save");
+
+        let args = DiskStateArgs {
+            disk_id: Some("disk-a".to_string()),
+            fs_uuid: None,
+        };
+        run_set_disabled(&config_path, args, true).expect("disable");
+
+        let contents = std::fs::read_to_string(&config_path).expect("read");
+        let updated: Config = serde_yaml::from_str(&contents).expect("parse");
+        assert!(updated.backup_disks[0].disabled);
+    }
+
+    #[test]
+    fn disk_rotate_out_updates_config() {
+        let dir = TempDir::new().expect("tempdir");
+        let config_path = dir.path().join("timevault.yaml");
+        let cfg = Config {
+            jobs: Vec::new(),
+            excludes: Vec::new(),
+            options: crate::config::model::ConfigOptions::default(),
+            backup_disks: vec![BackupDiskConfig {
+                disk_id: "disk-a".to_string(),
+                fs_uuid: "uuid-a".to_string(),
+                label: None,
+                mount_options: None,
+                disabled: false,
+                rotated_out: false,
+            }],
+            mount_base: None,
+            user_mount_base: None,
+        };
+        save_config(config_path.to_string_lossy().as_ref(), &cfg).expect("save");
+
+        let args = DiskStateArgs {
+            disk_id: None,
+            fs_uuid: Some("uuid-a".to_string()),
+        };
+        run_set_rotated_out(&config_path, args, true).expect("rotate-out");
+
+        let contents = std::fs::read_to_string(&config_path).expect("read");
+        let updated: Config = serde_yaml::from_str(&contents).expect("parse");
+        assert!(updated.backup_disks[0].rotated_out);
     }
 }

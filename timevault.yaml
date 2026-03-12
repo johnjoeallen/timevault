@@ -6,6 +6,8 @@ backupDisks:
     fsUuid: "REPLACE-WITH-UUID"
     label: "primary-backup"
     mountOptions: "rw,nodev,nosuid,noexec"
+    # disabled: true
+    # rotatedOut: true
 excludes:
   - "/backups"
   - "/proc"

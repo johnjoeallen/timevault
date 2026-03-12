@@ -4,6 +4,7 @@ use chrono::Local;
 
 use crate::backup::{print_job_details, run_backup, run_pristine_only, BackupOptions};
 use crate::cli::commands::exit_for_disk_error;
+use crate::config::model::BackupDiskConfig;
 use crate::config::load::load_config;
 use crate::disk::{
     connected_disks_in_order, device_path_for_uuid, mount_disk_guarded, mount_options_for_backup,
@@ -130,6 +131,10 @@ pub fn run_backup_command(
             Err(TimevaultError::Disk(err)) => exit_for_disk_error(&err),
             Err(err) => return Err(err),
         };
+        if primary_disk.disabled {
+            println!("disk {} is disabled for backups; aborting", primary_disk.disk_id);
+            std::process::exit(2);
+        }
         jobs_to_run.retain(|job| job_requires_disk(job, disk_id));
         if jobs_to_run.is_empty() {
             println!("no jobs matched disk selection; aborting");
@@ -149,9 +154,19 @@ pub fn run_backup_command(
             std::process::exit(code);
         }
     } else {
+        let eligible_connected: Vec<BackupDiskConfig> = connected
+            .iter()
+            .filter(|disk| disk_is_eligible_for_automatic_backup(disk))
+            .cloned()
+            .collect();
+        if eligible_connected.is_empty() {
+            println!("no eligible backup disks connected; aborting");
+            std::process::exit(2);
+        }
+
         let mut groups: HashMap<String, Vec<crate::config::model::Job>> = HashMap::new();
         for job in jobs_to_run {
-            let allowed = allowed_disks_for_job(&job, &connected);
+            let allowed = allowed_disks_for_job(&job, &eligible_connected);
             if allowed.is_empty() {
                 println!("job {} has no connected disks; aborting", job.name);
                 std::process::exit(2);
@@ -163,14 +178,14 @@ pub fn run_backup_command(
                 .push(job);
         }
 
-        for disk in &connected {
+        for disk in &eligible_connected {
             let Some(jobs) = groups.remove(&disk.disk_id) else {
                 continue;
             };
             if let Some((code, message)) = run_jobs_for_primary(
                 disk,
                 jobs,
-                &connected,
+                &eligible_connected,
                 cascade,
                 run_mode,
                 &rsync_extra,
@@ -211,6 +226,10 @@ fn allowed_disks_for_job(
             .collect(),
         None => connected.to_vec(),
     }
+}
+
+fn disk_is_eligible_for_automatic_backup(disk: &BackupDiskConfig) -> bool {
+    !disk.disabled && !disk.rotated_out
 }
 
 fn run_jobs_for_primary(
@@ -330,12 +349,16 @@ mod tests {
                 fs_uuid: "uuid-a".to_string(),
                 label: None,
                 mount_options: None,
+                disabled: false,
+                rotated_out: false,
             },
             crate::config::model::BackupDiskConfig {
                 disk_id: "disk-b".to_string(),
                 fs_uuid: "uuid-b".to_string(),
                 label: None,
                 mount_options: None,
+                disabled: false,
+                rotated_out: false,
             },
         ];
         let job = crate::config::model::Job {
@@ -359,12 +382,16 @@ mod tests {
                 fs_uuid: "uuid-a".to_string(),
                 label: None,
                 mount_options: None,
+                disabled: false,
+                rotated_out: false,
             },
             crate::config::model::BackupDiskConfig {
                 disk_id: "disk-b".to_string(),
                 fs_uuid: "uuid-b".to_string(),
                 label: None,
                 mount_options: None,
+                disabled: false,
+                rotated_out: false,
             },
         ];
         let job = crate::config::model::Job {
@@ -377,6 +404,38 @@ mod tests {
         };
         let allowed = allowed_disks_for_job(&job, &connected);
         assert_eq!(allowed.len(), 2);
+    }
+
+    #[test]
+    fn automatic_backup_excludes_disabled_and_rotated_out_disks() {
+        let disabled = BackupDiskConfig {
+            disk_id: "disk-a".to_string(),
+            fs_uuid: "uuid-a".to_string(),
+            label: None,
+            mount_options: None,
+            disabled: true,
+            rotated_out: false,
+        };
+        let rotated = BackupDiskConfig {
+            disk_id: "disk-b".to_string(),
+            fs_uuid: "uuid-b".to_string(),
+            label: None,
+            mount_options: None,
+            disabled: false,
+            rotated_out: true,
+        };
+        let active = BackupDiskConfig {
+            disk_id: "disk-c".to_string(),
+            fs_uuid: "uuid-c".to_string(),
+            label: None,
+            mount_options: None,
+            disabled: false,
+            rotated_out: false,
+        };
+
+        assert!(!disk_is_eligible_for_automatic_backup(&disabled));
+        assert!(!disk_is_eligible_for_automatic_backup(&rotated));
+        assert!(disk_is_eligible_for_automatic_backup(&active));
     }
 }
 

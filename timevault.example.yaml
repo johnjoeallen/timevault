@@ -9,6 +9,8 @@ backupDisks:
     fsUuid: "REPLACE-WITH-UUID"
     label: "primary-backup"
     mountOptions: "rw,nodev,nosuid,noexec"
+    # disabled: true    # hard stop: never use this disk for backups
+    # rotatedOut: true  # skip automatic backups, but allow explicit --disk-id runs
 excludes:
   - "/backups"
   - "/proc"

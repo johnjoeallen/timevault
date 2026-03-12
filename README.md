@@ -9,12 +9,13 @@ Timevault is a safe, rsync-based backup tool built for people who want dependabl
 - Minimal moving parts: YAML config, rsync, and system tools you already have.
 
 ## Features
-- YAML config with job-based backups, run policies, and per-job disk allowlists.
+- YAML config with job-based backups, run policies, per-job disk allowlists, and disk states (`disabled`, `rotatedOut`).
 - Disk enrollment by filesystem UUID with a `.timevault` identity file.
 - Snapshot rotation with date-stamped directories and a `current` symlink.
 - Safe and dry-run modes for validation before writing.
 - Optional pristine package excludes cached at `~/.cache/timevault/pristine-cache.json`.
 - Manual runs: target jobs with `--job`, select disks with `--disk-id`, or cascade with `--cascade`.
+- Disk management commands for rename, enable/disable, and rotation control.
 - Systemd service + timer support for unattended schedules.
 
 ## Documentation

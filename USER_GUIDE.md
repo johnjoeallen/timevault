@@ -28,6 +28,8 @@ Each entry identifies a backup disk by UUID.
 - `fsUuid`: Filesystem UUID (from `/dev/disk/by-uuid`).
 - `label`: Optional human label.
 - `mountOptions`: Optional mount options for backups. Default: `rw,nodev,nosuid,noexec`.
+- `disabled`: Optional boolean. If `true`, Timevault will not use the disk for backups, including explicit `--disk-id` runs.
+- `rotatedOut`: Optional boolean. If `true`, Timevault skips the disk for automatic backup selection, but explicit `--disk-id <id>` runs still work.
 
 Example:
 ```yaml
@@ -36,6 +38,8 @@ backupDisks:
     fsUuid: "REPLACE-WITH-UUID"
     label: "primary-backup"
     mountOptions: "rw,nodev,nosuid,noexec"
+    # disabled: true
+    # rotatedOut: true
 ```
 
 ### Job entries
@@ -69,6 +73,8 @@ backupDisks:
     fsUuid: "REPLACE-WITH-UUID"
     label: "primary-backup"
     mountOptions: "rw,nodev,nosuid,noexec"
+    # disabled: true
+    # rotatedOut: true
 excludes:
   - "/backups"
   - "/proc"
@@ -162,6 +168,18 @@ Global options:
 - `timevault disk umount`
 - Unmounts a restore mount.
 
+### Disk enable / disable
+- `timevault disk enable [--disk-id <id> | --fs-uuid <uuid>]`
+- `timevault disk disable [--disk-id <id> | --fs-uuid <uuid>]`
+- `disable` keeps the disk enrolled but prevents all backup use, including explicit `--disk-id` runs.
+- `enable` clears that state.
+
+### Disk rotation
+- `timevault disk rotate-in [--disk-id <id> | --fs-uuid <uuid>]`
+- `timevault disk rotate-out [--disk-id <id> | --fs-uuid <uuid>]`
+- `rotate-out` keeps the disk enrolled but removes it from automatic backup selection and cascade planning.
+- `rotate-in` returns the disk to automatic rotation.
+
 ### Disk inspect
 - `timevault disk inspect [--disk-id <id>]`
 - Mounts the disk read-only, opens a shell in the mountpoint, unmounts on exit.
@@ -178,6 +196,8 @@ Global options:
 - If `diskIds` is set for a job, it will only run on those disks.
 - Without `--disk-id`, Timevault chooses the first connected disk in that list as the primary and cascades to the other connected disks in the list.
 - With `--disk-id`, only jobs that include that disk in `diskIds` will run.
+- Disks with `disabled: true` are never used for backups.
+- Disks with `rotatedOut: true` are skipped by automatic selection and cascade planning, but can still be targeted with `--disk-id`.
 
 ## Typical setup workflow
 1) Create a test config in your home directory:

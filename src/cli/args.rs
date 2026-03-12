@@ -53,6 +53,10 @@ pub enum DiskCommand {
     Mount(MountArgs),
     #[command(alias = "unmount", alias = "umount")]
     Umount(UmountArgs),
+    Enable(DiskStateArgs),
+    Disable(DiskStateArgs),
+    RotateIn(DiskStateArgs),
+    RotateOut(DiskStateArgs),
     Unenroll(DiskUnenrollArgs),
     Inspect(DiskInspectArgs),
     Rename(DiskRenameArgs),
@@ -94,6 +98,14 @@ pub struct UmountArgs {
 
 #[derive(Args, Debug, Clone)]
 pub struct DiskUnenrollArgs {
+    #[arg(long)]
+    pub disk_id: Option<String>,
+    #[arg(long)]
+    pub fs_uuid: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct DiskStateArgs {
     #[arg(long)]
     pub disk_id: Option<String>,
     #[arg(long)]

@@ -54,6 +54,10 @@ pub struct BackupDiskConfig {
     pub label: Option<String>,
     #[serde(default, rename = "mountOptions", skip_serializing_if = "Option::is_none")]
     pub mount_options: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub disabled: bool,
+    #[serde(default, rename = "rotatedOut", skip_serializing_if = "is_false")]
+    pub rotated_out: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -77,4 +81,8 @@ pub struct RuntimeConfig {
 
 fn default_run_policy() -> String {
     "auto".to_string()
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }

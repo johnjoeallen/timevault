@@ -82,6 +82,26 @@ pub fn run() -> Result<()> {
                     exit_for_error(&err);
                 }
             }
+            DiskCommand::Enable(args) => {
+                if let Err(err) = disk_add::run_set_disabled(&config_path, args, false) {
+                    exit_for_error(&err);
+                }
+            }
+            DiskCommand::Disable(args) => {
+                if let Err(err) = disk_add::run_set_disabled(&config_path, args, true) {
+                    exit_for_error(&err);
+                }
+            }
+            DiskCommand::RotateIn(args) => {
+                if let Err(err) = disk_add::run_set_rotated_out(&config_path, args, false) {
+                    exit_for_error(&err);
+                }
+            }
+            DiskCommand::RotateOut(args) => {
+                if let Err(err) = disk_add::run_set_rotated_out(&config_path, args, true) {
+                    exit_for_error(&err);
+                }
+            }
             DiskCommand::Inspect(args) => {
                 if let Err(err) = disk_inspect::run_inspect(&config_path, args, cli.disk_id.as_deref()) {
                     exit_for_error(&err);
@@ -176,6 +196,10 @@ fn print_help() {
     println!("  timevault disk discover");
     println!("  timevault disk mount [--disk-id <id>]");
     println!("  timevault disk umount");
+    println!("  timevault disk enable [--disk-id <id> | --fs-uuid <uuid>]");
+    println!("  timevault disk disable [--disk-id <id> | --fs-uuid <uuid>]");
+    println!("  timevault disk rotate-in [--disk-id <id> | --fs-uuid <uuid>]");
+    println!("  timevault disk rotate-out [--disk-id <id> | --fs-uuid <uuid>]");
     println!("  timevault disk inspect [--disk-id <id>]");
     println!("  timevault disk unenroll [--disk-id <id> | --fs-uuid <uuid>]");
     println!("  timevault disk rename [--disk-id <id> | --fs-uuid <uuid>] --new-id <id>");
@@ -198,6 +222,12 @@ fn print_help() {
     println!("  --label <label>        Optional disk label (disk enroll)");
     println!("  --mount-options <opt>  Mount options (disk enroll)");
     println!("  --force                Force disk enroll on non-empty root or existing identity");
+    println!();
+    println!("Disk state commands:");
+    println!("  enable                 Allow the disk to be used for backups again");
+    println!("  disable                Prevent the disk from being used for backups");
+    println!("  rotate-in              Return the disk to automatic backup rotation");
+    println!("  rotate-out             Exclude the disk from automatic backup rotation");
 }
 
 fn init_tracing() {

@@ -232,12 +232,16 @@ mod tests {
                 fs_uuid: "uuid-a".to_string(),
                 label: None,
                 mount_options: None,
+                disabled: false,
+                rotated_out: false,
             },
             BackupDiskConfig {
                 disk_id: "b".to_string(),
                 fs_uuid: "uuid-b".to_string(),
                 label: None,
                 mount_options: None,
+                disabled: false,
+                rotated_out: false,
             },
         ];
         let connected = ["uuid-b".to_string()].into_iter().collect();
