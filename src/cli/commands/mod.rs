@@ -1,5 +1,6 @@
 pub mod backup;
 pub mod disk_add;
+pub mod disk_check;
 pub mod disk_df;
 pub mod disk_du;
 pub mod disk_inspect;

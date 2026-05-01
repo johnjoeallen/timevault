@@ -5,7 +5,7 @@ use crate::cli::args::DiskDfArgs;
 use crate::config::load::load_config;
 use crate::config::model::BackupDiskConfig;
 use crate::disk::identity::{identity_path, read_identity, verify_identity};
-use crate::disk::{device_path_for_uuid, mount_options_for_restore};
+use crate::disk::{device_path_for_uuid, disk_matches_selector, mount_options_for_restore};
 use crate::error::{DiskError, Result, TimevaultError};
 use crate::mount::guard::MountGuard;
 use crate::mount::inspect::{find_device_mountpoint, mountpoint_is_mounted};
@@ -22,7 +22,11 @@ struct DfStats {
 
 pub fn run_df(config_path: &Path, args: DiskDfArgs, disk_id: Option<&str>) -> Result<()> {
     let cfg = load_config(config_path.to_string_lossy().as_ref())?;
-    let requested_id = args.selector.as_deref().or(disk_id);
+    let requested_id = args
+        .selector
+        .as_deref()
+        .or(args.fs_uuid.as_deref())
+        .or(disk_id);
     let disks = match requested_id {
         Some(id) => vec![select_configured_disk(&cfg.backup_disks, id)?],
         None => {
@@ -70,12 +74,14 @@ pub fn run_df(config_path: &Path, args: DiskDfArgs, disk_id: Option<&str>) -> Re
     Ok(())
 }
 
-fn select_configured_disk(disks: &[BackupDiskConfig], disk_id: &str) -> Result<BackupDiskConfig> {
+fn select_configured_disk(disks: &[BackupDiskConfig], selector: &str) -> Result<BackupDiskConfig> {
     disks
         .iter()
-        .find(|disk| disk.disk_id == disk_id)
+        .find(|disk| disk_matches_selector(disk, selector))
         .cloned()
-        .ok_or_else(|| DiskError::Other(format!("disk-id {} not found in config", disk_id)).into())
+        .ok_or_else(|| {
+            DiskError::Other(format!("disk selector {} not found in config", selector)).into()
+        })
 }
 
 fn mountpoint_for_df(
@@ -210,5 +216,19 @@ mod tests {
         assert_eq!(human_size(999), "999 B");
         assert_eq!(human_size(1_500_000), "1.50 MB");
         assert_eq!(human_size(75_000_000_000), "75.0 GB");
+    }
+
+    #[test]
+    fn selects_configured_disk_by_fs_uuid() {
+        let disks = vec![BackupDiskConfig {
+            disk_id: "primary".to_string(),
+            fs_uuid: "uuid-primary".to_string(),
+            label: None,
+            mount_options: None,
+            disabled: false,
+            rotated_out: false,
+        }];
+        let selected = select_configured_disk(&disks, "uuid-primary").expect("select disk");
+        assert_eq!(selected.disk_id, "primary");
     }
 }

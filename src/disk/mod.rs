@@ -97,12 +97,16 @@ pub fn resolve_fs_uuid(fs_uuid: Option<&str>, device: Option<&str>) -> Result<Fs
     ))
 }
 
-pub fn select_disk(disks: &[BackupDiskConfig], disk_id: Option<&str>) -> Result<BackupDiskConfig> {
+pub fn disk_matches_selector(disk: &BackupDiskConfig, selector: &str) -> bool {
+    disk.disk_id == selector || disk.fs_uuid == selector
+}
+
+pub fn select_disk(disks: &[BackupDiskConfig], selector: Option<&str>) -> Result<BackupDiskConfig> {
     let connected = connected_disks_in_order(disks)
         .into_iter()
         .map(|disk| disk.fs_uuid)
         .collect::<HashSet<_>>();
-    select_disk_from_connected(disks, disk_id, &connected)
+    select_disk_from_connected(disks, selector, &connected)
 }
 
 pub fn connected_disks_in_order(disks: &[BackupDiskConfig]) -> Vec<BackupDiskConfig> {
@@ -115,7 +119,7 @@ pub fn connected_disks_in_order(disks: &[BackupDiskConfig]) -> Vec<BackupDiskCon
 
 pub fn select_disk_from_connected(
     disks: &[BackupDiskConfig],
-    disk_id: Option<&str>,
+    selector: Option<&str>,
     connected_uuids: &HashSet<String>,
 ) -> Result<BackupDiskConfig> {
     if disks.is_empty() {
@@ -124,13 +128,17 @@ pub fn select_disk_from_connected(
         )
         .into());
     }
-    if let Some(disk_id) = disk_id {
+    if let Some(selector) = selector {
         let disk = disks
             .iter()
-            .find(|disk| disk.disk_id == disk_id)
-            .ok_or_else(|| DiskError::Other(format!("disk-id {} not found in config", disk_id)))?;
+            .find(|disk| disk_matches_selector(disk, selector))
+            .ok_or_else(|| {
+                DiskError::Other(format!("disk selector {} not found in config", selector))
+            })?;
         if !connected_uuids.contains(&disk.fs_uuid) {
-            return Err(DiskError::Other(format!("disk-id {} not connected", disk.disk_id)).into());
+            return Err(
+                DiskError::Other(format!("disk selector {} not connected", selector)).into(),
+            );
         }
         return Ok(disk.clone());
     }
@@ -150,7 +158,7 @@ pub fn select_disk_from_connected(
 
 pub fn select_first_connected(
     disks: &[BackupDiskConfig],
-    disk_id: Option<&str>,
+    selector: Option<&str>,
 ) -> Result<BackupDiskConfig> {
     let connected = connected_disks_in_order(disks);
     if disks.is_empty() {
@@ -159,13 +167,17 @@ pub fn select_first_connected(
         )
         .into());
     }
-    if let Some(disk_id) = disk_id {
+    if let Some(selector) = selector {
         let disk = disks
             .iter()
-            .find(|disk| disk.disk_id == disk_id)
-            .ok_or_else(|| DiskError::Other(format!("disk-id {} not found in config", disk_id)))?;
+            .find(|disk| disk_matches_selector(disk, selector))
+            .ok_or_else(|| {
+                DiskError::Other(format!("disk selector {} not found in config", selector))
+            })?;
         if !connected.iter().any(|item| item.fs_uuid == disk.fs_uuid) {
-            return Err(DiskError::Other(format!("disk-id {} not connected", disk.disk_id)).into());
+            return Err(
+                DiskError::Other(format!("disk selector {} not connected", selector)).into(),
+            );
         }
         return Ok(disk.clone());
     }
@@ -243,6 +255,9 @@ mod tests {
         ];
         let connected = ["uuid-b".to_string()].into_iter().collect();
         let selected = select_disk_from_connected(&disks, None, &connected).unwrap();
+        assert_eq!(selected.disk_id, "b");
+
+        let selected = select_disk_from_connected(&disks, Some("uuid-b"), &connected).unwrap();
         assert_eq!(selected.disk_id, "b");
     }
 }

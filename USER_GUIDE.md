@@ -135,7 +135,7 @@ Global options:
 - `--exclude-pristine`: Exclude pristine package-managed files.
 - `--exclude-pristine-only`: Generate pristine excludes and exit (no backup).
 - `--rsync <args...>`: Pass remaining args to rsync.
-- `--disk-id <id>`: Select a specific enrolled disk.
+- `--disk-id <id>`: Select a specific enrolled disk by disk id.
 - `--cascade`: Run backups across all connected disks.
 - `--version`: Show version and license info.
 - `-h`: Show help.
@@ -145,7 +145,7 @@ Global options:
 ### Backup (default)
 - `timevault` or `timevault backup`
 - Runs all jobs with `run: auto` unless `--job` is specified.
-- Uses the first connected disk unless `--disk-id` is set.
+- Uses the first connected disk unless `--disk-id` is set to a disk id or filesystem UUID.
 - With `--cascade`, uses the primary disk’s `current` as the source for other disks.
 
 ### Disk register
@@ -159,27 +159,34 @@ Global options:
 
 ### Disk ls
 - `timevault disk ls [--short | --columns]`
-- `timevault disk ls <disk-id>:/path`
+- `timevault disk ls <disk>:/path`
 - Alias: `timevault disk discover`
-- Without a path, scans `/dev/disk/by-uuid`, prints candidate disks, and includes enrolled offline disks.
+- `<disk>` may be either a disk id or filesystem UUID.
+- Without a path, scans `/dev/disk/by-uuid`, prints candidate disks, and includes registered offline disks.
 - Connected disk output includes the block device serial number when available.
-- `--short` prints tab-separated `diskId`, UUID, status, enabled state, and serial.
+- `--short` prints tab-separated `diskId`, UUID, status, registered state, enabled state, and serial.
 - `--columns` prints the same disk summary as a columnar table.
-- With `<disk-id>:/path`, mounts the enrolled disk read-only if needed and lists files under that path.
+- With `<disk>:/path`, mounts the enrolled disk read-only if needed and lists files under that path.
 
 ### Disk df
-- `timevault disk df [<id>]`
-- Compatibility: `--disk-id <id>` may be used instead of the positional id.
+- `timevault disk df [<disk>]`
+- Compatibility: `--disk-id <id>` or `--fs-uuid <uuid>` may be used instead of the positional selector.
 - Shows enabled state, size, used space, free space, and percent used for enrolled disks; offline disks are listed with unknown usage.
 
+### Disk check
+- `timevault disk check [<disk>]`
+- Compatibility: `--disk-id <id>` or `--fs-uuid <uuid>` may be used instead of the positional selector.
+- Scans configured disks, reports whether they are online or offline, and verifies connected `.timevault` identities against config.
+- Fails if a connected disk is missing its identity, has a mismatched `diskId`, or has a `.timevault` `fsUuid` that differs from the actual filesystem UUID.
+
 ### Disk du
-- `timevault disk du [du options] <disk-id>:/path`
-- Passes options through to the system `du` command after translating each `<disk-id>:/path` target to a verified read-only disk mount path.
+- `timevault disk du [du options] <disk>:/path`
+- Passes options through to the system `du` command after translating each `<disk>:/path` target to a verified read-only disk mount path.
 - Example: `timevault disk du -sh primary:/snapshots`
 
 ### Disk mount (restore)
-- `timevault disk mount [<id>]`
-- Compatibility: `--disk-id <id>` may be used instead of the positional id.
+- `timevault disk mount [<disk>]`
+- Compatibility: `--disk-id <id>` or `--fs-uuid <uuid>` may be used instead of the positional selector.
 - Mounts an enrolled disk read-only and prints the mountpoint.
 
 ### Disk umount
@@ -187,32 +194,32 @@ Global options:
 - Unmounts a restore mount.
 
 ### Disk enable / disable
-- `timevault disk enable <id>`
-- `timevault disk disable <id>`
-- Compatibility: `--disk-id <id>` or `--fs-uuid <uuid>` may be used instead of the positional id.
+- `timevault disk enable <disk>`
+- `timevault disk disable <disk>`
+- Compatibility: `--disk-id <id>` or `--fs-uuid <uuid>` may be used instead of the positional selector.
 - `disable` keeps the disk enrolled but prevents all backup use, including explicit `--disk-id` runs.
 - `enable` clears that state.
 
 ### Disk rotation
-- `timevault disk rotate-in <id>`
-- `timevault disk rotate-out <id>`
-- Compatibility: `--disk-id <id>` or `--fs-uuid <uuid>` may be used instead of the positional id.
+- `timevault disk rotate-in <disk>`
+- `timevault disk rotate-out <disk>`
+- Compatibility: `--disk-id <id>` or `--fs-uuid <uuid>` may be used instead of the positional selector.
 - `rotate-out` keeps the disk enrolled but removes it from automatic backup selection and cascade planning.
 - `rotate-in` returns the disk to automatic rotation.
 
 ### Disk inspect
-- `timevault disk inspect [<id>]`
-- Compatibility: `--disk-id <id>` may be used instead of the positional id.
+- `timevault disk inspect [<disk>]`
+- Compatibility: `--disk-id <id>` or `--fs-uuid <uuid>` may be used instead of the positional selector.
 - Mounts the disk read-only, opens a shell in the mountpoint, unmounts on exit.
 
 ### Disk unregister
-- `timevault disk unregister <id>`
-- Aliases: `timevault disk un-register <id>`, `timevault disk unenroll <id>`, `timevault disk de-register <id>`
-- Compatibility: `--disk-id <id>` or `--fs-uuid <uuid>` may be used instead of the positional id.
+- `timevault disk unregister <disk>`
+- Aliases: `timevault disk un-register <disk>`, `timevault disk unenroll <disk>`, `timevault disk de-register <disk>`
+- Compatibility: `--disk-id <id>` or `--fs-uuid <uuid>` may be used instead of the positional selector.
 - Removes the disk from config (does not delete `.timevault`).
 
 ### Disk rename
-- `timevault disk rename <old-id> <new-id>`
+- `timevault disk rename <old-disk> <new-id>`
 - Compatibility: `timevault disk rename [--disk-id <id> | --fs-uuid <uuid>] --new-id <id>`
 - Updates config and identity if the disk is connected.
 

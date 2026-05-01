@@ -57,6 +57,7 @@ pub enum DiskCommand {
     #[command(alias = "ls", alias = "list")]
     Discover(DiskLsArgs),
     Mount(MountArgs),
+    Check(DiskCheckArgs),
     Df(DiskDfArgs),
     Du(DiskDuArgs),
     #[command(alias = "unmount")]
@@ -116,13 +117,24 @@ pub struct DiskLsArgs {
 }
 
 #[derive(Args, Debug, Clone)]
+pub struct DiskCheckArgs {
+    pub selector: Option<String>,
+    #[arg(long)]
+    pub fs_uuid: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
 pub struct MountArgs {
     pub selector: Option<String>,
+    #[arg(long)]
+    pub fs_uuid: Option<String>,
 }
 
 #[derive(Args, Debug, Clone)]
 pub struct DiskDfArgs {
     pub selector: Option<String>,
+    #[arg(long)]
+    pub fs_uuid: Option<String>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -155,6 +167,8 @@ pub struct DiskStateArgs {
 #[derive(Args, Debug, Clone)]
 pub struct DiskInspectArgs {
     pub selector: Option<String>,
+    #[arg(long)]
+    pub fs_uuid: Option<String>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -285,6 +299,30 @@ mod tests {
     }
 
     #[test]
+    fn parses_disk_mount_with_fs_uuid() {
+        let cli = Cli::parse_from(["timevault", "disk", "mount", "--fs-uuid", "uuid-a"]);
+        let Some(Command::Disk {
+            command: DiskCommand::Mount(args),
+        }) = cli.command
+        else {
+            panic!("expected disk mount");
+        };
+        assert_eq!(args.fs_uuid.as_deref(), Some("uuid-a"));
+    }
+
+    #[test]
+    fn parses_disk_check_with_fs_uuid() {
+        let cli = Cli::parse_from(["timevault", "disk", "check", "--fs-uuid", "uuid-a"]);
+        let Some(Command::Disk {
+            command: DiskCommand::Check(args),
+        }) = cli.command
+        else {
+            panic!("expected disk check");
+        };
+        assert_eq!(args.fs_uuid.as_deref(), Some("uuid-a"));
+    }
+
+    #[test]
     fn parses_disk_inspect_with_positional_id() {
         let cli = Cli::parse_from(["timevault", "disk", "inspect", "primary"]);
         let Some(Command::Disk {
@@ -297,6 +335,18 @@ mod tests {
     }
 
     #[test]
+    fn parses_disk_inspect_with_fs_uuid() {
+        let cli = Cli::parse_from(["timevault", "disk", "inspect", "--fs-uuid", "uuid-a"]);
+        let Some(Command::Disk {
+            command: DiskCommand::Inspect(args),
+        }) = cli.command
+        else {
+            panic!("expected disk inspect");
+        };
+        assert_eq!(args.fs_uuid.as_deref(), Some("uuid-a"));
+    }
+
+    #[test]
     fn parses_disk_df_with_positional_id() {
         let cli = Cli::parse_from(["timevault", "disk", "df", "primary"]);
         let Some(Command::Disk {
@@ -306,6 +356,18 @@ mod tests {
             panic!("expected disk df");
         };
         assert_eq!(args.selector.as_deref(), Some("primary"));
+    }
+
+    #[test]
+    fn parses_disk_df_with_fs_uuid() {
+        let cli = Cli::parse_from(["timevault", "disk", "df", "--fs-uuid", "uuid-a"]);
+        let Some(Command::Disk {
+            command: DiskCommand::Df(args),
+        }) = cli.command
+        else {
+            panic!("expected disk df");
+        };
+        assert_eq!(args.fs_uuid.as_deref(), Some("uuid-a"));
     }
 
     #[test]

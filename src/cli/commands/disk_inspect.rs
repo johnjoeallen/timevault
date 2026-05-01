@@ -17,8 +17,12 @@ use crate::util::paths::{create_temp_dir, ensure_base_dir};
 
 pub fn run_inspect(config_path: &Path, args: DiskInspectArgs, disk_id: Option<&str>) -> Result<()> {
     let cfg = load_config(config_path.to_string_lossy().as_ref())?;
-    let disk_id = args.selector.as_deref().or(disk_id);
-    let disk = match select_disk(&cfg.backup_disks, disk_id) {
+    let selector = args
+        .selector
+        .as_deref()
+        .or(args.fs_uuid.as_deref())
+        .or(disk_id);
+    let disk = match select_disk(&cfg.backup_disks, selector) {
         Ok(disk) => disk,
         Err(TimevaultError::Disk(err)) => exit_for_disk_error(&err),
         Err(err) => return Err(err),

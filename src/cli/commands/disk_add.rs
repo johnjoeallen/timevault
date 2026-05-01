@@ -14,8 +14,8 @@ use crate::disk::identity::{
     identity_path, read_identity, write_identity, DiskIdentity, IDENTITY_VERSION,
 };
 use crate::disk::{
-    device_path_for_uuid, ensure_disk_not_mounted, mount_disk_guarded, mount_options_for_backup,
-    resolve_fs_uuid, DEFAULT_BACKUP_MOUNT_OPTS, DISK_ADD_ALLOWED_ENTRIES,
+    device_path_for_uuid, disk_matches_selector, ensure_disk_not_mounted, mount_disk_guarded,
+    mount_options_for_backup, resolve_fs_uuid, DEFAULT_BACKUP_MOUNT_OPTS, DISK_ADD_ALLOWED_ENTRIES,
 };
 use crate::error::{DiskError, Result, TimevaultError};
 use crate::mount::guard::MountGuard;
@@ -181,6 +181,7 @@ pub fn run_discover_with_output(config_path: &Path, output: DiskListOutput) -> R
     let cfg = crate::config::load::load_config(config_path.to_string_lossy().as_ref())?;
     warn_duplicate_disk_ids(&cfg);
     let candidates = list_candidates(&cfg.backup_disks, Path::new(&cfg.user_mount_base))?;
+    warn_registered_identity_mismatches(&cfg, &candidates);
     warn_duplicate_discovered_ids(&cfg, &candidates);
     if candidates.is_empty() && cfg.backup_disks.is_empty() {
         println!("no candidate backup devices found");
@@ -215,7 +216,7 @@ pub fn run_discover_with_output(config_path: &Path, output: DiskListOutput) -> R
             candidate.serial.as_deref().unwrap_or("unknown")
         );
         println!(
-            "  enrolled: {}",
+            "  registered: {}",
             if candidate.enrolled { "yes" } else { "no" }
         );
         match enrolled_disk {
@@ -263,7 +264,7 @@ pub fn run_discover_with_output(config_path: &Path, output: DiskListOutput) -> R
         println!("  mounted: no");
         println!("  capacity: unknown");
         println!("  serial: unknown");
-        println!("  enrolled: yes");
+        println!("  registered: yes");
         println!("  enabled: {}", if disk.disabled { "no" } else { "yes" });
         println!(
             "  rotation: {}",
@@ -272,7 +273,7 @@ pub fn run_discover_with_output(config_path: &Path, output: DiskListOutput) -> R
         if let Some(label) = &disk.label {
             println!("  label: {}", label);
         }
-        println!("  reason: enrolled, offline");
+        println!("  reason: registered, offline");
         println!();
     }
     Ok(())
@@ -286,8 +287,8 @@ fn print_discover_table(
     let mut seen_enrolled_uuids = std::collections::HashSet::new();
     if output == DiskListOutput::Columns {
         println!(
-            "{:<20} {:<36} {:<8} {:<7} {:<18} {:<12} DEVICE",
-            "DISK ID", "FS UUID", "STATUS", "ENABLED", "SERIAL", "CAPACITY"
+            "{:<20} {:<36} {:<8} {:<10} {:<7} {:<18} {:<12} DEVICE",
+            "DISK ID", "FS UUID", "STATUS", "REGISTERED", "ENABLED", "SERIAL", "CAPACITY"
         );
     }
     for candidate in candidates {
@@ -310,16 +311,18 @@ fn print_discover_table(
         let enabled = enrolled_disk
             .map(|disk| if disk.disabled { "no" } else { "yes" })
             .unwrap_or("n/a");
+        let registered = if enrolled_disk.is_some() { "yes" } else { "no" };
         let capacity = candidate
             .capacity_bytes
             .map(human_size)
             .unwrap_or_else(|| "-".to_string());
         if output == DiskListOutput::Columns {
             println!(
-                "{:<20} {:<36} {:<8} {:<7} {:<18} {:<12} {}",
+                "{:<20} {:<36} {:<8} {:<10} {:<7} {:<18} {:<12} {}",
                 disk_id,
                 candidate.uuid,
                 "online",
+                registered,
                 enabled,
                 candidate.serial.as_deref().unwrap_or("-"),
                 capacity,
@@ -327,10 +330,11 @@ fn print_discover_table(
             );
         } else {
             println!(
-                "{}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}\t{}",
                 disk_id,
                 candidate.uuid,
                 "online",
+                registered,
                 enabled,
                 candidate.serial.as_deref().unwrap_or("-")
             );
@@ -343,13 +347,13 @@ fn print_discover_table(
         let enabled = if disk.disabled { "no" } else { "yes" };
         if output == DiskListOutput::Columns {
             println!(
-                "{:<20} {:<36} {:<8} {:<7} {:<18} {:<12} -",
-                disk.disk_id, disk.fs_uuid, "offline", enabled, "-", "-"
+                "{:<20} {:<36} {:<8} {:<10} {:<7} {:<18} {:<12} -",
+                disk.disk_id, disk.fs_uuid, "offline", "yes", enabled, "-", "-"
             );
         } else {
             println!(
-                "{}\t{}\t{}\t{}\t{}",
-                disk.disk_id, disk.fs_uuid, "offline", enabled, "-"
+                "{}\t{}\t{}\t{}\t{}\t{}",
+                disk.disk_id, disk.fs_uuid, "offline", "yes", enabled, "-"
             );
         }
     }
@@ -374,6 +378,55 @@ fn warn_duplicate_disk_ids(cfg: &crate::config::model::RuntimeConfig) {
         );
         println!();
     }
+}
+
+fn warn_registered_identity_mismatches(
+    cfg: &crate::config::model::RuntimeConfig,
+    candidates: &[crate::disk::discovery::DiskCandidate],
+) {
+    let mut mismatches = find_registered_identity_mismatches(cfg, candidates);
+    if mismatches.is_empty() {
+        return;
+    }
+    mismatches.sort();
+    println!();
+    println!("WARNING: registered disk identity mismatch:");
+    for mismatch in mismatches {
+        println!("  {}", mismatch);
+    }
+    println!();
+}
+
+fn find_registered_identity_mismatches(
+    cfg: &crate::config::model::RuntimeConfig,
+    candidates: &[crate::disk::discovery::DiskCandidate],
+) -> Vec<String> {
+    let mut mismatches = Vec::new();
+    for candidate in candidates {
+        let Some(config_disk) = cfg
+            .backup_disks
+            .iter()
+            .find(|disk| disk.fs_uuid == candidate.uuid)
+        else {
+            continue;
+        };
+        let Some(identity) = &candidate.identity else {
+            continue;
+        };
+        if identity.fs_uuid != config_disk.fs_uuid {
+            mismatches.push(format!(
+                "{}: actual fsUuid {}, identity has {}",
+                config_disk.disk_id, config_disk.fs_uuid, identity.fs_uuid
+            ));
+        }
+        if identity.disk_id != config_disk.disk_id {
+            mismatches.push(format!(
+                "{}: expected diskId {}, identity has {}",
+                config_disk.fs_uuid, config_disk.disk_id, identity.disk_id
+            ));
+        }
+    }
+    mismatches
 }
 
 fn warn_duplicate_discovered_ids(
@@ -455,11 +508,11 @@ pub fn run_rename(config_path: &Path, args: crate::cli::args::DiskRenameArgs) ->
             )));
         }
     };
-    let disk_id = selector_or_flag(args.selector.as_deref(), args.disk_id.as_deref());
+    let selector = selector_or_flag(args.selector.as_deref(), args.disk_id.as_deref());
 
-    if disk_id.is_none() && args.fs_uuid.is_none() {
+    if selector.is_none() && args.fs_uuid.is_none() {
         return Err(TimevaultError::message(
-            "disk rename requires <disk-id>, --disk-id, or --fs-uuid".to_string(),
+            "disk rename requires <disk-id-or-fs-uuid>, --disk-id, or --fs-uuid".to_string(),
         ));
     }
 
@@ -486,34 +539,15 @@ pub fn run_rename(config_path: &Path, args: crate::cli::args::DiskRenameArgs) ->
         )));
     }
 
-    let idx: Option<usize> = if let Some(fs_uuid) = args.fs_uuid.as_deref() {
-        cfg.backup_disks.iter().position(|disk| {
-            disk.fs_uuid == fs_uuid && disk_id.map(|id| disk.disk_id == id).unwrap_or(true)
-        })
-    } else {
-        let matches: Vec<usize> = cfg
-            .backup_disks
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, disk)| {
-                if disk_id.map(|id| disk.disk_id == id).unwrap_or(false) {
-                    Some(idx)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        if matches.is_empty() {
-            return Err(TimevaultError::message(
-                "disk-id not found in config; use --fs-uuid".to_string(),
-            ));
+    let idx = match resolve_disk_index(&cfg, selector, args.fs_uuid.as_deref(), "disk rename") {
+        Ok(idx) => Some(idx),
+        Err(err) if args.fs_uuid.is_some() => {
+            if selector.is_some() {
+                return Err(err);
+            }
+            None
         }
-        if matches.len() > 1 {
-            return Err(TimevaultError::message(
-                "multiple disks with disk-id; use --fs-uuid to disambiguate".to_string(),
-            ));
-        }
-        Some(matches[0])
+        Err(err) => return Err(err),
     };
 
     if let Some(idx) = idx {
@@ -642,23 +676,11 @@ pub fn run_set_rotated_out(
 }
 
 pub fn run_unenroll(config_path: &Path, args: DiskUnenrollArgs) -> Result<()> {
-    let raw_disk_id = selector_or_flag(args.selector.as_deref(), args.disk_id.as_deref());
-    let disk_id = match raw_disk_id {
-        Some(disk_id) => {
-            let parsed = disk_id.parse::<DiskId>().map_err(|_| {
-                TimevaultError::message(format!(
-                    "disk-id {} must use only letters, digits, '.', '-', '_'",
-                    disk_id
-                ))
-            })?;
-            Some(parsed.as_str().to_string())
-        }
-        None => None,
-    };
+    let selector = selector_or_flag(args.selector.as_deref(), args.disk_id.as_deref());
 
-    if disk_id.is_none() && args.fs_uuid.is_none() {
+    if selector.is_none() && args.fs_uuid.is_none() {
         return Err(TimevaultError::message(
-            "disk unenroll requires <disk-id>, --disk-id, or --fs-uuid".to_string(),
+            "disk unenroll requires <disk-id-or-fs-uuid>, --disk-id, or --fs-uuid".to_string(),
         ));
     }
 
@@ -674,53 +696,11 @@ pub fn run_unenroll(config_path: &Path, args: DiskUnenrollArgs) -> Result<()> {
     let mut cfg: Config = serde_yaml::from_str(&contents)
         .map_err(|e| TimevaultError::message(format!("parse config: {}", e)))?;
 
-    let idx: Option<usize> = if let Some(fs_uuid) = args.fs_uuid.as_deref() {
-        cfg.backup_disks.iter().position(|disk| {
-            disk.fs_uuid == fs_uuid
-                && disk_id
-                    .as_deref()
-                    .map(|id| disk.disk_id == id)
-                    .unwrap_or(true)
-        })
-    } else {
-        let matches: Vec<usize> = cfg
-            .backup_disks
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, disk)| {
-                if disk_id
-                    .as_deref()
-                    .map(|id| disk.disk_id == id)
-                    .unwrap_or(false)
-                {
-                    Some(idx)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        if matches.is_empty() {
-            return Err(TimevaultError::message(
-                "disk-id not found in config; use --fs-uuid".to_string(),
-            ));
-        }
-        if matches.len() > 1 {
-            return Err(TimevaultError::message(
-                "multiple disks with disk-id; use --fs-uuid to disambiguate".to_string(),
-            ));
-        }
-        Some(matches[0])
-    };
+    let idx = resolve_disk_index(&cfg, selector, args.fs_uuid.as_deref(), "disk unregister")?;
 
-    if let Some(idx) = idx {
-        cfg.backup_disks.remove(idx);
-        save_config(config_path.to_string_lossy().as_ref(), &cfg)?;
-        return Ok(());
-    }
-
-    Err(TimevaultError::message(
-        "disk not found in config".to_string(),
-    ))
+    cfg.backup_disks.remove(idx);
+    save_config(config_path.to_string_lossy().as_ref(), &cfg)?;
+    Ok(())
 }
 
 fn update_disk_state<F>(
@@ -744,8 +724,8 @@ where
     let mut cfg: Config = serde_yaml::from_str(&contents)
         .map_err(|e| TimevaultError::message(format!("parse config: {}", e)))?;
 
-    let disk_id = selector_or_flag(args.selector.as_deref(), args.disk_id.as_deref());
-    let idx = resolve_disk_index(&cfg, disk_id, args.fs_uuid.as_deref(), action)?;
+    let selector = selector_or_flag(args.selector.as_deref(), args.disk_id.as_deref());
+    let idx = resolve_disk_index(&cfg, selector, args.fs_uuid.as_deref(), action)?;
     update(&mut cfg.backup_disks[idx]);
     save_config(config_path.to_string_lossy().as_ref(), &cfg)?;
     Ok(())
@@ -757,26 +737,13 @@ fn selector_or_flag<'a>(selector: Option<&'a str>, flag: Option<&'a str>) -> Opt
 
 fn resolve_disk_index(
     cfg: &Config,
-    disk_id: Option<&str>,
+    selector: Option<&str>,
     fs_uuid: Option<&str>,
     action: &str,
 ) -> Result<usize> {
-    let disk_id = match disk_id {
-        Some(disk_id) => {
-            let parsed = disk_id.parse::<DiskId>().map_err(|_| {
-                TimevaultError::message(format!(
-                    "disk-id {} must use only letters, digits, '.', '-', '_'",
-                    disk_id
-                ))
-            })?;
-            Some(parsed.as_str().to_string())
-        }
-        None => None,
-    };
-
-    if disk_id.is_none() && fs_uuid.is_none() {
+    if selector.is_none() && fs_uuid.is_none() {
         return Err(TimevaultError::message(format!(
-            "{} requires <disk-id>, --disk-id, or --fs-uuid",
+            "{} requires <disk-id-or-fs-uuid>, --disk-id, or --fs-uuid",
             action
         )));
     }
@@ -787,9 +754,8 @@ fn resolve_disk_index(
             .iter()
             .position(|disk| {
                 disk.fs_uuid == fs_uuid
-                    && disk_id
-                        .as_deref()
-                        .map(|id| disk.disk_id == id)
+                    && selector
+                        .map(|value| disk_matches_selector(disk, value))
                         .unwrap_or(true)
             })
             .ok_or_else(|| TimevaultError::message("disk not found in config".to_string()));
@@ -800,9 +766,8 @@ fn resolve_disk_index(
         .iter()
         .enumerate()
         .filter_map(|(idx, disk)| {
-            if disk_id
-                .as_deref()
-                .map(|id| disk.disk_id == id)
+            if selector
+                .map(|value| disk_matches_selector(disk, value))
                 .unwrap_or(false)
             {
                 Some(idx)
@@ -813,12 +778,12 @@ fn resolve_disk_index(
         .collect();
     if matches.is_empty() {
         return Err(TimevaultError::message(
-            "disk-id not found in config; use --fs-uuid".to_string(),
+            "disk selector not found in config; use --fs-uuid".to_string(),
         ));
     }
     if matches.len() > 1 {
         return Err(TimevaultError::message(
-            "multiple disks with disk-id; use --fs-uuid to disambiguate".to_string(),
+            "multiple disks match selector; use --fs-uuid to disambiguate".to_string(),
         ));
     }
     Ok(matches[0])
@@ -893,6 +858,8 @@ mod tests {
         let candidates = vec![candidate_with_identity("disk-a", "uuid-a")];
         let dupes = find_duplicate_disk_ids(&cfg, &candidates);
         assert!(dupes.is_empty());
+        let mismatches = find_registered_identity_mismatches(&cfg, &candidates);
+        assert!(mismatches.is_empty());
     }
 
     #[test]
@@ -914,6 +881,56 @@ mod tests {
         let candidates = vec![candidate_with_identity("disk-a", "uuid-b")];
         let dupes = find_duplicate_disk_ids(&cfg, &candidates);
         assert_eq!(dupes, vec!["disk-a".to_string()]);
+    }
+
+    #[test]
+    fn registered_identity_mismatch_reports_wrong_disk_id() {
+        let cfg = RuntimeConfig {
+            jobs: Vec::new(),
+            backup_disks: vec![BackupDiskConfig {
+                disk_id: "disk-a".to_string(),
+                fs_uuid: "uuid-a".to_string(),
+                label: None,
+                mount_options: None,
+                disabled: false,
+                rotated_out: false,
+            }],
+            mount_base: "/run/timevault/mounts".to_string(),
+            user_mount_base: "/run/timevault/user-mounts".to_string(),
+            options: crate::config::model::ConfigOptions::default(),
+        };
+        let candidates = vec![candidate_with_identity("old-name", "uuid-a")];
+        let mismatches = find_registered_identity_mismatches(&cfg, &candidates);
+        assert_eq!(
+            mismatches,
+            vec!["uuid-a: expected diskId disk-a, identity has old-name".to_string()]
+        );
+    }
+
+    #[test]
+    fn registered_identity_mismatch_reports_wrong_identity_uuid() {
+        let cfg = RuntimeConfig {
+            jobs: Vec::new(),
+            backup_disks: vec![BackupDiskConfig {
+                disk_id: "disk-a".to_string(),
+                fs_uuid: "uuid-a".to_string(),
+                label: None,
+                mount_options: None,
+                disabled: false,
+                rotated_out: false,
+            }],
+            mount_base: "/run/timevault/mounts".to_string(),
+            user_mount_base: "/run/timevault/user-mounts".to_string(),
+            options: crate::config::model::ConfigOptions::default(),
+        };
+        let mut candidate = candidate_with_identity("disk-a", "uuid-b");
+        candidate.uuid = "uuid-a".to_string();
+        let candidates = vec![candidate];
+        let mismatches = find_registered_identity_mismatches(&cfg, &candidates);
+        assert_eq!(
+            mismatches,
+            vec!["disk-a: actual fsUuid uuid-a, identity has uuid-b".to_string()]
+        );
     }
 
     #[test]
@@ -944,6 +961,27 @@ mod tests {
         };
         let dupes = find_duplicate_disk_ids(&cfg, &[]);
         assert_eq!(dupes, vec!["disk-a".to_string()]);
+    }
+
+    #[test]
+    fn resolves_disk_index_by_fs_uuid_selector() {
+        let cfg = Config {
+            jobs: Vec::new(),
+            excludes: Vec::new(),
+            options: crate::config::model::ConfigOptions::default(),
+            backup_disks: vec![BackupDiskConfig {
+                disk_id: "disk-a".to_string(),
+                fs_uuid: "uuid-a".to_string(),
+                label: None,
+                mount_options: None,
+                disabled: false,
+                rotated_out: false,
+            }],
+            mount_base: None,
+            user_mount_base: None,
+        };
+        let idx = resolve_disk_index(&cfg, Some("uuid-a"), None, "disk disable").expect("resolve");
+        assert_eq!(idx, 0);
     }
 
     #[test]
@@ -988,6 +1026,39 @@ mod tests {
         let updated: Config = serde_yaml::from_str(&contents).expect("parse");
         assert_eq!(updated.backup_disks.len(), 1);
         assert_eq!(updated.backup_disks[0].disk_id, "disk-b");
+    }
+
+    #[test]
+    fn disk_unenroll_by_positional_fs_uuid_removes_entry() {
+        let dir = TempDir::new().expect("tempdir");
+        let config_path = dir.path().join("timevault.yaml");
+        let cfg = Config {
+            jobs: Vec::new(),
+            excludes: Vec::new(),
+            options: crate::config::model::ConfigOptions::default(),
+            backup_disks: vec![BackupDiskConfig {
+                disk_id: "disk-a".to_string(),
+                fs_uuid: "uuid-a".to_string(),
+                label: None,
+                mount_options: None,
+                disabled: false,
+                rotated_out: false,
+            }],
+            mount_base: None,
+            user_mount_base: None,
+        };
+        save_config(config_path.to_string_lossy().as_ref(), &cfg).expect("save");
+
+        let args = DiskUnenrollArgs {
+            selector: Some("uuid-a".to_string()),
+            disk_id: None,
+            fs_uuid: None,
+        };
+        run_unenroll(&config_path, args).expect("unregister");
+
+        let contents = std::fs::read_to_string(&config_path).expect("read");
+        let updated: Config = serde_yaml::from_str(&contents).expect("parse");
+        assert!(updated.backup_disks.is_empty());
     }
 
     #[test]

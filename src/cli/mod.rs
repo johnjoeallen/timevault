@@ -8,13 +8,14 @@ use clap::Parser;
 use crate::backup::BackupOptions;
 use crate::cli::args::{Cli, Command, DiskCommand};
 use crate::cli::commands::{
-    backup, disk_add, disk_df, disk_du, disk_inspect, disk_ls, exit_for_error, mount, umount,
+    backup, disk_add, disk_check, disk_df, disk_du, disk_inspect, disk_ls, exit_for_error, mount,
+    umount,
 };
 use crate::types::RunMode;
 
 const CONFIG_FILE: &str = "/etc/timevault.yaml";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-pub(crate) const BUILD_NUMBER: u32 = 3;
+pub(crate) const BUILD_NUMBER: u32 = 8;
 const LICENSE_NAME: &str = "GNU GPL v3 or later";
 const COPYRIGHT: &str = "Copyright (C) 2026 John Allen (john.joe.allen@gmail.com)";
 const PROJECT_URL: &str = "https://github.com/johnjoeallen/timevault";
@@ -74,6 +75,12 @@ pub fn run() -> Result<()> {
             }
             DiskCommand::Mount(args) => {
                 if let Err(err) = mount::run_mount(&config_path, args, cli.disk_id.as_deref()) {
+                    exit_for_error(&err);
+                }
+            }
+            DiskCommand::Check(args) => {
+                if let Err(err) = disk_check::run_check(&config_path, args, cli.disk_id.as_deref())
+                {
                     exit_for_error(&err);
                 }
             }
@@ -204,31 +211,34 @@ fn print_copyright() {
 fn print_help() {
     println!("Usage:");
     println!("  timevault [backup] [options]");
-    println!("  timevault disk ls [--short | --columns] [<disk-id>:/path]");
+    println!("  timevault disk ls [--short | --columns] [<disk>:/path]");
     println!("  timevault disk register <id> [--fs-uuid <uuid> | --device <path>] [--label <label>] [--mount-options <opts>] [--force]");
-    println!("  timevault disk df [<id>]");
-    println!("  timevault disk du [du options] <disk-id>:/path");
-    println!("  timevault disk mount [<id>]");
+    println!("  timevault disk df [<disk>]");
+    println!("  timevault disk check [<disk>]");
+    println!("  timevault disk du [du options] <disk>:/path");
+    println!("  timevault disk mount [<disk>]");
     println!("  timevault disk umount");
-    println!("  timevault disk enable <id>");
-    println!("  timevault disk disable <id>");
-    println!("  timevault disk rotate-in <id>");
-    println!("  timevault disk rotate-out <id>");
-    println!("  timevault disk inspect [<id>]");
-    println!("  timevault disk unregister <id>");
-    println!("  timevault disk rename <old-id> <new-id>");
+    println!("  timevault disk enable <disk>");
+    println!("  timevault disk disable <disk>");
+    println!("  timevault disk rotate-in <disk>");
+    println!("  timevault disk rotate-out <disk>");
+    println!("  timevault disk inspect [<disk>]");
+    println!("  timevault disk unregister <disk>");
+    println!("  timevault disk rename <old-disk> <new-id>");
     println!();
     println!("Compatibility forms:");
     println!("  timevault disk discover");
     println!(
         "  timevault disk enroll [<id> | --disk-id <id>] [--fs-uuid <uuid> | --device <path>]"
     );
-    println!("  timevault disk df [<id> | --disk-id <id>]");
-    println!("  timevault disk mount [<id> | --disk-id <id>]");
-    println!("  timevault disk inspect [<id> | --disk-id <id>]");
-    println!("  timevault disk un-register [<id> | --disk-id <id> | --fs-uuid <uuid>]");
-    println!("  timevault disk unenroll [<id> | --disk-id <id> | --fs-uuid <uuid>]");
-    println!("  timevault disk rename [<old-id> | --disk-id <id> | --fs-uuid <uuid>] [<new-id> | --new-id <id>]");
+    println!("  <disk> may be either a disk id or filesystem UUID");
+    println!("  timevault disk df [<disk> | --disk-id <id> | --fs-uuid <uuid>]");
+    println!("  timevault disk check [<disk> | --disk-id <id> | --fs-uuid <uuid>]");
+    println!("  timevault disk mount [<disk> | --disk-id <id> | --fs-uuid <uuid>]");
+    println!("  timevault disk inspect [<disk> | --disk-id <id> | --fs-uuid <uuid>]");
+    println!("  timevault disk un-register [<disk> | --disk-id <id> | --fs-uuid <uuid>]");
+    println!("  timevault disk unenroll [<disk> | --disk-id <id> | --fs-uuid <uuid>]");
+    println!("  timevault disk rename [<old-disk> | --disk-id <id> | --fs-uuid <uuid>] [<new-id> | --new-id <id>]");
     println!("  timevault --version");
     println!();
     println!("Options:");
@@ -241,19 +251,22 @@ fn print_help() {
     println!("  --exclude-pristine-only  Generate pristine excludes and exit");
     println!("  --print-order          Print resolved job order and exit");
     println!("  --rsync <args...>      Pass remaining args to rsync");
-    println!("  --disk-id <id>         Select enrolled backup disk");
+    println!("  --disk-id <id>         Select enrolled backup disk by id");
     println!("  --cascade              Run backup across all connected disks");
-    println!("  --fs-uuid <uuid>       Filesystem UUID (disk enroll)");
+    println!("  --fs-uuid <uuid>       Filesystem UUID selector");
     println!("  --device <path>        Block device path (disk enroll)");
     println!("  --label <label>        Optional disk label (disk enroll)");
     println!("  --mount-options <opt>  Mount options (disk enroll)");
     println!("  --force                Force disk enroll on non-empty root or existing identity");
     println!();
     println!("Disk state commands:");
-    println!("  ls                     List disks or in-disk paths, with serials when available");
+    println!(
+        "  ls                     List disks or in-disk paths, with registration state and serials"
+    );
     println!(
         "  df                     Show enabled, free space, or offline status for enrolled disks"
     );
+    println!("  check                  Verify configured disks and connected identities");
     println!("  du                     Run du against paths inside connected enrolled disks");
     println!("  register               Register a backup disk (alias: enroll)");
     println!("  unregister             Remove a disk from config");
