@@ -15,8 +15,8 @@ pub fn load_config(path: &str) -> Result<RuntimeConfig> {
         .map_err(|e| TimevaultError::Io(e))?
         .read_to_string(&mut contents)
         .map_err(|e| TimevaultError::Io(e))?;
-    let cfg: Config = serde_yaml::from_str(&contents)
-        .map_err(|e| ConfigError::Parse(e.to_string()))?;
+    let cfg: Config =
+        serde_yaml::from_str(&contents).map_err(|e| ConfigError::Parse(e.to_string()))?;
     parse_runtime(cfg)
 }
 
@@ -55,7 +55,9 @@ fn parse_runtime(cfg: Config) -> Result<RuntimeConfig> {
         let run_policy = RunPolicy::parse(&job.run)
             .map_err(|e| ConfigError::Invalid(format!("job {}: {}", job.name, e)))?;
         if job.source.trim().is_empty() {
-            return Err(ConfigError::Invalid(format!("job {}: source path is empty", job.name)).into());
+            return Err(
+                ConfigError::Invalid(format!("job {}: source path is empty", job.name)).into(),
+            );
         }
         if job.name.trim().is_empty() {
             return Err(ConfigError::Invalid("job name is required".to_string()).into());
@@ -116,7 +118,9 @@ fn parse_runtime(cfg: Config) -> Result<RuntimeConfig> {
     Ok(RuntimeConfig {
         jobs,
         backup_disks: cfg.backup_disks,
-        mount_base: cfg.mount_base.unwrap_or_else(|| DEFAULT_MOUNT_BASE.to_string()),
+        mount_base: cfg
+            .mount_base
+            .unwrap_or_else(|| DEFAULT_MOUNT_BASE.to_string()),
         user_mount_base: cfg
             .user_mount_base
             .unwrap_or_else(|| DEFAULT_USER_MOUNT_BASE.to_string()),
@@ -170,10 +174,7 @@ jobs:
         file.write_all(yaml.as_bytes()).expect("write");
         let cfg = load_config(file.path().to_string_lossy().as_ref()).expect("load");
         assert_eq!(cfg.jobs.len(), 1);
-        assert_eq!(
-            cfg.jobs[0].disk_ids,
-            Some(vec!["primary".to_string()])
-        );
+        assert_eq!(cfg.jobs[0].disk_ids, Some(vec!["primary".to_string()]));
     }
 
     #[test]

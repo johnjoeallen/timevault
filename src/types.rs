@@ -17,7 +17,10 @@ impl FromStr for DiskId {
         if s.is_empty() || s == "." || s == ".." {
             return Err("disk-id is empty".to_string());
         }
-        if !s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
+        if !s
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+        {
             return Err("disk-id must use only letters, digits, '.', '-', '_'".to_string());
         }
         Ok(DiskId(s.to_string()))

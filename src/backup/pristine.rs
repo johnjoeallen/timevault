@@ -170,7 +170,13 @@ pub fn build_pristine_excludes(verbose: bool) -> Result<Vec<String>> {
     let mut excludes = cache
         .entries
         .iter()
-        .filter_map(|(path, entry)| if entry.dirty { None } else { Some(path.clone()) })
+        .filter_map(|(path, entry)| {
+            if entry.dirty {
+                None
+            } else {
+                Some(path.clone())
+            }
+        })
         .collect::<Vec<String>>();
     excludes.sort();
     Ok(excludes)
@@ -203,7 +209,10 @@ pub fn detect_package_manager(os: &OsInfo) -> Option<PackageManager> {
     if matches_id(os, &["debian", "ubuntu", "linuxmint"]) {
         return Some(PackageManager::Dpkg);
     }
-    if matches_id(os, &["rhel", "fedora", "centos", "rocky", "almalinux", "amzn"]) {
+    if matches_id(
+        os,
+        &["rhel", "fedora", "centos", "rocky", "almalinux", "amzn"],
+    ) {
         return Some(PackageManager::Rpm);
     }
     if matches_id(os, &["arch", "manjaro", "endeavouros"]) {
@@ -382,10 +391,7 @@ fn parse_os_release(content: &str) -> OsInfo {
         if key.is_empty() {
             continue;
         }
-        let value = raw
-            .trim_matches('"')
-            .trim_matches('\'')
-            .to_string();
+        let value = raw.trim_matches('"').trim_matches('\'').to_string();
         match key {
             "ID" => info.id = Some(value),
             "ID_LIKE" => info.id_like = value.split_whitespace().map(|s| s.to_string()).collect(),
@@ -399,9 +405,8 @@ fn parse_os_release(content: &str) -> OsInfo {
 
 fn matches_id(os: &OsInfo, ids: &[&str]) -> bool {
     let id = os.id.as_deref();
-    ids.iter().any(|needle| {
-        id == Some(*needle) || os.id_like.iter().any(|like| like == needle)
-    })
+    ids.iter()
+        .any(|needle| id == Some(*needle) || os.id_like.iter().any(|like| like == needle))
 }
 
 fn format_package_manager(manager: PackageManager) -> &'static str {

@@ -3,8 +3,8 @@ pub mod fs_type;
 pub mod identity;
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
 use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 
 use crate::config::model::BackupDiskConfig;
 use crate::error::{DiskError, Result, TimevaultError};
@@ -34,11 +34,9 @@ pub fn device_path_for_uuid(uuid: &str) -> PathBuf {
 
 pub fn ensure_disk_not_mounted(device: &Path) -> Result<()> {
     if device_is_mounted(device)? {
-        return Err(DiskError::Other(format!(
-            "device {} is already mounted",
-            device.display()
-        ))
-        .into());
+        return Err(
+            DiskError::Other(format!("device {} is already mounted", device.display())).into(),
+        );
     }
     Ok(())
 }
@@ -60,9 +58,9 @@ pub fn resolve_fs_uuid(fs_uuid: Option<&str>, device: Option<&str>) -> Result<Fs
             let entry = entry
                 .map_err(|e| TimevaultError::message(format!("read /dev/disk/by-uuid: {}", e)))?;
             let link_path = entry.path();
-            let target = link_path
-                .canonicalize()
-                .map_err(|e| TimevaultError::message(format!("resolve {}: {}", link_path.display(), e)))?;
+            let target = link_path.canonicalize().map_err(|e| {
+                TimevaultError::message(format!("resolve {}: {}", link_path.display(), e))
+            })?;
             if target == device_real {
                 let name = entry.file_name().to_string_lossy().to_string();
                 return name
@@ -79,8 +77,8 @@ pub fn resolve_fs_uuid(fs_uuid: Option<&str>, device: Option<&str>) -> Result<Fs
         .map_err(|e| TimevaultError::message(format!("read /dev/disk/by-uuid: {}", e)))?;
     let mut uuids = Vec::new();
     for entry in entries {
-        let entry = entry
-            .map_err(|e| TimevaultError::message(format!("read /dev/disk/by-uuid: {}", e)))?;
+        let entry =
+            entry.map_err(|e| TimevaultError::message(format!("read /dev/disk/by-uuid: {}", e)))?;
         let name = entry.file_name().to_string_lossy().to_string();
         uuids.push(name);
     }
@@ -99,10 +97,7 @@ pub fn resolve_fs_uuid(fs_uuid: Option<&str>, device: Option<&str>) -> Result<Fs
     ))
 }
 
-pub fn select_disk(
-    disks: &[BackupDiskConfig],
-    disk_id: Option<&str>,
-) -> Result<BackupDiskConfig> {
+pub fn select_disk(disks: &[BackupDiskConfig], disk_id: Option<&str>) -> Result<BackupDiskConfig> {
     let connected = connected_disks_in_order(disks)
         .into_iter()
         .map(|disk| disk.fs_uuid)
@@ -200,14 +195,16 @@ pub fn mount_disk_guarded(
         .into());
     }
     if !mountpoint.exists() {
-        std::fs::create_dir_all(&mountpoint)
-            .map_err(|e| TimevaultError::message(format!("create {}: {}", mountpoint.display(), e)))?;
+        std::fs::create_dir_all(&mountpoint).map_err(|e| {
+            TimevaultError::message(format!("create {}: {}", mountpoint.display(), e))
+        })?;
         let mut perms = std::fs::metadata(&mountpoint)
             .map_err(|e| TimevaultError::message(format!("stat {}: {}", mountpoint.display(), e)))?
             .permissions();
         perms.set_mode(0o700);
-        std::fs::set_permissions(&mountpoint, perms)
-            .map_err(|e| TimevaultError::message(format!("chmod {}: {}", mountpoint.display(), e)))?;
+        std::fs::set_permissions(&mountpoint, perms).map_err(|e| {
+            TimevaultError::message(format!("chmod {}: {}", mountpoint.display(), e))
+        })?;
     }
     if mountpoint_is_mounted(&mountpoint)? {
         return Err(DiskError::Other(format!(

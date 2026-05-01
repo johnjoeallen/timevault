@@ -17,9 +17,9 @@ pub fn maybe_print_command(cmd: &Command, run_mode: RunMode) {
 
 pub fn run_command(cmd: &mut Command, run_mode: RunMode) -> Result<i32> {
     maybe_print_command(cmd, run_mode);
-    let status = cmd
-        .status()
-        .map_err(|e| TimevaultError::message(format!("{}: {}", cmd.get_program().to_string_lossy(), e)))?;
+    let status = cmd.status().map_err(|e| {
+        TimevaultError::message(format!("{}: {}", cmd.get_program().to_string_lossy(), e))
+    })?;
     Ok(status.code().unwrap_or(1))
 }
 

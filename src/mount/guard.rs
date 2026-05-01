@@ -9,7 +9,10 @@ pub struct MountGuard {
 
 impl MountGuard {
     pub fn new(mountpoint: PathBuf, remove_dir: bool) -> Self {
-        Self { mountpoint, remove_dir }
+        Self {
+            mountpoint,
+            remove_dir,
+        }
     }
 
     pub fn mountpoint(&self) -> &PathBuf {

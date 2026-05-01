@@ -10,8 +10,13 @@ use crate::config::model::{BackupDiskConfig, Config};
 use crate::config::save::save_config;
 use crate::disk::discovery::list_candidates;
 use crate::disk::fs_type::detect_fs_type;
-use crate::disk::identity::{identity_path, read_identity, write_identity, DiskIdentity, IDENTITY_VERSION};
-use crate::disk::{device_path_for_uuid, ensure_disk_not_mounted, mount_disk_guarded, mount_options_for_backup, resolve_fs_uuid, DEFAULT_BACKUP_MOUNT_OPTS, DISK_ADD_ALLOWED_ENTRIES};
+use crate::disk::identity::{
+    identity_path, read_identity, write_identity, DiskIdentity, IDENTITY_VERSION,
+};
+use crate::disk::{
+    device_path_for_uuid, ensure_disk_not_mounted, mount_disk_guarded, mount_options_for_backup,
+    resolve_fs_uuid, DEFAULT_BACKUP_MOUNT_OPTS, DISK_ADD_ALLOWED_ENTRIES,
+};
 use crate::error::{DiskError, Result, TimevaultError};
 use crate::mount::guard::MountGuard;
 use crate::mount::ops::mount_device;
@@ -19,15 +24,22 @@ use crate::types::DiskId;
 use crate::util::paths::{create_temp_dir, ensure_base_dir};
 
 pub fn run_enroll(config_path: &Path, disk_id: Option<&str>, args: DiskAddArgs) -> Result<()> {
-    let disk_id_arg = disk_id
+    let disk_id_arg = args
+        .disk_id
+        .as_deref()
+        .or(disk_id)
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
 
     let mut contents = String::new();
     File::open(config_path)
-        .map_err(|e| TimevaultError::message(format!("open config {}: {}", config_path.display(), e)))?
+        .map_err(|e| {
+            TimevaultError::message(format!("open config {}: {}", config_path.display(), e))
+        })?
         .read_to_string(&mut contents)
-        .map_err(|e| TimevaultError::message(format!("read config {}: {}", config_path.display(), e)))?;
+        .map_err(|e| {
+            TimevaultError::message(format!("read config {}: {}", config_path.display(), e))
+        })?;
     let mut cfg: Config = serde_yaml::from_str(&contents)
         .map_err(|e| TimevaultError::message(format!("parse config: {}", e)))?;
 
@@ -48,11 +60,7 @@ pub fn run_enroll(config_path: &Path, disk_id: Option<&str>, args: DiskAddArgs) 
 
     let fs_type = detect_fs_type(device.to_string_lossy().as_ref())?;
     if fs_type.is_rejected() || !fs_type.is_allowed() {
-        return Err(DiskError::Other(format!(
-            "unsupported filesystem type {}",
-            fs_type
-        ))
-        .into());
+        return Err(DiskError::Other(format!("unsupported filesystem type {}", fs_type)).into());
     }
 
     let mount_base = cfg
@@ -100,7 +108,7 @@ pub fn run_enroll(config_path: &Path, disk_id: Option<&str>, args: DiskAddArgs) 
         let disk_id_raw = match disk_id_arg {
             Some(disk_id_raw) => disk_id_raw,
             None => {
-                println!("disk enroll requires --disk-id");
+                println!("disk enroll requires <disk-id> or --disk-id");
                 std::process::exit(2);
             }
         };
@@ -120,7 +128,9 @@ pub fn run_enroll(config_path: &Path, disk_id: Option<&str>, args: DiskAddArgs) 
 
     for disk in &cfg.backup_disks {
         if disk.disk_id == disk_id.as_str() {
-            return Err(DiskError::Other(format!("disk-id {} already enrolled", disk_id.as_str())).into());
+            return Err(
+                DiskError::Other(format!("disk-id {} already enrolled", disk_id.as_str())).into(),
+            );
         }
     }
 
@@ -182,7 +192,10 @@ pub fn run_discover(config_path: &Path) -> Result<()> {
         } else {
             println!("  capacity: unknown");
         }
-        println!("  enrolled: {}", if candidate.enrolled { "yes" } else { "no" });
+        println!(
+            "  enrolled: {}",
+            if candidate.enrolled { "yes" } else { "no" }
+        );
         match enrolled_disk {
             Some(disk) => {
                 println!("  enabled: {}", if disk.disabled { "no" } else { "yes" });
@@ -304,27 +317,39 @@ fn human_size(bytes: u64) -> String {
 }
 
 pub fn run_rename(config_path: &Path, args: crate::cli::args::DiskRenameArgs) -> Result<()> {
-    let new_id = match args.new_id.parse::<DiskId>() {
+    let new_id_raw = args
+        .new_id_arg
+        .as_deref()
+        .or(args.new_id.as_deref())
+        .ok_or_else(|| {
+            TimevaultError::message("disk rename requires <new-id> or --new-id".to_string())
+        })?;
+    let new_id = match new_id_raw.parse::<DiskId>() {
         Ok(id) => id,
         Err(_) => {
             return Err(TimevaultError::message(format!(
                 "disk-id {} must use only letters, digits, '.', '-', '_'",
-                args.new_id
+                new_id_raw
             )));
         }
     };
+    let disk_id = selector_or_flag(args.selector.as_deref(), args.disk_id.as_deref());
 
-    if args.disk_id.is_none() && args.fs_uuid.is_none() {
+    if disk_id.is_none() && args.fs_uuid.is_none() {
         return Err(TimevaultError::message(
-            "disk rename requires --disk-id or --fs-uuid".to_string(),
+            "disk rename requires <disk-id>, --disk-id, or --fs-uuid".to_string(),
         ));
     }
 
     let mut contents = String::new();
     File::open(config_path)
-        .map_err(|e| TimevaultError::message(format!("open config {}: {}", config_path.display(), e)))?
+        .map_err(|e| {
+            TimevaultError::message(format!("open config {}: {}", config_path.display(), e))
+        })?
         .read_to_string(&mut contents)
-        .map_err(|e| TimevaultError::message(format!("read config {}: {}", config_path.display(), e)))?;
+        .map_err(|e| {
+            TimevaultError::message(format!("read config {}: {}", config_path.display(), e))
+        })?;
     let mut cfg: Config = serde_yaml::from_str(&contents)
         .map_err(|e| TimevaultError::message(format!("parse config: {}", e)))?;
 
@@ -341,12 +366,7 @@ pub fn run_rename(config_path: &Path, args: crate::cli::args::DiskRenameArgs) ->
 
     let idx: Option<usize> = if let Some(fs_uuid) = args.fs_uuid.as_deref() {
         cfg.backup_disks.iter().position(|disk| {
-            disk.fs_uuid == fs_uuid
-                && args
-                    .disk_id
-                    .as_deref()
-                    .map(|id| disk.disk_id == id)
-                    .unwrap_or(true)
+            disk.fs_uuid == fs_uuid && disk_id.map(|id| disk.disk_id == id).unwrap_or(true)
         })
     } else {
         let matches: Vec<usize> = cfg
@@ -354,7 +374,7 @@ pub fn run_rename(config_path: &Path, args: crate::cli::args::DiskRenameArgs) ->
             .iter()
             .enumerate()
             .filter_map(|(idx, disk)| {
-                if args.disk_id.as_deref().map(|id| disk.disk_id == id).unwrap_or(false) {
+                if disk_id.map(|id| disk.disk_id == id).unwrap_or(false) {
                     Some(idx)
                 } else {
                     None
@@ -476,21 +496,32 @@ pub fn run_rename(config_path: &Path, args: crate::cli::args::DiskRenameArgs) ->
 }
 
 pub fn run_set_disabled(config_path: &Path, args: DiskStateArgs, disabled: bool) -> Result<()> {
-    let action = if disabled { "disk disable" } else { "disk enable" };
+    let action = if disabled {
+        "disk disable"
+    } else {
+        "disk enable"
+    };
     update_disk_state(config_path, args, action, |disk| disk.disabled = disabled)
 }
 
-pub fn run_set_rotated_out(config_path: &Path, args: DiskStateArgs, rotated_out: bool) -> Result<()> {
+pub fn run_set_rotated_out(
+    config_path: &Path,
+    args: DiskStateArgs,
+    rotated_out: bool,
+) -> Result<()> {
     let action = if rotated_out {
         "disk rotate-out"
     } else {
         "disk rotate-in"
     };
-    update_disk_state(config_path, args, action, |disk| disk.rotated_out = rotated_out)
+    update_disk_state(config_path, args, action, |disk| {
+        disk.rotated_out = rotated_out
+    })
 }
 
 pub fn run_unenroll(config_path: &Path, args: DiskUnenrollArgs) -> Result<()> {
-    let disk_id = match args.disk_id.as_deref() {
+    let raw_disk_id = selector_or_flag(args.selector.as_deref(), args.disk_id.as_deref());
+    let disk_id = match raw_disk_id {
         Some(disk_id) => {
             let parsed = disk_id.parse::<DiskId>().map_err(|_| {
                 TimevaultError::message(format!(
@@ -505,15 +536,19 @@ pub fn run_unenroll(config_path: &Path, args: DiskUnenrollArgs) -> Result<()> {
 
     if disk_id.is_none() && args.fs_uuid.is_none() {
         return Err(TimevaultError::message(
-            "disk unenroll requires --disk-id or --fs-uuid".to_string(),
+            "disk unenroll requires <disk-id>, --disk-id, or --fs-uuid".to_string(),
         ));
     }
 
     let mut contents = String::new();
     File::open(config_path)
-        .map_err(|e| TimevaultError::message(format!("open config {}: {}", config_path.display(), e)))?
+        .map_err(|e| {
+            TimevaultError::message(format!("open config {}: {}", config_path.display(), e))
+        })?
         .read_to_string(&mut contents)
-        .map_err(|e| TimevaultError::message(format!("read config {}: {}", config_path.display(), e)))?;
+        .map_err(|e| {
+            TimevaultError::message(format!("read config {}: {}", config_path.display(), e))
+        })?;
     let mut cfg: Config = serde_yaml::from_str(&contents)
         .map_err(|e| TimevaultError::message(format!("parse config: {}", e)))?;
 
@@ -531,7 +566,11 @@ pub fn run_unenroll(config_path: &Path, args: DiskUnenrollArgs) -> Result<()> {
             .iter()
             .enumerate()
             .filter_map(|(idx, disk)| {
-                if disk_id.as_deref().map(|id| disk.disk_id == id).unwrap_or(false) {
+                if disk_id
+                    .as_deref()
+                    .map(|id| disk.disk_id == id)
+                    .unwrap_or(false)
+                {
                     Some(idx)
                 } else {
                     None
@@ -573,16 +612,25 @@ where
 {
     let mut contents = String::new();
     File::open(config_path)
-        .map_err(|e| TimevaultError::message(format!("open config {}: {}", config_path.display(), e)))?
+        .map_err(|e| {
+            TimevaultError::message(format!("open config {}: {}", config_path.display(), e))
+        })?
         .read_to_string(&mut contents)
-        .map_err(|e| TimevaultError::message(format!("read config {}: {}", config_path.display(), e)))?;
+        .map_err(|e| {
+            TimevaultError::message(format!("read config {}: {}", config_path.display(), e))
+        })?;
     let mut cfg: Config = serde_yaml::from_str(&contents)
         .map_err(|e| TimevaultError::message(format!("parse config: {}", e)))?;
 
-    let idx = resolve_disk_index(&cfg, args.disk_id.as_deref(), args.fs_uuid.as_deref(), action)?;
+    let disk_id = selector_or_flag(args.selector.as_deref(), args.disk_id.as_deref());
+    let idx = resolve_disk_index(&cfg, disk_id, args.fs_uuid.as_deref(), action)?;
     update(&mut cfg.backup_disks[idx]);
     save_config(config_path.to_string_lossy().as_ref(), &cfg)?;
     Ok(())
+}
+
+fn selector_or_flag<'a>(selector: Option<&'a str>, flag: Option<&'a str>) -> Option<&'a str> {
+    selector.or(flag)
 }
 
 fn resolve_disk_index(
@@ -606,7 +654,7 @@ fn resolve_disk_index(
 
     if disk_id.is_none() && fs_uuid.is_none() {
         return Err(TimevaultError::message(format!(
-            "{} requires --disk-id or --fs-uuid",
+            "{} requires <disk-id>, --disk-id, or --fs-uuid",
             action
         )));
     }
@@ -630,7 +678,11 @@ fn resolve_disk_index(
         .iter()
         .enumerate()
         .filter_map(|(idx, disk)| {
-            if disk_id.as_deref().map(|id| disk.disk_id == id).unwrap_or(false) {
+            if disk_id
+                .as_deref()
+                .map(|id| disk.disk_id == id)
+                .unwrap_or(false)
+            {
                 Some(idx)
             } else {
                 None
@@ -803,6 +855,7 @@ mod tests {
         save_config(config_path.to_string_lossy().as_ref(), &cfg).expect("save");
 
         let args = DiskUnenrollArgs {
+            selector: None,
             disk_id: None,
             fs_uuid: Some("uuid-a".to_string()),
         };
@@ -846,6 +899,7 @@ mod tests {
         save_config(config_path.to_string_lossy().as_ref(), &cfg).expect("save");
 
         let args = DiskUnenrollArgs {
+            selector: None,
             disk_id: Some("disk-b".to_string()),
             fs_uuid: None,
         };
@@ -872,6 +926,7 @@ mod tests {
         save_config(config_path.to_string_lossy().as_ref(), &cfg).expect("save");
 
         let args = DiskUnenrollArgs {
+            selector: None,
             disk_id: None,
             fs_uuid: None,
         };
@@ -910,6 +965,7 @@ mod tests {
         save_config(config_path.to_string_lossy().as_ref(), &cfg).expect("save");
 
         let args = DiskUnenrollArgs {
+            selector: None,
             disk_id: Some("disk-a".to_string()),
             fs_uuid: None,
         };
@@ -938,6 +994,7 @@ mod tests {
         save_config(config_path.to_string_lossy().as_ref(), &cfg).expect("save");
 
         let args = DiskUnenrollArgs {
+            selector: None,
             disk_id: Some("disk-b".to_string()),
             fs_uuid: None,
         };
@@ -966,6 +1023,7 @@ mod tests {
         save_config(config_path.to_string_lossy().as_ref(), &cfg).expect("save");
 
         let args = DiskStateArgs {
+            selector: None,
             disk_id: Some("disk-a".to_string()),
             fs_uuid: None,
         };
@@ -998,6 +1056,7 @@ mod tests {
         save_config(config_path.to_string_lossy().as_ref(), &cfg).expect("save");
 
         let args = DiskStateArgs {
+            selector: None,
             disk_id: None,
             fs_uuid: Some("uuid-a".to_string()),
         };

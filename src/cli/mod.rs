@@ -5,10 +5,12 @@ use anyhow::Result;
 use clap::error::ErrorKind;
 use clap::Parser;
 
-use crate::cli::args::{Cli, Command, DiskCommand};
-use crate::cli::commands::{backup, disk_add, disk_inspect, exit_for_error, mount, umount};
-use crate::types::RunMode;
 use crate::backup::BackupOptions;
+use crate::cli::args::{Cli, Command, DiskCommand};
+use crate::cli::commands::{
+    backup, disk_add, disk_df, disk_du, disk_inspect, disk_ls, exit_for_error, mount, umount,
+};
+use crate::types::RunMode;
 
 const CONFIG_FILE: &str = "/etc/timevault.yaml";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -35,9 +37,7 @@ pub fn run() -> Result<()> {
         return Ok(());
     }
 
-    let config_path = cli
-        .config
-        .unwrap_or_else(|| PathBuf::from(CONFIG_FILE));
+    let config_path = cli.config.unwrap_or_else(|| PathBuf::from(CONFIG_FILE));
     let run_mode = RunMode {
         dry_run: cli.dry_run,
         safe_mode: cli.safe,
@@ -62,18 +62,27 @@ pub fn run() -> Result<()> {
         )?,
         Command::Disk { command } => match command {
             DiskCommand::Enroll(args) => {
-                if let Err(err) = disk_add::run_enroll(&config_path, cli.disk_id.as_deref(), args)
-                {
+                if let Err(err) = disk_add::run_enroll(&config_path, cli.disk_id.as_deref(), args) {
                     exit_for_error(&err);
                 }
             }
-            DiskCommand::Discover => {
-                if let Err(err) = disk_add::run_discover(&config_path) {
+            DiskCommand::Discover(args) => {
+                if let Err(err) = disk_ls::run_ls(&config_path, args) {
                     exit_for_error(&err);
                 }
             }
             DiskCommand::Mount(args) => {
                 if let Err(err) = mount::run_mount(&config_path, args, cli.disk_id.as_deref()) {
+                    exit_for_error(&err);
+                }
+            }
+            DiskCommand::Df(args) => {
+                if let Err(err) = disk_df::run_df(&config_path, args, cli.disk_id.as_deref()) {
+                    exit_for_error(&err);
+                }
+            }
+            DiskCommand::Du(args) => {
+                if let Err(err) = disk_du::run_du(&config_path, args) {
                     exit_for_error(&err);
                 }
             }
@@ -103,7 +112,9 @@ pub fn run() -> Result<()> {
                 }
             }
             DiskCommand::Inspect(args) => {
-                if let Err(err) = disk_inspect::run_inspect(&config_path, args, cli.disk_id.as_deref()) {
+                if let Err(err) =
+                    disk_inspect::run_inspect(&config_path, args, cli.disk_id.as_deref())
+                {
                     exit_for_error(&err);
                 }
             }
@@ -192,17 +203,30 @@ fn print_copyright() {
 fn print_help() {
     println!("Usage:");
     println!("  timevault [backup] [options]");
-    println!("  timevault disk enroll --disk-id <id> [--fs-uuid <uuid> | --device <path>] [--label <label>] [--mount-options <opts>] [--force]");
-    println!("  timevault disk discover");
-    println!("  timevault disk mount [--disk-id <id>]");
+    println!("  timevault disk ls [<disk-id>:/path]");
+    println!("  timevault disk register <id> [--fs-uuid <uuid> | --device <path>] [--label <label>] [--mount-options <opts>] [--force]");
+    println!("  timevault disk df [<id>]");
+    println!("  timevault disk du [du options] <disk-id>:/path");
+    println!("  timevault disk mount [<id>]");
     println!("  timevault disk umount");
-    println!("  timevault disk enable [--disk-id <id> | --fs-uuid <uuid>]");
-    println!("  timevault disk disable [--disk-id <id> | --fs-uuid <uuid>]");
-    println!("  timevault disk rotate-in [--disk-id <id> | --fs-uuid <uuid>]");
-    println!("  timevault disk rotate-out [--disk-id <id> | --fs-uuid <uuid>]");
-    println!("  timevault disk inspect [--disk-id <id>]");
-    println!("  timevault disk unenroll [--disk-id <id> | --fs-uuid <uuid>]");
-    println!("  timevault disk rename [--disk-id <id> | --fs-uuid <uuid>] --new-id <id>");
+    println!("  timevault disk enable <id>");
+    println!("  timevault disk disable <id>");
+    println!("  timevault disk rotate-in <id>");
+    println!("  timevault disk rotate-out <id>");
+    println!("  timevault disk inspect [<id>]");
+    println!("  timevault disk de-register <id>");
+    println!("  timevault disk rename <old-id> <new-id>");
+    println!();
+    println!("Compatibility forms:");
+    println!("  timevault disk discover");
+    println!(
+        "  timevault disk enroll [<id> | --disk-id <id>] [--fs-uuid <uuid> | --device <path>]"
+    );
+    println!("  timevault disk df [<id> | --disk-id <id>]");
+    println!("  timevault disk mount [<id> | --disk-id <id>]");
+    println!("  timevault disk inspect [<id> | --disk-id <id>]");
+    println!("  timevault disk unenroll [<id> | --disk-id <id> | --fs-uuid <uuid>]");
+    println!("  timevault disk rename [<old-id> | --disk-id <id> | --fs-uuid <uuid>] [<new-id> | --new-id <id>]");
     println!("  timevault --version");
     println!();
     println!("Options:");
@@ -224,6 +248,12 @@ fn print_help() {
     println!("  --force                Force disk enroll on non-empty root or existing identity");
     println!();
     println!("Disk state commands:");
+    println!("  ls                     List discoverable devices or files inside a disk");
+    println!("  df                     Show free space on connected enrolled disks");
+    println!("  du                     Run du against paths inside connected enrolled disks");
+    println!("  register               Register a backup disk (alias: enroll)");
+    println!("  de-register            Remove a disk from config (alias: unenroll)");
+    println!("  rename                 Rename a disk id");
     println!("  enable                 Allow the disk to be used for backups again");
     println!("  disable                Prevent the disk from being used for backups");
     println!("  rotate-in              Return the disk to automatic backup rotation");
@@ -231,7 +261,5 @@ fn print_help() {
 }
 
 fn init_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .try_init();
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
 }

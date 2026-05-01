@@ -8,8 +8,15 @@ use crate::util::command::run_command;
 pub fn mount_device(device: &Path, mountpoint: &Path, options: &str) -> Result<()> {
     let mut cmd = Command::new("mount");
     cmd.arg("-o").arg(options).arg(device).arg(mountpoint);
-    let rc = run_command(&mut cmd, RunMode { dry_run: false, safe_mode: false, verbose: false })
-        .map_err(|e| TimevaultError::message(format!("mount {}: {}", device.display(), e)))?;
+    let rc = run_command(
+        &mut cmd,
+        RunMode {
+            dry_run: false,
+            safe_mode: false,
+            verbose: false,
+        },
+    )
+    .map_err(|e| TimevaultError::message(format!("mount {}: {}", device.display(), e)))?;
     if rc != 0 {
         return Err(DiskError::MountFailure(format!(
             "{} failed with exit code {}",
@@ -45,8 +52,15 @@ pub fn mount_device_silent(device: &Path, mountpoint: &Path, options: &str) -> R
 pub fn unmount_path(mountpoint: &Path) -> Result<()> {
     let mut cmd = Command::new("umount");
     cmd.arg(mountpoint);
-    let rc = run_command(&mut cmd, RunMode { dry_run: false, safe_mode: false, verbose: false })
-        .map_err(|e| TimevaultError::message(format!("umount {}: {}", mountpoint.display(), e)))?;
+    let rc = run_command(
+        &mut cmd,
+        RunMode {
+            dry_run: false,
+            safe_mode: false,
+            verbose: false,
+        },
+    )
+    .map_err(|e| TimevaultError::message(format!("umount {}: {}", mountpoint.display(), e)))?;
     if rc != 0 {
         return Err(DiskError::UmountFailure(format!(
             "{} failed with exit code {}",

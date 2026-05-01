@@ -13,7 +13,11 @@ pub struct Config {
     pub backup_disks: Vec<BackupDiskConfig>,
     #[serde(default, rename = "mountBase", skip_serializing_if = "Option::is_none")]
     pub mount_base: Option<String>,
-    #[serde(default, rename = "userMountBase", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "userMountBase",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub user_mount_base: Option<String>,
 }
 
@@ -52,7 +56,11 @@ pub struct BackupDiskConfig {
     pub fs_uuid: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
-    #[serde(default, rename = "mountOptions", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "mountOptions",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub mount_options: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub disabled: bool,

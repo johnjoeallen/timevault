@@ -14,8 +14,8 @@ use crate::error::{Result, TimevaultError};
 use crate::types::RunMode;
 use crate::util::paths::job_lock_path;
 
-pub mod rsync;
 pub mod pristine;
+pub mod rsync;
 
 const TIMEVAULT_MARKER: &str = ".timevault";
 
@@ -76,7 +76,10 @@ pub fn run_backup(
         let excludes_file = tmp_dir.join("timevault.excludes");
         let excludes = build_exclude_list(&job, pristine_excludes.as_deref())?;
         if run_mode.dry_run {
-            println!("dry-run: would write excludes file {}", excludes_file.display());
+            println!(
+                "dry-run: would write excludes file {}",
+                excludes_file.display()
+            );
         } else {
             create_excludes_file(&excludes, &excludes_file)?;
         }
@@ -90,7 +93,9 @@ pub fn run_backup(
             continue;
         }
 
-        let backup_day = (Local::now() - Duration::days(1)).format("%Y%m%d").to_string();
+        let backup_day = (Local::now() - Duration::days(1))
+            .format("%Y%m%d")
+            .to_string();
         if run_mode.verbose {
             println!("  backup day: {}", backup_day);
         }
@@ -129,12 +134,22 @@ pub fn run_backup(
 
         let mut rc = 1;
         for attempt in 1..=3 {
-            rc = run_rsync(&job.source, &backup_dir, &excludes_file, rsync_extra, run_mode)?;
+            rc = run_rsync(
+                &job.source,
+                &backup_dir,
+                &excludes_file,
+                rsync_extra,
+                run_mode,
+            )?;
             if rc == 0 || rc == 24 {
                 break;
             }
             if attempt < 3 {
-                println!("rsync failed with exit code {}; retrying ({}/3)", rc, attempt + 1);
+                println!(
+                    "rsync failed with exit code {}; retrying ({}/3)",
+                    rc,
+                    attempt + 1
+                );
             }
         }
         let rsync_ok = rc == 0 || rc == 24;
@@ -156,7 +171,10 @@ pub fn run_backup(
                         let _ = fs::remove_file(&current_link);
                     }
                 } else if meta.is_dir() {
-                    println!("skip updating current (directory exists): {}", current_link.display());
+                    println!(
+                        "skip updating current (directory exists): {}",
+                        current_link.display()
+                    );
                 }
             }
             if !current_link.exists() {
@@ -190,7 +208,10 @@ pub fn run_pristine_only(jobs: Vec<Job>, run_mode: RunMode, options: BackupOptio
         let excludes_file = tmp_dir.join("timevault.excludes");
         let excludes = build_exclude_list(&job, pristine_excludes.as_deref())?;
         if run_mode.dry_run {
-            println!("dry-run: would write excludes file {}", excludes_file.display());
+            println!(
+                "dry-run: would write excludes file {}",
+                excludes_file.display()
+            );
         } else {
             create_excludes_file(&excludes, &excludes_file)?;
         }

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use crate::config::model::BackupDiskConfig;
 use crate::disk::fs_type::{detect_fs_type, FsType};
 use crate::disk::identity::{identity_path, read_identity, DiskIdentity};
-use crate::disk::{DEFAULT_RESTORE_MOUNT_OPTS};
+use crate::disk::DEFAULT_RESTORE_MOUNT_OPTS;
 use crate::error::{Result, TimevaultError};
 use crate::mount::inspect::find_device_mountpoint;
 use crate::mount::ops::mount_device_silent;
@@ -39,13 +39,12 @@ pub fn list_candidates(
     let entries = fs::read_dir("/dev/disk/by-uuid")
         .map_err(|e| TimevaultError::message(format!("read /dev/disk/by-uuid: {}", e)))?;
     for entry in entries {
-        let entry = entry
-            .map_err(|e| TimevaultError::message(format!("read /dev/disk/by-uuid: {}", e)))?;
+        let entry =
+            entry.map_err(|e| TimevaultError::message(format!("read /dev/disk/by-uuid: {}", e)))?;
         let uuid = entry.file_name().to_string_lossy().to_string();
-        let device = entry
-            .path()
-            .canonicalize()
-            .map_err(|e| TimevaultError::message(format!("resolve {}: {}", entry.path().display(), e)))?;
+        let device = entry.path().canonicalize().map_err(|e| {
+            TimevaultError::message(format!("resolve {}: {}", entry.path().display(), e))
+        })?;
 
         if swap_devices.contains(&device) {
             continue;

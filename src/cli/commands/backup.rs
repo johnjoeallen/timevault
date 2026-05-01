@@ -4,14 +4,14 @@ use chrono::Local;
 
 use crate::backup::{print_job_details, run_backup, run_pristine_only, BackupOptions};
 use crate::cli::commands::exit_for_disk_error;
-use crate::config::model::BackupDiskConfig;
 use crate::config::load::load_config;
+use crate::config::model::BackupDiskConfig;
+use crate::disk::fs_type::detect_fs_type;
+use crate::disk::identity::{identity_path, read_identity, verify_identity};
 use crate::disk::{
     connected_disks_in_order, device_path_for_uuid, mount_disk_guarded, mount_options_for_backup,
     select_first_connected,
 };
-use crate::disk::fs_type::detect_fs_type;
-use crate::disk::identity::{identity_path, read_identity, verify_identity};
 use crate::error::{DiskError, Result, TimevaultError};
 use crate::mount::guard::MountGuard;
 use crate::types::RunMode;
@@ -132,7 +132,10 @@ pub fn run_backup_command(
             Err(err) => return Err(err),
         };
         if primary_disk.disabled {
-            println!("disk {} is disabled for backups; aborting", primary_disk.disk_id);
+            println!(
+                "disk {} is disabled for backups; aborting",
+                primary_disk.disk_id
+            );
             std::process::exit(2);
         }
         jobs_to_run.retain(|job| job_requires_disk(job, disk_id));
@@ -172,10 +175,7 @@ pub fn run_backup_command(
                 std::process::exit(2);
             }
             let primary = allowed[0].clone();
-            groups
-                .entry(primary.disk_id.clone())
-                .or_default()
-                .push(job);
+            groups.entry(primary.disk_id.clone()).or_default().push(job);
         }
 
         for disk in &eligible_connected {
@@ -470,7 +470,10 @@ fn mount_and_verify(
             Ok(identity) => identity,
             Err(err) => {
                 drop(disk_guard);
-                return Err(TimevaultError::message(format!("identity file invalid: {}", err)));
+                return Err(TimevaultError::message(format!(
+                    "identity file invalid: {}",
+                    err
+                )));
             }
         };
         if let Err(err) = verify_identity(&identity, &disk.disk_id, &disk.fs_uuid) {
@@ -495,8 +498,7 @@ fn mount_and_verify(
                 drop(disk_guard);
                 return Err(TimevaultError::Disk(DiskError::IdentityMismatch(format!(
                     "fsType mismatch: expected {}, got {}",
-                    identity_type,
-                    fs_type
+                    identity_type, fs_type
                 ))));
             }
         }

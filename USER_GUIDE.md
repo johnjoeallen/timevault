@@ -148,20 +148,35 @@ Global options:
 - Uses the first connected disk unless `--disk-id` is set.
 - With `--cascade`, uses the primary disk’s `current` as the source for other disks.
 
-### Disk enroll
-- `timevault disk enroll --disk-id <id> [--fs-uuid <uuid> | --device <path>] [--label <label>] [--mount-options <opts>] [--force]`
+### Disk register
+- `timevault disk register <id> [--fs-uuid <uuid> | --device <path>] [--label <label>] [--mount-options <opts>] [--force]`
+- Alias: `timevault disk enroll [<id> | --disk-id <id>] ...`
 - `--fs-uuid` picks a disk by filesystem UUID; `--device` uses a block device path (alias `--block-id`).
 - `--label` sets a human-friendly label in the config.
 - `--mount-options` overrides the mount options stored for this disk (default `rw,nodev,nosuid,noexec`).
-- If the disk already contains a `.timevault` identity, `--disk-id` is optional.
+- If the disk already contains a `.timevault` identity, `<id>` is optional.
 - `--force` reinitializes an existing identity or non-empty disk.
 
-### Disk discover
-- `timevault disk discover`
-- Scans `/dev/disk/by-uuid` and prints candidate disks.
+### Disk ls
+- `timevault disk ls`
+- `timevault disk ls <disk-id>:/path`
+- Alias: `timevault disk discover`
+- Without a path, scans `/dev/disk/by-uuid` and prints candidate disks.
+- With `<disk-id>:/path`, mounts the enrolled disk read-only if needed and lists files under that path.
+
+### Disk df
+- `timevault disk df [<id>]`
+- Compatibility: `--disk-id <id>` may be used instead of the positional id.
+- Shows size, used space, free space, and percent used for connected enrolled disks.
+
+### Disk du
+- `timevault disk du [du options] <disk-id>:/path`
+- Passes options through to the system `du` command after translating each `<disk-id>:/path` target to a verified read-only disk mount path.
+- Example: `timevault disk du -sh primary:/snapshots`
 
 ### Disk mount (restore)
-- `timevault disk mount [--disk-id <id>]`
+- `timevault disk mount [<id>]`
+- Compatibility: `--disk-id <id>` may be used instead of the positional id.
 - Mounts an enrolled disk read-only and prints the mountpoint.
 
 ### Disk umount
@@ -169,27 +184,32 @@ Global options:
 - Unmounts a restore mount.
 
 ### Disk enable / disable
-- `timevault disk enable [--disk-id <id> | --fs-uuid <uuid>]`
-- `timevault disk disable [--disk-id <id> | --fs-uuid <uuid>]`
+- `timevault disk enable <id>`
+- `timevault disk disable <id>`
+- Compatibility: `--disk-id <id>` or `--fs-uuid <uuid>` may be used instead of the positional id.
 - `disable` keeps the disk enrolled but prevents all backup use, including explicit `--disk-id` runs.
 - `enable` clears that state.
 
 ### Disk rotation
-- `timevault disk rotate-in [--disk-id <id> | --fs-uuid <uuid>]`
-- `timevault disk rotate-out [--disk-id <id> | --fs-uuid <uuid>]`
+- `timevault disk rotate-in <id>`
+- `timevault disk rotate-out <id>`
+- Compatibility: `--disk-id <id>` or `--fs-uuid <uuid>` may be used instead of the positional id.
 - `rotate-out` keeps the disk enrolled but removes it from automatic backup selection and cascade planning.
 - `rotate-in` returns the disk to automatic rotation.
 
 ### Disk inspect
-- `timevault disk inspect [--disk-id <id>]`
+- `timevault disk inspect [<id>]`
+- Compatibility: `--disk-id <id>` may be used instead of the positional id.
 - Mounts the disk read-only, opens a shell in the mountpoint, unmounts on exit.
 
-### Disk unenroll
-- `timevault disk unenroll [--disk-id <id> | --fs-uuid <uuid>]`
+### Disk de-register
+- `timevault disk de-register <id>`
+- Alias: `timevault disk unenroll [<id> | --disk-id <id> | --fs-uuid <uuid>]`
 - Removes the disk from config (does not delete `.timevault`).
 
 ### Disk rename
-- `timevault disk rename [--disk-id <id> | --fs-uuid <uuid>] --new-id <id>`
+- `timevault disk rename <old-id> <new-id>`
+- Compatibility: `timevault disk rename [--disk-id <id> | --fs-uuid <uuid>] --new-id <id>`
 - Updates config and identity if the disk is connected.
 
 ## Job disk allowlists (`diskIds`)
@@ -210,11 +230,11 @@ ${EDITOR:-vi} ~/timevault.test.yaml
 ```
 3) Discover candidate disks:
 ```bash
-sudo timevault disk discover
+sudo timevault disk ls
 ```
 4) Enroll your backup disk(s) (requires a clean filesystem or an existing enrolled disk):
 ```bash
-sudo timevault disk enroll --disk-id primary --fs-uuid <uuid>
+sudo timevault disk register primary --fs-uuid <uuid>
 ```
 5) Run a dry-run with the test config:
 ```bash
