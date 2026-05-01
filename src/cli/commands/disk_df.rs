@@ -2,13 +2,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::cli::args::DiskDfArgs;
-use crate::cli::commands::exit_for_disk_error;
 use crate::config::load::load_config;
 use crate::config::model::BackupDiskConfig;
 use crate::disk::identity::{identity_path, read_identity, verify_identity};
-use crate::disk::{
-    connected_disks_in_order, device_path_for_uuid, mount_options_for_restore, select_disk,
-};
+use crate::disk::{device_path_for_uuid, mount_options_for_restore};
 use crate::error::{DiskError, Result, TimevaultError};
 use crate::mount::guard::MountGuard;
 use crate::mount::inspect::{find_device_mountpoint, mountpoint_is_mounted};
@@ -27,11 +24,7 @@ pub fn run_df(config_path: &Path, args: DiskDfArgs, disk_id: Option<&str>) -> Re
     let cfg = load_config(config_path.to_string_lossy().as_ref())?;
     let requested_id = args.selector.as_deref().or(disk_id);
     let disks = match requested_id {
-        Some(id) => match select_disk(&cfg.backup_disks, Some(id)) {
-            Ok(disk) => vec![disk],
-            Err(TimevaultError::Disk(err)) => exit_for_disk_error(&err),
-            Err(err) => return Err(err),
-        },
+        Some(id) => vec![select_configured_disk(&cfg.backup_disks, id)?],
         None => {
             if cfg.backup_disks.is_empty() {
                 return Err(DiskError::Other(
@@ -39,27 +32,33 @@ pub fn run_df(config_path: &Path, args: DiskDfArgs, disk_id: Option<&str>) -> Re
                 )
                 .into());
             }
-            let connected = connected_disks_in_order(&cfg.backup_disks);
-            if connected.is_empty() {
-                return Err(DiskError::NoDiskConnected.into());
-            }
-            connected
+            cfg.backup_disks.clone()
         }
     };
 
     println!(
-        "{:<20} {:<36} {:>10} {:>10} {:>10} {:>5}  MOUNTED",
-        "DISK ID", "FS UUID", "SIZE", "USED", "FREE", "USE%"
+        "{:<20} {:<36} {:<9} {:<7} {:>10} {:>10} {:>10} {:>5}  MOUNTED",
+        "DISK ID", "FS UUID", "STATUS", "ENABLED", "SIZE", "USED", "FREE", "USE%"
     );
     for disk in disks {
-        let (mountpoint, _guard, mounted_label) =
-            mountpoint_for_df(&disk, Path::new(&cfg.user_mount_base))?;
+        let enabled = if disk.disabled { "no" } else { "yes" };
+        let Some((mountpoint, _guard, mounted_label)) =
+            mountpoint_for_df(&disk, Path::new(&cfg.user_mount_base))?
+        else {
+            println!(
+                "{:<20} {:<36} {:<9} {:<7} {:>10} {:>10} {:>10} {:>5}  -",
+                disk.disk_id, disk.fs_uuid, "offline", enabled, "-", "-", "-", "-"
+            );
+            continue;
+        };
         verify_disk_identity(&disk, &mountpoint)?;
         let stats = df_stats(&mountpoint)?;
         println!(
-            "{:<20} {:<36} {:>10} {:>10} {:>10} {:>5}  {}",
+            "{:<20} {:<36} {:<9} {:<7} {:>10} {:>10} {:>10} {:>5}  {}",
             disk.disk_id,
             disk.fs_uuid,
+            "online",
+            enabled,
             human_size(stats.size_bytes),
             human_size(stats.used_bytes),
             human_size(stats.free_bytes),
@@ -71,16 +70,24 @@ pub fn run_df(config_path: &Path, args: DiskDfArgs, disk_id: Option<&str>) -> Re
     Ok(())
 }
 
+fn select_configured_disk(disks: &[BackupDiskConfig], disk_id: &str) -> Result<BackupDiskConfig> {
+    disks
+        .iter()
+        .find(|disk| disk.disk_id == disk_id)
+        .cloned()
+        .ok_or_else(|| DiskError::Other(format!("disk-id {} not found in config", disk_id)).into())
+}
+
 fn mountpoint_for_df(
     disk: &BackupDiskConfig,
     user_mount_base: &Path,
-) -> Result<(PathBuf, Option<MountGuard>, PathBuf)> {
+) -> Result<Option<(PathBuf, Option<MountGuard>, PathBuf)>> {
     let device = device_path_for_uuid(&disk.fs_uuid);
     if !device.exists() {
-        return Err(DiskError::Other(format!("device {} not found", device.display())).into());
+        return Ok(None);
     }
     if let Some(mountpoint) = find_device_mountpoint(&device)? {
-        return Ok((mountpoint.clone(), None, mountpoint));
+        return Ok(Some((mountpoint.clone(), None, mountpoint)));
     }
 
     ensure_base_dir(user_mount_base)?;
@@ -95,7 +102,7 @@ fn mountpoint_for_df(
     let options = mount_options_for_restore(disk);
     mount_device(&device, &mountpoint, &options)?;
     let guard = MountGuard::new(mountpoint.clone(), true);
-    Ok((mountpoint.clone(), Some(guard), mountpoint))
+    Ok(Some((mountpoint.clone(), Some(guard), mountpoint)))
 }
 
 fn verify_disk_identity(disk: &BackupDiskConfig, mountpoint: &Path) -> Result<()> {

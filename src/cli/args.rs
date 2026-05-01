@@ -108,6 +108,10 @@ impl Default for DiskAddArgs {
 #[derive(Args, Debug, Clone)]
 pub struct DiskLsArgs {
     pub target: Option<String>,
+    #[arg(long, short = 's')]
+    pub short: bool,
+    #[arg(long)]
+    pub columns: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -179,6 +183,8 @@ mod tests {
             panic!("expected disk discover");
         };
         assert!(args.target.is_none());
+        assert!(!args.short);
+        assert!(!args.columns);
     }
 
     #[test]
@@ -191,6 +197,19 @@ mod tests {
             panic!("expected disk discover");
         };
         assert_eq!(args.target.as_deref(), Some("primary:/snapshots"));
+    }
+
+    #[test]
+    fn parses_disk_ls_output_options() {
+        let cli = Cli::parse_from(["timevault", "disk", "ls", "--short", "--columns"]);
+        let Some(Command::Disk {
+            command: DiskCommand::Discover(args),
+        }) = cli.command
+        else {
+            panic!("expected disk discover");
+        };
+        assert!(args.short);
+        assert!(args.columns);
     }
 
     #[test]

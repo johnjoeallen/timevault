@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use crate::config::model::BackupDiskConfig;
 use crate::disk::fs_type::{detect_fs_type, FsType};
@@ -17,6 +18,7 @@ pub struct DiskCandidate {
     pub device: PathBuf,
     pub mounted_at: Option<PathBuf>,
     pub capacity_bytes: Option<u64>,
+    pub serial: Option<String>,
     pub empty: Option<bool>,
     pub removable: Option<bool>,
     pub reasons: Vec<String>,
@@ -63,6 +65,7 @@ pub fn list_candidates(
         let mut temp_mount: Option<PathBuf> = None;
         let mut mounted_path: Option<PathBuf> = None;
         let capacity_bytes = disk_capacity_bytes(&device);
+        let serial = disk_serial(&device);
         let mountpoint = match find_device_mountpoint(&device)? {
             Some(path) => {
                 mounted_path = Some(path.clone());
@@ -83,6 +86,7 @@ pub fn list_candidates(
                             device,
                             mounted_at: None,
                             capacity_bytes,
+                            serial,
                             empty: None,
                             removable,
                             reasons,
@@ -134,6 +138,7 @@ pub fn list_candidates(
             device,
             mounted_at: mounted_path,
             capacity_bytes,
+            serial,
             empty,
             removable,
             reasons,
@@ -199,6 +204,75 @@ fn disk_capacity_bytes(device: &Path) -> Option<u64> {
     sectors.map(|value| value.saturating_mul(512))
 }
 
+fn disk_serial(device: &Path) -> Option<String> {
+    if let Some(serial) = lsblk_serial(device) {
+        return Some(serial);
+    }
+    if let Some(base) = base_block_device_name(device) {
+        let parent = Path::new("/dev").join(base);
+        if let Some(serial) = lsblk_serial(&parent) {
+            return Some(serial);
+        }
+    }
+    by_id_serial(device)
+}
+
+fn lsblk_serial(device: &Path) -> Option<String> {
+    let output = Command::new("lsblk")
+        .arg("-dn")
+        .arg("-o")
+        .arg("SERIAL")
+        .arg(device)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).ok()?;
+    let serial = value.trim();
+    if serial.is_empty() {
+        None
+    } else {
+        Some(serial.to_string())
+    }
+}
+
+fn by_id_serial(device: &Path) -> Option<String> {
+    let device_real = device.canonicalize().ok()?;
+    let entries = fs::read_dir("/dev/disk/by-id").ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with("wwn-") || name.starts_with("dm-") || name.starts_with("md-") {
+            continue;
+        }
+        let target = path.canonicalize().ok()?;
+        if target == device_real {
+            return normalize_by_id_serial(&name);
+        }
+    }
+    None
+}
+
+fn normalize_by_id_serial(name: &str) -> Option<String> {
+    let value = name
+        .strip_prefix("usb-")
+        .or_else(|| name.strip_prefix("ata-"))
+        .or_else(|| name.strip_prefix("nvme-"))
+        .or_else(|| name.strip_prefix("scsi-"))
+        .unwrap_or(name);
+    let value = value
+        .rsplit_once("-part")
+        .map(|(base, _)| base)
+        .unwrap_or(value);
+    let serial = value.rsplit('_').next().unwrap_or(value).trim();
+    if serial.is_empty() {
+        None
+    } else {
+        Some(serial.to_string())
+    }
+}
+
 fn is_removable_device(device: &Path) -> Option<bool> {
     let base = base_block_device_name(device)?;
     let path = Path::new("/sys/block").join(base).join("removable");
@@ -252,4 +326,21 @@ fn is_disk_empty(root: &Path) -> Result<bool> {
         return Ok(false);
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_by_id_serial_suffix() {
+        assert_eq!(
+            normalize_by_id_serial("usb-SanDisk_Extreme_1234567890-part1").as_deref(),
+            Some("1234567890")
+        );
+        assert_eq!(
+            normalize_by_id_serial("ata-Samsung_SSD_870_QVO_S5ABC123").as_deref(),
+            Some("S5ABC123")
+        );
+    }
 }

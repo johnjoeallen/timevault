@@ -21,7 +21,14 @@ pub(crate) struct DiskPathTarget {
 
 pub fn run_ls(config_path: &Path, args: DiskLsArgs) -> Result<()> {
     let Some(target) = args.target.as_deref() else {
-        return disk_add::run_discover(config_path);
+        let output = if args.columns {
+            disk_add::DiskListOutput::Columns
+        } else if args.short {
+            disk_add::DiskListOutput::Short
+        } else {
+            disk_add::DiskListOutput::Verbose
+        };
+        return disk_add::run_discover_with_output(config_path, output);
     };
 
     let target = parse_disk_path_target(target)?;

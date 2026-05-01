@@ -23,6 +23,13 @@ use crate::mount::ops::mount_device;
 use crate::types::DiskId;
 use crate::util::paths::{create_temp_dir, ensure_base_dir};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiskListOutput {
+    Verbose,
+    Short,
+    Columns,
+}
+
 pub fn run_enroll(config_path: &Path, disk_id: Option<&str>, args: DiskAddArgs) -> Result<()> {
     let disk_id_arg = args
         .disk_id
@@ -167,22 +174,33 @@ pub fn run_enroll(config_path: &Path, disk_id: Option<&str>, args: DiskAddArgs) 
 }
 
 pub fn run_discover(config_path: &Path) -> Result<()> {
+    run_discover_with_output(config_path, DiskListOutput::Verbose)
+}
+
+pub fn run_discover_with_output(config_path: &Path, output: DiskListOutput) -> Result<()> {
     let cfg = crate::config::load::load_config(config_path.to_string_lossy().as_ref())?;
     warn_duplicate_disk_ids(&cfg);
     let candidates = list_candidates(&cfg.backup_disks, Path::new(&cfg.user_mount_base))?;
     warn_duplicate_discovered_ids(&cfg, &candidates);
-    if candidates.is_empty() {
+    if candidates.is_empty() && cfg.backup_disks.is_empty() {
         println!("no candidate backup devices found");
         return Ok(());
     }
-    for candidate in candidates {
+    if output != DiskListOutput::Verbose {
+        return print_discover_table(&cfg, &candidates, output);
+    }
+    let mut seen_enrolled_uuids = std::collections::HashSet::new();
+    for candidate in &candidates {
+        if candidate.enrolled {
+            seen_enrolled_uuids.insert(candidate.uuid.clone());
+        }
         let enrolled_disk = cfg
             .backup_disks
             .iter()
             .find(|disk| disk.fs_uuid == candidate.uuid);
         println!("uuid: {}", candidate.uuid);
         println!("  device: {}", candidate.device.display());
-        if let Some(mp) = candidate.mounted_at {
+        if let Some(mp) = &candidate.mounted_at {
             println!("  mounted: {}", mp.display());
         } else {
             println!("  mounted: no");
@@ -192,6 +210,10 @@ pub fn run_discover(config_path: &Path) -> Result<()> {
         } else {
             println!("  capacity: unknown");
         }
+        println!(
+            "  serial: {}",
+            candidate.serial.as_deref().unwrap_or("unknown")
+        );
         println!(
             "  enrolled: {}",
             if candidate.enrolled { "yes" } else { "no" }
@@ -209,15 +231,15 @@ pub fn run_discover(config_path: &Path) -> Result<()> {
                 println!("  rotation: n/a");
             }
         }
-        if let Some(identity) = candidate.identity {
+        if let Some(identity) = &candidate.identity {
             println!("  identity.diskId: {}", identity.disk_id);
             println!("  identity.fsUuid: {}", identity.fs_uuid);
-            if let Some(fs_type) = identity.fs_type {
+            if let Some(fs_type) = &identity.fs_type {
                 println!("  identity.fsType: {}", fs_type);
             }
             println!("  identity.created: {}", identity.created);
         }
-        if let Some(fs_type) = candidate.fs_type {
+        if let Some(fs_type) = &candidate.fs_type {
             println!("  fsType: {}", fs_type);
         }
         match candidate.empty {
@@ -230,6 +252,106 @@ pub fn run_discover(config_path: &Path) -> Result<()> {
         }
         println!("  reason: {}", candidate.reasons.join(", "));
         println!();
+    }
+    for disk in &cfg.backup_disks {
+        if seen_enrolled_uuids.contains(&disk.fs_uuid) {
+            continue;
+        }
+        println!("uuid: {}", disk.fs_uuid);
+        println!("  diskId: {}", disk.disk_id);
+        println!("  device: offline");
+        println!("  mounted: no");
+        println!("  capacity: unknown");
+        println!("  serial: unknown");
+        println!("  enrolled: yes");
+        println!("  enabled: {}", if disk.disabled { "no" } else { "yes" });
+        println!(
+            "  rotation: {}",
+            if disk.rotated_out { "out" } else { "in" }
+        );
+        if let Some(label) = &disk.label {
+            println!("  label: {}", label);
+        }
+        println!("  reason: enrolled, offline");
+        println!();
+    }
+    Ok(())
+}
+
+fn print_discover_table(
+    cfg: &crate::config::model::RuntimeConfig,
+    candidates: &[crate::disk::discovery::DiskCandidate],
+    output: DiskListOutput,
+) -> Result<()> {
+    let mut seen_enrolled_uuids = std::collections::HashSet::new();
+    if output == DiskListOutput::Columns {
+        println!(
+            "{:<20} {:<36} {:<8} {:<7} {:<18} {:<12} DEVICE",
+            "DISK ID", "FS UUID", "STATUS", "ENABLED", "SERIAL", "CAPACITY"
+        );
+    }
+    for candidate in candidates {
+        if candidate.enrolled {
+            seen_enrolled_uuids.insert(candidate.uuid.clone());
+        }
+        let enrolled_disk = cfg
+            .backup_disks
+            .iter()
+            .find(|disk| disk.fs_uuid == candidate.uuid);
+        let disk_id = enrolled_disk
+            .map(|disk| disk.disk_id.as_str())
+            .or_else(|| {
+                candidate
+                    .identity
+                    .as_ref()
+                    .map(|identity| identity.disk_id.as_str())
+            })
+            .unwrap_or("-");
+        let enabled = enrolled_disk
+            .map(|disk| if disk.disabled { "no" } else { "yes" })
+            .unwrap_or("n/a");
+        let capacity = candidate
+            .capacity_bytes
+            .map(human_size)
+            .unwrap_or_else(|| "-".to_string());
+        if output == DiskListOutput::Columns {
+            println!(
+                "{:<20} {:<36} {:<8} {:<7} {:<18} {:<12} {}",
+                disk_id,
+                candidate.uuid,
+                "online",
+                enabled,
+                candidate.serial.as_deref().unwrap_or("-"),
+                capacity,
+                candidate.device.display()
+            );
+        } else {
+            println!(
+                "{}\t{}\t{}\t{}\t{}",
+                disk_id,
+                candidate.uuid,
+                "online",
+                enabled,
+                candidate.serial.as_deref().unwrap_or("-")
+            );
+        }
+    }
+    for disk in &cfg.backup_disks {
+        if seen_enrolled_uuids.contains(&disk.fs_uuid) {
+            continue;
+        }
+        let enabled = if disk.disabled { "no" } else { "yes" };
+        if output == DiskListOutput::Columns {
+            println!(
+                "{:<20} {:<36} {:<8} {:<7} {:<18} {:<12} -",
+                disk.disk_id, disk.fs_uuid, "offline", enabled, "-", "-"
+            );
+        } else {
+            println!(
+                "{}\t{}\t{}\t{}\t{}",
+                disk.disk_id, disk.fs_uuid, "offline", enabled, "-"
+            );
+        }
     }
     Ok(())
 }
@@ -736,6 +858,7 @@ mod tests {
             device: PathBuf::from("/dev/sdz1"),
             mounted_at: None,
             capacity_bytes: None,
+            serial: None,
             empty: None,
             removable: None,
             reasons: Vec::new(),

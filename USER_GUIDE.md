@@ -158,16 +158,19 @@ Global options:
 - `--force` reinitializes an existing identity or non-empty disk.
 
 ### Disk ls
-- `timevault disk ls`
+- `timevault disk ls [--short | --columns]`
 - `timevault disk ls <disk-id>:/path`
 - Alias: `timevault disk discover`
-- Without a path, scans `/dev/disk/by-uuid` and prints candidate disks.
+- Without a path, scans `/dev/disk/by-uuid`, prints candidate disks, and includes enrolled offline disks.
+- Connected disk output includes the block device serial number when available.
+- `--short` prints tab-separated `diskId`, UUID, status, enabled state, and serial.
+- `--columns` prints the same disk summary as a columnar table.
 - With `<disk-id>:/path`, mounts the enrolled disk read-only if needed and lists files under that path.
 
 ### Disk df
 - `timevault disk df [<id>]`
 - Compatibility: `--disk-id <id>` may be used instead of the positional id.
-- Shows size, used space, free space, and percent used for connected enrolled disks.
+- Shows enabled state, size, used space, free space, and percent used for enrolled disks; offline disks are listed with unknown usage.
 
 ### Disk du
 - `timevault disk du [du options] <disk-id>:/path`

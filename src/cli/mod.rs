@@ -203,7 +203,7 @@ fn print_copyright() {
 fn print_help() {
     println!("Usage:");
     println!("  timevault [backup] [options]");
-    println!("  timevault disk ls [<disk-id>:/path]");
+    println!("  timevault disk ls [--short | --columns] [<disk-id>:/path]");
     println!("  timevault disk register <id> [--fs-uuid <uuid> | --device <path>] [--label <label>] [--mount-options <opts>] [--force]");
     println!("  timevault disk df [<id>]");
     println!("  timevault disk du [du options] <disk-id>:/path");
@@ -248,8 +248,10 @@ fn print_help() {
     println!("  --force                Force disk enroll on non-empty root or existing identity");
     println!();
     println!("Disk state commands:");
-    println!("  ls                     List discoverable devices or files inside a disk");
-    println!("  df                     Show free space on connected enrolled disks");
+    println!("  ls                     List disks or in-disk paths, with serials when available");
+    println!(
+        "  df                     Show enabled, free space, or offline status for enrolled disks"
+    );
     println!("  du                     Run du against paths inside connected enrolled disks");
     println!("  register               Register a backup disk (alias: enroll)");
     println!("  de-register            Remove a disk from config (alias: unenroll)");
