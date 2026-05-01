@@ -14,8 +14,9 @@ use crate::types::RunMode;
 
 const CONFIG_FILE: &str = "/etc/timevault.yaml";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub(crate) const BUILD_NUMBER: u32 = 3;
 const LICENSE_NAME: &str = "GNU GPL v3 or later";
-const COPYRIGHT: &str = "Copyright (C) 2025 John Allen (john.joe.allen@gmail.com)";
+const COPYRIGHT: &str = "Copyright (C) 2026 John Allen (john.joe.allen@gmail.com)";
 const PROJECT_URL: &str = "https://github.com/johnjoeallen/timevault";
 
 pub mod args;
@@ -118,7 +119,7 @@ pub fn run() -> Result<()> {
                     exit_for_error(&err);
                 }
             }
-            DiskCommand::Unenroll(args) => {
+            DiskCommand::Unregister(args) => {
                 if let Err(err) = disk_add::run_unenroll(&config_path, args) {
                     exit_for_error(&err);
                 }
@@ -193,7 +194,7 @@ fn split_rsync_args(raw: Vec<String>) -> (Vec<String>, Vec<String>) {
 }
 
 fn print_banner() {
-    println!("Timevault {}", VERSION);
+    println!("Timevault {}-{}", VERSION, BUILD_NUMBER);
 }
 
 fn print_copyright() {
@@ -214,7 +215,7 @@ fn print_help() {
     println!("  timevault disk rotate-in <id>");
     println!("  timevault disk rotate-out <id>");
     println!("  timevault disk inspect [<id>]");
-    println!("  timevault disk de-register <id>");
+    println!("  timevault disk unregister <id>");
     println!("  timevault disk rename <old-id> <new-id>");
     println!();
     println!("Compatibility forms:");
@@ -225,6 +226,7 @@ fn print_help() {
     println!("  timevault disk df [<id> | --disk-id <id>]");
     println!("  timevault disk mount [<id> | --disk-id <id>]");
     println!("  timevault disk inspect [<id> | --disk-id <id>]");
+    println!("  timevault disk un-register [<id> | --disk-id <id> | --fs-uuid <uuid>]");
     println!("  timevault disk unenroll [<id> | --disk-id <id> | --fs-uuid <uuid>]");
     println!("  timevault disk rename [<old-id> | --disk-id <id> | --fs-uuid <uuid>] [<new-id> | --new-id <id>]");
     println!("  timevault --version");
@@ -254,7 +256,7 @@ fn print_help() {
     );
     println!("  du                     Run du against paths inside connected enrolled disks");
     println!("  register               Register a backup disk (alias: enroll)");
-    println!("  de-register            Remove a disk from config (alias: unenroll)");
+    println!("  unregister             Remove a disk from config");
     println!("  rename                 Rename a disk id");
     println!("  enable                 Allow the disk to be used for backups again");
     println!("  disable                Prevent the disk from being used for backups");

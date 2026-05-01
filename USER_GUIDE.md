@@ -205,9 +205,10 @@ Global options:
 - Compatibility: `--disk-id <id>` may be used instead of the positional id.
 - Mounts the disk read-only, opens a shell in the mountpoint, unmounts on exit.
 
-### Disk de-register
-- `timevault disk de-register <id>`
-- Alias: `timevault disk unenroll [<id> | --disk-id <id> | --fs-uuid <uuid>]`
+### Disk unregister
+- `timevault disk unregister <id>`
+- Aliases: `timevault disk un-register <id>`, `timevault disk unenroll <id>`, `timevault disk de-register <id>`
+- Compatibility: `--disk-id <id>` or `--fs-uuid <uuid>` may be used instead of the positional id.
 - Removes the disk from config (does not delete `.timevault`).
 
 ### Disk rename

@@ -68,11 +68,12 @@ pub enum DiskCommand {
     #[command(
         alias = "deregister",
         alias = "de-register",
-        alias = "unregister",
+        alias = "un-register",
+        alias = "unenroll",
         alias = "rm",
         alias = "remove"
     )]
-    Unenroll(DiskUnenrollArgs),
+    Unregister(DiskUnenrollArgs),
     Inspect(DiskInspectArgs),
     Rename(DiskRenameArgs),
 }
@@ -234,14 +235,28 @@ mod tests {
 
     #[test]
     fn parses_disk_de_register_with_positional_id() {
-        let cli = Cli::parse_from(["timevault", "disk", "de-register", "primary"]);
+        let cli = Cli::parse_from(["timevault", "disk", "unregister", "primary"]);
         let Some(Command::Disk {
-            command: DiskCommand::Unenroll(args),
+            command: DiskCommand::Unregister(args),
         }) = cli.command
         else {
-            panic!("expected disk unenroll");
+            panic!("expected disk unregister");
         };
         assert_eq!(args.selector.as_deref(), Some("primary"));
+    }
+
+    #[test]
+    fn parses_disk_unregister_aliases() {
+        for command in ["un-register", "unenroll", "de-register"] {
+            let cli = Cli::parse_from(["timevault", "disk", command, "primary"]);
+            let Some(Command::Disk {
+                command: DiskCommand::Unregister(args),
+            }) = cli.command
+            else {
+                panic!("expected disk unregister for {command}");
+            };
+            assert_eq!(args.selector.as_deref(), Some("primary"));
+        }
     }
 
     #[test]
