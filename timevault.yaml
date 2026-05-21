@@ -1,4 +1,4 @@
-# job run policy: auto | demand | off
+# job run policy, valid values: auto | demand | off
 mountBase: "/run/timevault/mounts"
 userMountBase: "/run/timevault/user-mounts"
 backupDisks:
