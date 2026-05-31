@@ -12,9 +12,9 @@ const DEFAULT_USER_MOUNT_BASE: &str = "/run/timevault/user-mounts";
 pub fn load_config(path: &str) -> Result<RuntimeConfig> {
     let mut contents = String::new();
     File::open(path)
-        .map_err(|e| TimevaultError::Io(e))?
+        .map_err(|e| TimevaultError::message(format!("open config {}: {}", path, e)))?
         .read_to_string(&mut contents)
-        .map_err(|e| TimevaultError::Io(e))?;
+        .map_err(|e| TimevaultError::message(format!("read config {}: {}", path, e)))?;
     let cfg: Config =
         serde_yaml::from_str(&contents).map_err(|e| ConfigError::Parse(e.to_string()))?;
     parse_runtime(cfg)
@@ -213,5 +213,15 @@ jobs:
 "#;
         file.write_all(yaml.as_bytes()).expect("write");
         assert!(load_config(file.path().to_string_lossy().as_ref()).is_err());
+    }
+
+    #[test]
+    fn load_config_reports_path_when_missing() {
+        let missing = "/tmp/timevault-missing-config.yaml";
+        let err = load_config(missing).expect_err("missing config should fail");
+        assert_eq!(
+            err.to_string(),
+            format!("open config {}: No such file or directory (os error 2)", missing)
+        );
     }
 }

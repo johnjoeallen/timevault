@@ -302,9 +302,11 @@ You can also set a different config for the timer run (the service is what the t
 ### Pristine exclude cache
 Pristine exclude caching uses:
 - `~/.cache/timevault/pristine-cache.json`
-Delete this file to force a full regeneration on the next run.
+- `~/.cache/timevault/pristine-cache-<host>.json` for remote `host:/...` sources.
+Delete the matching file to force a full regeneration on the next run.
 ## Remote backups
 Remote job sources require passwordless SSH (keys configured for the remote host), and the remote host must have rsync installed.
+When `--exclude-pristine` is enabled for a `host:/...` source, Timevault uses SSH to inspect the remote host's package database and file hashes, then stores that host's pristine cache separately on the local machine. Remote pristine analysis supports SSH-style rsync sources, not `rsync://` daemon sources.
 
 ## Notes
 - Backup disks must contain `/.timevault` and match the configured `diskId` and `fsUuid`.

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -7,7 +8,7 @@ use std::path::{Path, PathBuf};
 use chrono::{Duration, Local};
 use walkdir::WalkDir;
 
-use crate::backup::pristine::build_pristine_excludes;
+use crate::backup::pristine::{build_pristine_excludes_for_source, PristineSource};
 use crate::backup::rsync::run_rsync;
 use crate::config::model::Job;
 use crate::error::{Result, TimevaultError};
@@ -61,11 +62,7 @@ pub fn run_backup(
     disk_mount: &Path,
     options: BackupOptions,
 ) -> Result<()> {
-    let pristine_excludes = if options.exclude_pristine {
-        Some(build_pristine_excludes(run_mode.verbose)?)
-    } else {
-        None
-    };
+    let pristine_excludes = build_pristine_excludes_for_jobs(&jobs, options, run_mode.verbose)?;
     for job in jobs {
         let _lock = acquire_lock_for_job(&job.name, run_mode)?;
         let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
@@ -74,7 +71,7 @@ pub fn run_backup(
             fs::create_dir_all(&tmp_dir)?;
         }
         let excludes_file = tmp_dir.join("timevault.excludes");
-        let excludes = build_exclude_list(&job, pristine_excludes.as_deref())?;
+        let excludes = build_exclude_list(&job, &pristine_excludes)?;
         if run_mode.dry_run {
             println!(
                 "dry-run: would write excludes file {}",
@@ -193,11 +190,7 @@ pub fn run_pristine_only(jobs: Vec<Job>, run_mode: RunMode, options: BackupOptio
     if run_mode.verbose {
         println!("pristine: exclude-only mode enabled; skipping backup");
     }
-    let pristine_excludes = if options.exclude_pristine {
-        Some(build_pristine_excludes(run_mode.verbose)?)
-    } else {
-        None
-    };
+    let pristine_excludes = build_pristine_excludes_for_jobs(&jobs, options, run_mode.verbose)?;
     for job in jobs {
         let _lock = acquire_lock_for_job(&job.name, run_mode)?;
         let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
@@ -206,7 +199,7 @@ pub fn run_pristine_only(jobs: Vec<Job>, run_mode: RunMode, options: BackupOptio
             fs::create_dir_all(&tmp_dir)?;
         }
         let excludes_file = tmp_dir.join("timevault.excludes");
-        let excludes = build_exclude_list(&job, pristine_excludes.as_deref())?;
+        let excludes = build_exclude_list(&job, &pristine_excludes)?;
         if run_mode.dry_run {
             println!(
                 "dry-run: would write excludes file {}",
@@ -219,12 +212,93 @@ pub fn run_pristine_only(jobs: Vec<Job>, run_mode: RunMode, options: BackupOptio
     Ok(())
 }
 
-fn build_exclude_list(job: &Job, pristine_excludes: Option<&[String]>) -> Result<Vec<String>> {
+#[derive(Debug, Default)]
+struct PristineExcludes {
+    local: Option<Vec<String>>,
+    remote: HashMap<String, Vec<String>>,
+}
+
+fn build_exclude_list(job: &Job, pristine_excludes: &PristineExcludes) -> Result<Vec<String>> {
     let mut excludes = job.excludes.clone();
-    if let Some(pristine) = pristine_excludes {
+    if let Some(pristine) = pristine_excludes_for_job(job, pristine_excludes) {
         excludes.extend(pristine.iter().cloned());
     }
     Ok(excludes)
+}
+
+fn build_pristine_excludes_for_jobs(
+    jobs: &[Job],
+    options: BackupOptions,
+    verbose: bool,
+) -> Result<PristineExcludes> {
+    if !options.exclude_pristine {
+        return Ok(PristineExcludes::default());
+    }
+    let mut excludes = PristineExcludes::default();
+    if jobs
+        .iter()
+        .any(|job| pristine_source_for_job(job) == Some(PristineSource::Local))
+    {
+        excludes.local = Some(build_pristine_excludes_for_source(
+            &PristineSource::Local,
+            verbose,
+        )?);
+    }
+    let mut remote_hosts = jobs
+        .iter()
+        .filter_map(|job| match pristine_source_for_job(job) {
+            Some(PristineSource::RemoteSsh { host }) => Some(host),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    remote_hosts.sort();
+    remote_hosts.dedup();
+    for host in remote_hosts {
+        let source = PristineSource::RemoteSsh { host: host.clone() };
+        let host_excludes = build_pristine_excludes_for_source(&source, verbose)?;
+        excludes.remote.insert(host, host_excludes);
+    }
+    if verbose && excludes.local.is_none() && excludes.remote.is_empty() {
+        println!(
+            "pristine: skip package analysis; selected job sources are not supported for pristine analysis"
+        );
+    }
+    Ok(excludes)
+}
+
+fn pristine_excludes_for_job<'a>(
+    job: &Job,
+    pristine_excludes: &'a PristineExcludes,
+) -> Option<&'a [String]> {
+    match pristine_source_for_job(job) {
+        Some(PristineSource::Local) => pristine_excludes.local.as_deref(),
+        Some(PristineSource::RemoteSsh { host }) => {
+            pristine_excludes.remote.get(&host).map(Vec::as_slice)
+        }
+        None => None,
+    }
+}
+
+fn pristine_source_for_job(job: &Job) -> Option<PristineSource> {
+    if let Some(host) = remote_ssh_host_from_source(&job.source) {
+        return Some(PristineSource::RemoteSsh { host });
+    }
+    if job.source.trim().starts_with("rsync://") {
+        return None;
+    }
+    Some(PristineSource::Local)
+}
+
+fn remote_ssh_host_from_source(source: &str) -> Option<String> {
+    let source = source.trim();
+    if source.starts_with('/') || source.starts_with("rsync://") {
+        return None;
+    }
+    let (host, path) = source.split_once(':')?;
+    if host.is_empty() || !path.starts_with('/') {
+        return None;
+    }
+    Some(host.to_string())
 }
 
 fn create_excludes_file(excludes: &[String], filename: &Path) -> io::Result<()> {
@@ -389,5 +463,82 @@ fn acquire_lock_for_job(job_name: &str, run_mode: RunMode) -> Result<Option<Lock
             path.display(),
             e
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::RunPolicy;
+
+    fn job(source: &str) -> Job {
+        Job {
+            name: "test".to_string(),
+            source: source.to_string(),
+            copies: 1,
+            run_policy: RunPolicy::Auto,
+            excludes: vec!["/tmp".to_string()],
+            disk_ids: None,
+        }
+    }
+
+    #[test]
+    fn detects_remote_rsync_sources() {
+        assert_eq!(
+            remote_ssh_host_from_source("root@example.com:/").as_deref(),
+            Some("root@example.com")
+        );
+        assert_eq!(
+            remote_ssh_host_from_source("example.com:/var").as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(
+            remote_ssh_host_from_source("rsync://example.com/module"),
+            None
+        );
+        assert_eq!(remote_ssh_host_from_source("/"), None);
+        assert_eq!(remote_ssh_host_from_source("/srv/data"), None);
+    }
+
+    #[test]
+    fn remote_jobs_get_matching_remote_pristine_excludes() {
+        let mut pristine = PristineExcludes::default();
+        pristine.remote.insert(
+            "root@example.com".to_string(),
+            vec!["/usr/bin/bash".to_string()],
+        );
+        let excludes =
+            build_exclude_list(&job("root@example.com:/"), &pristine).expect("exclude list");
+
+        assert_eq!(
+            excludes,
+            vec!["/tmp".to_string(), "/usr/bin/bash".to_string()]
+        );
+    }
+
+    #[test]
+    fn remote_jobs_do_not_get_local_pristine_excludes() {
+        let pristine = PristineExcludes {
+            local: Some(vec!["/usr/bin/bash".to_string()]),
+            remote: HashMap::new(),
+        };
+        let excludes =
+            build_exclude_list(&job("root@example.com:/"), &pristine).expect("exclude list");
+
+        assert_eq!(excludes, vec!["/tmp".to_string()]);
+    }
+
+    #[test]
+    fn local_jobs_get_pristine_excludes() {
+        let pristine = PristineExcludes {
+            local: Some(vec!["/usr/bin/bash".to_string()]),
+            remote: HashMap::new(),
+        };
+        let excludes = build_exclude_list(&job("/"), &pristine).expect("exclude list");
+
+        assert_eq!(
+            excludes,
+            vec!["/tmp".to_string(), "/usr/bin/bash".to_string()]
+        );
     }
 }

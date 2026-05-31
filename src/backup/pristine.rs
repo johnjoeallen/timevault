@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{self, BufRead, BufReader, Read};
-use std::path::Path;
-use std::process::Command;
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::Result;
@@ -61,11 +61,24 @@ struct CacheEntry {
     dirty: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum PristineSource {
+    Local,
+    RemoteSsh { host: String },
+}
+
 pub fn build_pristine_excludes(verbose: bool) -> Result<Vec<String>> {
+    build_pristine_excludes_for_source(&PristineSource::Local, verbose)
+}
+
+pub fn build_pristine_excludes_for_source(
+    source: &PristineSource,
+    verbose: bool,
+) -> Result<Vec<String>> {
     if verbose {
         println!("pristine: detect operating system");
     }
-    let os = detect_os()?;
+    let os = detect_os_for_source(source)?;
     if verbose {
         println!("pristine: os {}", format_os_info(&os));
     }
@@ -79,92 +92,22 @@ pub fn build_pristine_excludes(verbose: bool) -> Result<Vec<String>> {
     let Some(manager) = manager else {
         return Ok(Vec::new());
     };
-    let cache_path = pristine_cache_path();
+    let cache_path = pristine_cache_path_for_source(source);
     if verbose {
         println!("pristine: cache {}", cache_path.display());
     }
     let mut cache = load_cache(&cache_path, verbose);
-    let files = list_package_files(manager, verbose)?;
-    let mut new_entries = HashMap::new();
-    let mut reused = 0usize;
-    let mut hashed = 0usize;
-    let mut dirty = 0usize;
-    let mut pristine = 0usize;
-    for path in files {
-        let meta = match fs::symlink_metadata(&path) {
-            Ok(meta) => meta,
-            Err(_) => continue,
-        };
-        if !meta.is_file() {
-            continue;
-        }
-        let mtime = match to_unix_mtime(meta.modified()) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-        if let Some(entry) = cache.entries.get(&path) {
-            if entry.mtime == mtime {
-                reused += 1;
-                if entry.dirty {
-                    dirty += 1;
-                } else {
-                    pristine += 1;
-                }
-                new_entries.insert(path, entry.clone());
-                continue;
-            }
-            let current_hash = match hash_file(Path::new(&path)) {
-                Ok(hash) => hash,
-                Err(err) => {
-                    if verbose {
-                        println!("pristine: hash failed {} ({})", path, err);
-                    }
-                    continue;
-                }
-            };
-            hashed += 1;
-            let is_dirty = current_hash != entry.hash;
-            if is_dirty {
-                dirty += 1;
-            } else {
-                pristine += 1;
-            }
-            new_entries.insert(
-                path,
-                CacheEntry {
-                    mtime,
-                    hash: entry.hash.clone(),
-                    dirty: is_dirty,
-                },
-            );
-            continue;
-        }
-        let current_hash = match hash_file(Path::new(&path)) {
-            Ok(hash) => hash,
-            Err(err) => {
-                if verbose {
-                    println!("pristine: hash failed {} ({})", path, err);
-                }
-                continue;
-            }
-        };
-        hashed += 1;
-        pristine += 1;
-        new_entries.insert(
-            path,
-            CacheEntry {
-                mtime,
-                hash: current_hash,
-                dirty: false,
-            },
-        );
-    }
-    cache.entries = new_entries;
+    let files = list_package_files_for_source(source, manager, verbose)?;
+    let stats = match source {
+        PristineSource::Local => analyze_local_files(files, &cache, verbose)?,
+        PristineSource::RemoteSsh { host } => analyze_remote_files(host, files, &cache, verbose)?,
+    };
+    cache.entries = stats.entries;
     save_cache(&cache_path, &cache, verbose)?;
     if verbose {
         println!(
             "pristine: cache stats reused={} hashed={} pristine={} dirty={}",
-            reused, hashed, pristine, dirty
+            stats.reused, stats.hashed, stats.pristine, stats.dirty
         );
     }
     let mut excludes = cache
@@ -182,7 +125,24 @@ pub fn build_pristine_excludes(verbose: bool) -> Result<Vec<String>> {
     Ok(excludes)
 }
 
+#[derive(Debug, Default)]
+struct AnalyzeStats {
+    entries: HashMap<String, CacheEntry>,
+    reused: usize,
+    hashed: usize,
+    dirty: usize,
+    pristine: usize,
+}
+
 pub fn detect_os() -> Result<OsInfo> {
+    detect_os_for_source(&PristineSource::Local)
+}
+
+fn detect_os_for_source(source: &PristineSource) -> Result<OsInfo> {
+    if let PristineSource::RemoteSsh { host } = source {
+        let content = ssh_output(host, "cat /etc/os-release")?;
+        return Ok(parse_os_release(&content));
+    }
     if cfg!(target_os = "linux") {
         return read_os_release(Path::new(OS_RELEASE_PATH));
     }
@@ -226,14 +186,31 @@ fn read_os_release(path: &Path) -> Result<OsInfo> {
     Ok(parse_os_release(&content))
 }
 
-pub fn pristine_cache_path() -> std::path::PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    Path::new(&home).join(PRISTINE_CACHE_REL)
+pub fn pristine_cache_path() -> PathBuf {
+    pristine_cache_path_for_source(&PristineSource::Local)
 }
 
-fn list_package_files(manager: PackageManager, verbose: bool) -> Result<Vec<String>> {
+pub fn pristine_cache_path_for_source(source: &PristineSource) -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let base = Path::new(&home).join(PRISTINE_CACHE_REL);
+    match source {
+        PristineSource::Local => base,
+        PristineSource::RemoteSsh { host } => {
+            base.with_file_name(format!("pristine-cache-{}.json", sanitize_cache_key(host)))
+        }
+    }
+}
+
+fn list_package_files_for_source(
+    source: &PristineSource,
+    manager: PackageManager,
+    verbose: bool,
+) -> Result<Vec<String>> {
     if verbose {
         println!("pristine: enumerate package-managed files");
+    }
+    if let PristineSource::RemoteSsh { host } = source {
+        return list_remote_package_files(host, manager, verbose);
     }
     let mut files = match manager {
         PackageManager::Dpkg => list_dpkg_files(verbose)?,
@@ -241,6 +218,33 @@ fn list_package_files(manager: PackageManager, verbose: bool) -> Result<Vec<Stri
         PackageManager::Pacman => list_command_files("pacman", &["-Qlq"], verbose)?,
     };
     files.sort();
+    Ok(files)
+}
+
+fn list_remote_package_files(
+    host: &str,
+    manager: PackageManager,
+    verbose: bool,
+) -> Result<Vec<String>> {
+    let command = match manager {
+        PackageManager::Dpkg => {
+            "find /var/lib/dpkg/info -type f -name '*.list' -exec cat {} + 2>/dev/null"
+        }
+        PackageManager::Rpm => "rpm -qal",
+        PackageManager::Pacman => "pacman -Qlq",
+    };
+    let output = ssh_output(host, command)?;
+    let mut files = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with('/'))
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    files.sort();
+    files.dedup();
+    if verbose {
+        println!("pristine: remote files {}", files.len());
+    }
     Ok(files)
 }
 
@@ -312,6 +316,224 @@ fn list_command_files(cmd: &str, args: &[&str], verbose: bool) -> Result<Vec<Str
         println!("pristine: {} files {}", cmd, files.len());
     }
     Ok(files)
+}
+
+fn analyze_local_files(
+    files: Vec<String>,
+    cache: &CacheFile,
+    verbose: bool,
+) -> Result<AnalyzeStats> {
+    let mut stats = AnalyzeStats::default();
+    for path in files {
+        let meta = match fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(_) => continue,
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let mtime = match to_unix_mtime(meta.modified()) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if let Some(entry) = cache.entries.get(&path) {
+            if entry.mtime == mtime {
+                stats.reused += 1;
+                if entry.dirty {
+                    stats.dirty += 1;
+                } else {
+                    stats.pristine += 1;
+                }
+                stats.entries.insert(path, entry.clone());
+                continue;
+            }
+            let current_hash = match hash_file(Path::new(&path)) {
+                Ok(hash) => hash,
+                Err(err) => {
+                    if verbose {
+                        println!("pristine: hash failed {} ({})", path, err);
+                    }
+                    continue;
+                }
+            };
+            stats.hashed += 1;
+            let is_dirty = current_hash != entry.hash;
+            if is_dirty {
+                stats.dirty += 1;
+            } else {
+                stats.pristine += 1;
+            }
+            stats.entries.insert(
+                path,
+                CacheEntry {
+                    mtime,
+                    hash: entry.hash.clone(),
+                    dirty: is_dirty,
+                },
+            );
+            continue;
+        }
+        let current_hash = match hash_file(Path::new(&path)) {
+            Ok(hash) => hash,
+            Err(err) => {
+                if verbose {
+                    println!("pristine: hash failed {} ({})", path, err);
+                }
+                continue;
+            }
+        };
+        stats.hashed += 1;
+        stats.pristine += 1;
+        stats.entries.insert(
+            path,
+            CacheEntry {
+                mtime,
+                hash: current_hash,
+                dirty: false,
+            },
+        );
+    }
+    Ok(stats)
+}
+
+fn analyze_remote_files(
+    host: &str,
+    files: Vec<String>,
+    cache: &CacheFile,
+    verbose: bool,
+) -> Result<AnalyzeStats> {
+    let script = r#"
+while IFS="$(printf '\t')" read -r path cached_mtime cached_hash; do
+    [ -f "$path" ] || continue
+    mtime=$(stat -c %Y -- "$path" 2>/dev/null) || continue
+    if [ "$mtime" = "$cached_mtime" ] && [ -n "$cached_hash" ]; then
+        printf 'R\t%s\t%s\t%s\n' "$mtime" "$cached_hash" "$path"
+        continue
+    fi
+    hash=$(sha256sum -- "$path" 2>/dev/null | awk '{print $1}') || continue
+    [ -n "$hash" ] || continue
+    printf 'H\t%s\t%s\t%s\n' "$mtime" "$hash" "$path"
+done
+"#;
+    let mut input = String::new();
+    for path in files {
+        let cached = cache.entries.get(&path);
+        let mtime = cached
+            .map(|entry| entry.mtime.to_string())
+            .unwrap_or_default();
+        let hash = cached.map(|entry| entry.hash.as_str()).unwrap_or("");
+        input.push_str(&path);
+        input.push('\t');
+        input.push_str(&mtime);
+        input.push('\t');
+        input.push_str(hash);
+        input.push('\n');
+    }
+
+    let output = ssh_script_output(host, script, &input)?;
+    let mut stats = AnalyzeStats::default();
+    for line in output.lines() {
+        let mut parts = line.splitn(4, '\t');
+        let state = parts.next().unwrap_or("");
+        let mtime = parts
+            .next()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        let current_hash = parts.next().unwrap_or("");
+        let path = parts.next().unwrap_or("").to_string();
+        if path.is_empty() || current_hash.is_empty() {
+            continue;
+        }
+
+        if state == "R" {
+            if let Some(entry) = cache.entries.get(&path) {
+                stats.reused += 1;
+                if entry.dirty {
+                    stats.dirty += 1;
+                } else {
+                    stats.pristine += 1;
+                }
+                stats.entries.insert(path, entry.clone());
+            }
+            continue;
+        }
+
+        if state != "H" {
+            continue;
+        }
+        stats.hashed += 1;
+        let (hash, dirty) = match cache.entries.get(&path) {
+            Some(entry) => (entry.hash.clone(), current_hash != entry.hash),
+            None => (current_hash.to_string(), false),
+        };
+        if dirty {
+            stats.dirty += 1;
+        } else {
+            stats.pristine += 1;
+        }
+        stats
+            .entries
+            .insert(path, CacheEntry { mtime, hash, dirty });
+    }
+    if verbose {
+        println!("pristine: remote file states {}", stats.entries.len());
+    }
+    Ok(stats)
+}
+
+fn ssh_output(host: &str, command: &str) -> Result<String> {
+    let output = Command::new("ssh").arg(host).arg(command).output()?;
+    command_output_to_string("ssh", host, output)
+}
+
+fn ssh_script_output(host: &str, script: &str, input: &str) -> Result<String> {
+    let mut child = Command::new("ssh")
+        .arg(host)
+        .arg(script)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin.write_all(input.as_bytes())?;
+    }
+    let output = child.wait_with_output()?;
+    command_output_to_string("ssh", host, output)
+}
+
+fn command_output_to_string(
+    command: &str,
+    target: &str,
+    output: std::process::Output,
+) -> Result<String> {
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(crate::error::TimevaultError::message(format!(
+            "{} {} failed: {}",
+            command,
+            target,
+            stderr.trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn sanitize_cache_key(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "unknown".to_string()
+    } else {
+        sanitized
+    }
 }
 
 fn load_cache(path: &Path, verbose: bool) -> CacheFile {
