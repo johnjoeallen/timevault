@@ -15,7 +15,7 @@ use crate::types::RunMode;
 
 const CONFIG_FILE: &str = "/etc/timevault.yaml";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-pub(crate) const BUILD_NUMBER: u32 = 8;
+pub(crate) const BUILD_NUMBER: u32 = 14;
 const LICENSE_NAME: &str = "GNU GPL v3 or later";
 const COPYRIGHT: &str = "Copyright (C) 2026 John Allen (john.joe.allen@gmail.com)";
 const PROJECT_URL: &str = "https://github.com/johnjoeallen/timevault";
@@ -25,6 +25,7 @@ pub mod commands;
 
 pub fn run() -> Result<()> {
     init_tracing();
+    crate::mount::signals::install_signal_handlers()?;
     let (cli, rsync_extra) = parse_cli()?;
 
     print_banner();
@@ -61,6 +62,7 @@ pub fn run() -> Result<()> {
             run_mode,
             &rsync_extra,
             options,
+            cli.send_report,
         )?,
         Command::Disk { command } => match command {
             DiskCommand::Enroll(args) => {
@@ -253,6 +255,7 @@ fn print_help() {
     println!("  --rsync <args...>      Pass remaining args to rsync");
     println!("  --disk-id <id>         Select enrolled backup disk by id");
     println!("  --cascade              Run backup across all connected disks");
+    println!("  --send-report          Send configured report email even during dry-run");
     println!("  --fs-uuid <uuid>       Filesystem UUID selector");
     println!("  --device <path>        Block device path (disk enroll)");
     println!("  --label <label>        Optional disk label (disk enroll)");

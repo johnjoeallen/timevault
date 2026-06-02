@@ -33,11 +33,25 @@ pub struct ConfigOptions {
     pub safe: Option<bool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rsync: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report: Option<ReportOptions>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ReportOptions {
+    #[serde(rename = "emailTo")]
+    pub email_to: String,
+    #[serde(default, rename = "emailFrom", skip_serializing_if = "Option::is_none")]
+    pub email_from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sendmail: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct JobConfig {
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     pub source: String,
     pub copies: usize,
     #[serde(default = "default_run_policy")]
@@ -71,6 +85,7 @@ pub struct BackupDiskConfig {
 #[derive(Debug, Clone)]
 pub struct Job {
     pub name: String,
+    pub description: Option<String>,
     pub source: String,
     pub copies: usize,
     pub run_policy: RunPolicy,

@@ -107,6 +107,7 @@ fn parse_runtime(cfg: Config) -> Result<RuntimeConfig> {
         excludes.extend(job.excludes);
         jobs.push(Job {
             name: job.name,
+            description: job.description.filter(|value| !value.trim().is_empty()),
             source: job.source,
             copies: job.copies,
             run_policy,
@@ -145,6 +146,7 @@ backupDisks:
     fsUuid: "uuid-1"
 jobs:
   - name: "job1"
+    description: "Primary filesystem"
     source: "/"
     copies: 2
     run: "auto"
@@ -154,6 +156,10 @@ jobs:
         let cfg = load_config(file.path().to_string_lossy().as_ref()).expect("load");
         assert_eq!(cfg.backup_disks.len(), 1);
         assert_eq!(cfg.jobs.len(), 1);
+        assert_eq!(
+            cfg.jobs[0].description.as_deref(),
+            Some("Primary filesystem")
+        );
     }
 
     #[test]
@@ -175,6 +181,32 @@ jobs:
         let cfg = load_config(file.path().to_string_lossy().as_ref()).expect("load");
         assert_eq!(cfg.jobs.len(), 1);
         assert_eq!(cfg.jobs[0].disk_ids, Some(vec!["primary".to_string()]));
+    }
+
+    #[test]
+    fn load_config_with_report_options() {
+        let mut file = NamedTempFile::new().expect("tempfile");
+        let yaml = r#"
+options:
+  report:
+    emailTo: "admin@example.com"
+    emailFrom: "timevault@example.com"
+    sendmail: "/usr/sbin/sendmail"
+backupDisks:
+  - diskId: "primary"
+    fsUuid: "uuid-1"
+jobs:
+  - name: "job1"
+    source: "/"
+    copies: 2
+    run: "auto"
+"#;
+        file.write_all(yaml.as_bytes()).expect("write");
+        let cfg = load_config(file.path().to_string_lossy().as_ref()).expect("load");
+        let report = cfg.options.report.expect("report options");
+        assert_eq!(report.email_to, "admin@example.com");
+        assert_eq!(report.email_from.as_deref(), Some("timevault@example.com"));
+        assert_eq!(report.sendmail.as_deref(), Some("/usr/sbin/sendmail"));
     }
 
     #[test]
@@ -221,7 +253,10 @@ jobs:
         let err = load_config(missing).expect_err("missing config should fail");
         assert_eq!(
             err.to_string(),
-            format!("open config {}: No such file or directory (os error 2)", missing)
+            format!(
+                "open config {}: No such file or directory (os error 2)",
+                missing
+            )
         );
     }
 }

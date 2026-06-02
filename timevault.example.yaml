@@ -44,11 +44,17 @@ options:
   exclude-pristine: false
   verbose: false
   safe: false
+  # Optional HTML backup report email, sent from "Timevault".
+  # report:
+  #   emailTo: "admin@example.com"
+  #   emailFrom: "timevault@example.com"
+  #   sendmail: "/usr/sbin/sendmail"
   rsync:
     - "--one-file-system"
 
 jobs:
   - name: "primary"
+    description: "Primary filesystem"
     source: "/"
     copies: 30
     run: "auto"
@@ -56,6 +62,7 @@ jobs:
     # diskIds: ["primary"]
     excludes: []
   - name: "remote-primary"
+    description: "Remote primary filesystem"
     source: "root@example.com:/"
     copies: 30
     run: "auto"

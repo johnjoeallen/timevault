@@ -2,6 +2,7 @@ use std::process::Command;
 
 use chrono::Local;
 
+use crate::backup::report::{email_html_report, render_html, BackupRunReport};
 use crate::backup::{print_job_details, run_backup, run_pristine_only, BackupOptions};
 use crate::cli::commands::exit_for_disk_error;
 use crate::config::load::load_config;
@@ -27,6 +28,7 @@ pub fn run_backup_command(
     run_mode: RunMode,
     rsync_extra_cli: &[String],
     options: BackupOptions,
+    send_report: bool,
 ) -> Result<()> {
     println!("{}", Local::now().format("%d-%m-%Y %H:%M"));
 
@@ -46,6 +48,7 @@ pub fn run_backup_command(
         exclude_pristine: options.exclude_pristine || cfg.options.exclude_pristine.unwrap_or(false),
         exclude_pristine_only: options.exclude_pristine_only,
     };
+    let report_options = cfg.options.report.clone();
 
     if backup_disks.is_empty() && !options.exclude_pristine_only {
         return Err(TimevaultError::message(
@@ -143,6 +146,7 @@ pub fn run_backup_command(
             println!("no jobs matched disk selection; aborting");
             std::process::exit(2);
         }
+        let mut reports = Vec::new();
         if let Some((code, message)) = run_jobs_for_primary(
             &primary_disk,
             jobs_to_run,
@@ -152,10 +156,13 @@ pub fn run_backup_command(
             &rsync_extra,
             &mount_base,
             options,
+            &mut reports,
         )? {
+            send_reports(&report_options, &reports, run_mode, send_report)?;
             println!("{}", message);
             std::process::exit(code);
         }
+        send_reports(&report_options, &reports, run_mode, send_report)?;
     } else {
         let eligible_connected: Vec<BackupDiskConfig> = connected
             .iter()
@@ -178,6 +185,7 @@ pub fn run_backup_command(
             groups.entry(primary.disk_id.clone()).or_default().push(job);
         }
 
+        let mut reports = Vec::new();
         for disk in &eligible_connected {
             let Some(jobs) = groups.remove(&disk.disk_id) else {
                 continue;
@@ -191,11 +199,14 @@ pub fn run_backup_command(
                 &rsync_extra,
                 &mount_base,
                 options,
+                &mut reports,
             )? {
+                send_reports(&report_options, &reports, run_mode, send_report)?;
                 println!("{}", message);
                 std::process::exit(code);
             }
         }
+        send_reports(&report_options, &reports, run_mode, send_report)?;
     }
 
     if !run_mode.dry_run {
@@ -205,6 +216,28 @@ pub fn run_backup_command(
     println!("{}", Local::now().format("%d-%m-%Y %H:%M"));
 
     Ok(())
+}
+
+fn send_reports(
+    options: &Option<crate::config::model::ReportOptions>,
+    reports: &[BackupRunReport],
+    run_mode: RunMode,
+    force_send: bool,
+) -> Result<()> {
+    let Some(options) = options else {
+        return Ok(());
+    };
+    if reports.is_empty() {
+        return Ok(());
+    }
+    if run_mode.dry_run && !force_send {
+        if run_mode.verbose {
+            println!("dry-run: skip backup report email");
+        }
+        return Ok(());
+    }
+    let html = render_html(reports);
+    email_html_report(options, &html)
 }
 
 fn job_requires_disk(job: &crate::config::model::Job, disk_id: &str) -> bool {
@@ -241,13 +274,20 @@ fn run_jobs_for_primary(
     rsync_extra: &[String],
     mount_base: &std::path::Path,
     options: BackupOptions,
+    reports: &mut Vec<BackupRunReport>,
 ) -> Result<Option<(i32, String)>> {
     let (primary_guard, primary_mount) = mount_and_verify(primary_disk, mount_base, run_mode)?;
     let primary_current_base = primary_mount.clone();
 
-    if let Some((code, message)) =
-        run_backup_checked(jobs.clone(), rsync_extra, run_mode, &primary_mount, options)
-    {
+    if let Some((code, message)) = run_backup_checked(
+        primary_disk.disk_id.clone(),
+        jobs.clone(),
+        rsync_extra,
+        run_mode,
+        &primary_mount,
+        options,
+        reports,
+    ) {
         drop(primary_guard);
         return Ok(Some((code, message)));
     }
@@ -298,9 +338,15 @@ fn run_jobs_for_primary(
                 drop(guard);
                 continue;
             }
-            if let Some((code, message)) =
-                run_backup_checked(cascaded_jobs, rsync_extra, run_mode, &mountpoint, options)
-            {
+            if let Some((code, message)) = run_backup_checked(
+                disk.disk_id.clone(),
+                cascaded_jobs,
+                rsync_extra,
+                run_mode,
+                &mountpoint,
+                options,
+                reports,
+            ) {
                 drop(guard);
                 drop(primary_guard);
                 return Ok(Some((code, message)));
@@ -322,6 +368,7 @@ mod tests {
     fn job_requires_disk_needs_explicit_match() {
         let job = crate::config::model::Job {
             name: "job".to_string(),
+            description: None,
             source: "/".to_string(),
             copies: 1,
             run_policy: RunPolicy::Auto,
@@ -331,6 +378,7 @@ mod tests {
         assert!(!job_requires_disk(&job, "disk-a"));
         let job = crate::config::model::Job {
             name: "job".to_string(),
+            description: None,
             source: "/".to_string(),
             copies: 1,
             run_policy: RunPolicy::Auto,
@@ -363,6 +411,7 @@ mod tests {
         ];
         let job = crate::config::model::Job {
             name: "job".to_string(),
+            description: None,
             source: "/".to_string(),
             copies: 1,
             run_policy: RunPolicy::Auto,
@@ -396,6 +445,7 @@ mod tests {
         ];
         let job = crate::config::model::Job {
             name: "job".to_string(),
+            description: None,
             source: "/".to_string(),
             copies: 1,
             run_policy: RunPolicy::Auto,
@@ -508,28 +558,36 @@ fn mount_and_verify(
 }
 
 fn run_backup_checked(
+    disk_id: String,
     jobs: Vec<crate::config::model::Job>,
     rsync_extra: &[String],
     run_mode: RunMode,
     mountpoint: &std::path::Path,
     options: BackupOptions,
+    reports: &mut Vec<BackupRunReport>,
 ) -> Option<(i32, String)> {
     let backup_result = run_backup(jobs, rsync_extra, run_mode, mountpoint, options);
-    if let Err(err) = backup_result {
-        let message = err.to_string();
-        if message.starts_with("job ") && message.ends_with(" is already running") {
-            return Some((3, message));
+    match backup_result {
+        Ok(mut report) => {
+            report.disk_id = disk_id;
+            reports.push(report);
+            None
         }
-        if message.starts_with("failed to lock ") {
-            return Some((
-                2,
-                format!(
-                    "{} (need write permission; try sudo or adjust permissions)",
-                    message
-                ),
-            ));
+        Err(err) => {
+            let message = err.to_string();
+            if message.starts_with("job ") && message.ends_with(" is already running") {
+                return Some((3, message));
+            }
+            if message.starts_with("failed to lock ") {
+                return Some((
+                    2,
+                    format!(
+                        "{} (need write permission; try sudo or adjust permissions)",
+                        message
+                    ),
+                ));
+            }
+            Some((1, format!("backup failed: {}", message)))
         }
-        return Some((1, format!("backup failed: {}", message)));
     }
-    None
 }

@@ -11,8 +11,7 @@
 ## Build and package
 
 ```bash
-cargo build --release
-cargo deb
+scripts/build-deb.sh
 ```
 
 The package will be created under:

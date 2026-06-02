@@ -45,6 +45,7 @@ backupDisks:
 ### Job entries
 Each job defines a backup source and retention policy.
 - `name`: Job name (used as the directory on the disk).
+- `description`: Optional human-readable label for reports and command output.
 - `source`: Source path for rsync. Can be local or remote (`user@host:/path`).
 - `copies`: Number of snapshots to keep (oldest beyond this are removed).
 - `run`: Run policy (`auto`, `demand`, `off`).
@@ -55,6 +56,7 @@ Example:
 ```yaml
 jobs:
   - name: "primary"
+    description: "Primary filesystem"
     source: "/"
     copies: 30
     run: "auto"
@@ -108,16 +110,23 @@ options:
   exclude-pristine: false
   verbose: false
   safe: false
+  # Optional HTML backup report email, sent from "Timevault".
+  # report:
+  #   emailTo: "admin@example.com"
+  #   emailFrom: "timevault@example.com"
+  #   sendmail: "/usr/sbin/sendmail"
   rsync:
     - "--one-file-system"
 
 jobs:
   - name: "primary"
+    description: "Primary filesystem"
     source: "/"
     copies: 30
     run: "auto"
     excludes: []
   - name: "remote-primary"
+    description: "Remote primary filesystem"
     source: "root@example.com:/"
     copies: 30
     run: "auto"
@@ -137,8 +146,14 @@ Global options:
 - `--rsync <args...>`: Pass remaining args to rsync.
 - `--disk-id <id>`: Select a specific enrolled disk by disk id.
 - `--cascade`: Run backups across all connected disks.
+- `--send-report`: Send the configured report email even during `--dry-run`.
 - `--version`: Show version and license info.
 - `-h`: Show help.
+
+### Backup reports
+Add `options.report.emailTo` to send a backup report after each backup run.
+The HTML email is sent from `Timevault <emailFrom>` so Gmail displays the report body directly.
+By default Timevault uses `/usr/sbin/sendmail -t`; set `options.report.sendmail` to override the command path.
 
 ## Commands
 

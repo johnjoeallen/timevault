@@ -9,6 +9,7 @@ use chrono::{Duration, Local};
 use walkdir::WalkDir;
 
 use crate::backup::pristine::{build_pristine_excludes_for_source, PristineSource};
+use crate::backup::report::{BackupJobReport, BackupJobStatus, BackupRunReport};
 use crate::backup::rsync::run_rsync;
 use crate::config::model::Job;
 use crate::error::{Result, TimevaultError};
@@ -16,6 +17,7 @@ use crate::types::RunMode;
 use crate::util::paths::job_lock_path;
 
 pub mod pristine;
+pub mod report;
 pub mod rsync;
 
 const TIMEVAULT_MARKER: &str = ".timevault";
@@ -47,6 +49,9 @@ pub fn print_job_details(job: &Job) {
         _ => "<any>".to_string(),
     };
     println!("job: {}", job.name);
+    if let Some(description) = &job.description {
+        println!("  description: {}", description);
+    }
     println!("  source: {}", job.source);
     println!("  backup dir: {}", job.name);
     println!("  copies: {}", job.copies);
@@ -61,8 +66,21 @@ pub fn run_backup(
     run_mode: RunMode,
     disk_mount: &Path,
     options: BackupOptions,
-) -> Result<()> {
-    let pristine_excludes = build_pristine_excludes_for_jobs(&jobs, options, run_mode.verbose)?;
+) -> Result<BackupRunReport> {
+    let started_at = Local::now();
+    let mut report = BackupRunReport {
+        disk_id: disk_mount
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("unknown")
+            .to_string(),
+        mountpoint: disk_mount.display().to_string(),
+        started_at,
+        finished_at: started_at,
+        jobs: Vec::new(),
+    };
+    let pristine_excludes =
+        build_pristine_excludes_for_jobs(&jobs, options, run_mode.verbose, run_mode.dry_run)?;
     for job in jobs {
         let _lock = acquire_lock_for_job(&job.name, run_mode)?;
         let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
@@ -87,6 +105,16 @@ pub fn run_backup(
                     job.name
                 );
             }
+            report.jobs.push(BackupJobReport {
+                name: job.name.clone(),
+                description: job.description.clone(),
+                source: job.source.clone(),
+                destination: disk_mount.display().to_string(),
+                backup_day: "-".to_string(),
+                status: BackupJobStatus::Skipped,
+                attempts: 0,
+                rsync_code: None,
+            });
             continue;
         }
 
@@ -130,7 +158,9 @@ pub fn run_backup(
         }
 
         let mut rc = 1;
+        let mut attempts = 0;
         for attempt in 1..=3 {
+            attempts = attempt;
             rc = run_rsync(
                 &job.source,
                 &backup_dir,
@@ -182,15 +212,35 @@ pub fn run_backup(
                 }
             }
         }
+        let status = status_for_rsync_code(rc);
+        report.jobs.push(BackupJobReport {
+            name: job.name,
+            description: job.description,
+            source: job.source,
+            destination: backup_dir.display().to_string(),
+            backup_day,
+            status,
+            attempts,
+            rsync_code: Some(rc),
+        });
     }
-    Ok(())
+    report.finished_at = Local::now();
+    Ok(report)
+}
+
+fn status_for_rsync_code(rc: i32) -> BackupJobStatus {
+    match rc {
+        0 | 24 => BackupJobStatus::Success,
+        _ => BackupJobStatus::Failed,
+    }
 }
 
 pub fn run_pristine_only(jobs: Vec<Job>, run_mode: RunMode, options: BackupOptions) -> Result<()> {
     if run_mode.verbose {
         println!("pristine: exclude-only mode enabled; skipping backup");
     }
-    let pristine_excludes = build_pristine_excludes_for_jobs(&jobs, options, run_mode.verbose)?;
+    let pristine_excludes =
+        build_pristine_excludes_for_jobs(&jobs, options, run_mode.verbose, run_mode.dry_run)?;
     for job in jobs {
         let _lock = acquire_lock_for_job(&job.name, run_mode)?;
         let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
@@ -230,8 +280,15 @@ fn build_pristine_excludes_for_jobs(
     jobs: &[Job],
     options: BackupOptions,
     verbose: bool,
+    dry_run: bool,
 ) -> Result<PristineExcludes> {
     if !options.exclude_pristine {
+        return Ok(PristineExcludes::default());
+    }
+    if dry_run {
+        if verbose {
+            println!("pristine: dry-run; skip package analysis");
+        }
         return Ok(PristineExcludes::default());
     }
     let mut excludes = PristineExcludes::default();
@@ -474,6 +531,7 @@ mod tests {
     fn job(source: &str) -> Job {
         Job {
             name: "test".to_string(),
+            description: None,
             source: source.to_string(),
             copies: 1,
             run_policy: RunPolicy::Auto,
@@ -540,5 +598,27 @@ mod tests {
             excludes,
             vec!["/tmp".to_string(), "/usr/bin/bash".to_string()]
         );
+    }
+
+    #[test]
+    fn dry_run_skips_pristine_analysis() {
+        let excludes = build_pristine_excludes_for_jobs(
+            &[job("root@example.com:/")],
+            BackupOptions {
+                exclude_pristine: true,
+                exclude_pristine_only: false,
+            },
+            false,
+            true,
+        )
+        .expect("pristine excludes");
+
+        assert!(excludes.local.is_none());
+        assert!(excludes.remote.is_empty());
+    }
+
+    #[test]
+    fn rsync_vanished_files_are_reported_as_success() {
+        assert_eq!(status_for_rsync_code(24), BackupJobStatus::Success);
     }
 }

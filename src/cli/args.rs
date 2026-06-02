@@ -34,6 +34,8 @@ pub struct Cli {
     pub disk_id: Option<String>,
     #[arg(long, global = true)]
     pub cascade: bool,
+    #[arg(long, global = true)]
+    pub send_report: bool,
 
     #[arg(long, short = 'h')]
     pub help: bool,
@@ -380,5 +382,12 @@ mod tests {
             panic!("expected disk du");
         };
         assert_eq!(args.args, vec!["-sh", "primary:/backups"]);
+    }
+
+    #[test]
+    fn parses_send_report() {
+        let cli = Cli::parse_from(["timevault", "--dry-run", "--send-report"]);
+        assert!(cli.dry_run);
+        assert!(cli.send_report);
     }
 }

@@ -39,11 +39,13 @@ excludes:
 
 jobs:
   - name: "spitfire-primary"
+    description: "Spitfire primary filesystem"
     source: "/"
     copies: 30
     run: "auto"
     excludes: []
   - name: "bf109-primary"
+    description: "BF109 remote primary filesystem"
     source: "root@mail.moyville.net:/"
     copies: 30
     run: "auto"
