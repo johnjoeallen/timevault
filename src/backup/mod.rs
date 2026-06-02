@@ -440,14 +440,29 @@ fn copy_snapshot_without_symlinks(source: &Path, dest: &Path, run_mode: RunMode)
             if run_mode.dry_run {
                 println!("dry-run: ln {} {}", src_path.display(), target.display());
             } else {
-                if let Some(parent) = target.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::hard_link(src_path, &target)?;
+                hard_link_if_missing(src_path, &target)?;
             }
         }
     }
     Ok(())
+}
+
+fn hard_link_if_missing(source: &Path, target: &Path) -> io::Result<()> {
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    match fs::symlink_metadata(target) {
+        Ok(_) => return Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+
+    match fs::hard_link(source, target) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 fn resolve_job_dest(job: &Job, disk_mount: &Path) -> Result<PathBuf> {
@@ -527,6 +542,7 @@ fn acquire_lock_for_job(job_name: &str, run_mode: RunMode) -> Result<Option<Lock
 mod tests {
     use super::*;
     use crate::types::RunPolicy;
+    use std::os::unix::fs::MetadataExt;
 
     fn job(source: &str) -> Job {
         Job {
@@ -538,6 +554,20 @@ mod tests {
             excludes: vec!["/tmp".to_string()],
             disk_ids: None,
         }
+    }
+
+    fn run_mode() -> RunMode {
+        RunMode {
+            dry_run: false,
+            safe_mode: false,
+            verbose: false,
+        }
+    }
+
+    fn same_inode(left: &Path, right: &Path) -> bool {
+        let left = fs::metadata(left).expect("left metadata");
+        let right = fs::metadata(right).expect("right metadata");
+        left.dev() == right.dev() && left.ino() == right.ino()
     }
 
     #[test]
@@ -620,5 +650,98 @@ mod tests {
     #[test]
     fn rsync_vanished_files_are_reported_as_success() {
         assert_eq!(status_for_rsync_code(24), BackupJobStatus::Success);
+    }
+
+    #[test]
+    fn missing_current_file_is_hard_linked_from_previous() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let previous = tmp.path().join("previous");
+        let current = tmp.path().join("current");
+        let previous_file = previous.join("nested/file.txt");
+        let current_file = current.join("nested/file.txt");
+        fs::create_dir_all(previous_file.parent().expect("parent")).expect("mkdir previous");
+        fs::write(&previous_file, "previous").expect("write previous");
+
+        copy_snapshot_without_symlinks(&previous, &current, run_mode()).expect("seed");
+
+        assert_eq!(
+            fs::read_to_string(&current_file).expect("read current"),
+            "previous"
+        );
+        assert!(same_inode(&previous_file, &current_file));
+    }
+
+    #[test]
+    fn existing_current_file_is_not_replaced() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let previous = tmp.path().join("previous");
+        let current = tmp.path().join("current");
+        let previous_file = previous.join("file.txt");
+        let current_file = current.join("file.txt");
+        fs::create_dir_all(&previous).expect("mkdir previous");
+        fs::create_dir_all(&current).expect("mkdir current");
+        fs::write(&previous_file, "same").expect("write previous");
+        fs::write(&current_file, "same").expect("write current");
+        let current_before = fs::metadata(&current_file).expect("metadata before");
+
+        copy_snapshot_without_symlinks(&previous, &current, run_mode()).expect("seed");
+
+        let current_after = fs::metadata(&current_file).expect("metadata after");
+        assert_eq!(
+            fs::read_to_string(&current_file).expect("read current"),
+            "same"
+        );
+        assert_eq!(current_before.dev(), current_after.dev());
+        assert_eq!(current_before.ino(), current_after.ino());
+        assert!(!same_inode(&previous_file, &current_file));
+    }
+
+    #[test]
+    fn rerunning_seed_operation_is_idempotent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let previous = tmp.path().join("previous");
+        let current = tmp.path().join("current");
+        let previous_file = previous.join("file.txt");
+        let current_file = current.join("file.txt");
+        fs::create_dir_all(&previous).expect("mkdir previous");
+        fs::write(&previous_file, "previous").expect("write previous");
+
+        copy_snapshot_without_symlinks(&previous, &current, run_mode()).expect("first seed");
+        let current_before = fs::metadata(&current_file).expect("metadata before");
+        copy_snapshot_without_symlinks(&previous, &current, run_mode()).expect("second seed");
+        let current_after = fs::metadata(&current_file).expect("metadata after");
+
+        assert_eq!(
+            fs::read_to_string(&current_file).expect("read current"),
+            "previous"
+        );
+        assert!(same_inode(&previous_file, &current_file));
+        assert_eq!(current_before.dev(), current_after.dev());
+        assert_eq!(current_before.ino(), current_after.ino());
+    }
+
+    #[test]
+    fn existing_current_file_with_different_contents_remains_unchanged() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let previous = tmp.path().join("previous");
+        let current = tmp.path().join("current");
+        let previous_file = previous.join("file.txt");
+        let current_file = current.join("file.txt");
+        fs::create_dir_all(&previous).expect("mkdir previous");
+        fs::create_dir_all(&current).expect("mkdir current");
+        fs::write(&previous_file, "previous").expect("write previous");
+        fs::write(&current_file, "current").expect("write current");
+        let current_before = fs::metadata(&current_file).expect("metadata before");
+
+        copy_snapshot_without_symlinks(&previous, &current, run_mode()).expect("seed");
+
+        let current_after = fs::metadata(&current_file).expect("metadata after");
+        assert_eq!(
+            fs::read_to_string(&current_file).expect("read current"),
+            "current"
+        );
+        assert_eq!(current_before.dev(), current_after.dev());
+        assert_eq!(current_before.ino(), current_after.ino());
+        assert!(!same_inode(&previous_file, &current_file));
     }
 }
