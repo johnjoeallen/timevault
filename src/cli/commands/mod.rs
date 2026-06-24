@@ -7,6 +7,7 @@ pub mod disk_inspect;
 pub mod disk_ls;
 pub mod mount;
 pub mod umount;
+pub mod wake;
 
 use crate::error::{DiskError, TimevaultError};
 

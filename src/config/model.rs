@@ -60,6 +60,45 @@ pub struct JobConfig {
     pub excludes: Vec<String>,
     #[serde(default, rename = "diskIds", skip_serializing_if = "Option::is_none")]
     pub disk_ids: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<RemoteJobOptions>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq, Eq)]
+pub struct RemoteJobOptions {
+    #[serde(
+        default,
+        rename = "inhibitSuspend",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub inhibit_suspend: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake: Option<RemoteWakeOptions>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct RemoteWakeOptions {
+    pub mac: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub broadcast: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface: Option<String>,
+    #[serde(
+        default,
+        rename = "keepaliveSeconds",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub keepalive_seconds: Option<u64>,
+    #[serde(
+        default,
+        rename = "waitSeconds",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub wait_seconds: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -91,6 +130,7 @@ pub struct Job {
     pub run_policy: RunPolicy,
     pub excludes: Vec<String>,
     pub disk_ids: Option<Vec<String>>,
+    pub remote: Option<RemoteJobOptions>,
 }
 
 #[derive(Debug, Clone)]

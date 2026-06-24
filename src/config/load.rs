@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::io::Read;
+use std::net::Ipv4Addr;
 
 use crate::config::model::{Config, Job, RuntimeConfig};
 use crate::error::{ConfigError, Result, TimevaultError};
@@ -59,6 +60,75 @@ fn parse_runtime(cfg: Config) -> Result<RuntimeConfig> {
                 ConfigError::Invalid(format!("job {}: source path is empty", job.name)).into(),
             );
         }
+        if job.remote.is_some() && !is_ssh_rsync_source(&job.source) {
+            return Err(ConfigError::Invalid(format!(
+                "job {}: remote options require an SSH-style source like user@host:/path",
+                job.name
+            ))
+            .into());
+        }
+        if let Some(remote) = &job.remote {
+            if remote.inhibit_suspend == Some(true) && remote.wake.is_none() {
+                return Err(ConfigError::Invalid(format!(
+                    "job {}: remote.inhibitSuspend requires remote.wake",
+                    job.name
+                ))
+                .into());
+            }
+            if let Some(wake) = &remote.wake {
+                if wake.mac.trim().is_empty() {
+                    return Err(ConfigError::Invalid(format!(
+                        "job {}: remote.wake.mac is empty",
+                        job.name
+                    ))
+                    .into());
+                }
+                if parse_mac_address(&wake.mac).is_none() {
+                    return Err(ConfigError::Invalid(format!(
+                        "job {}: remote.wake.mac is invalid",
+                        job.name
+                    ))
+                    .into());
+                }
+                if matches!(&wake.host, Some(host) if host.trim().is_empty()) {
+                    return Err(ConfigError::Invalid(format!(
+                        "job {}: remote.wake.host is empty",
+                        job.name
+                    ))
+                    .into());
+                }
+                if let Some(broadcast) = &wake.broadcast {
+                    if broadcast.parse::<Ipv4Addr>().is_err() {
+                        return Err(ConfigError::Invalid(format!(
+                            "job {}: remote.wake.broadcast must be an IPv4 address",
+                            job.name
+                        ))
+                        .into());
+                    }
+                }
+                if matches!(wake.port, Some(0)) {
+                    return Err(ConfigError::Invalid(format!(
+                        "job {}: remote.wake.port must be greater than zero",
+                        job.name
+                    ))
+                    .into());
+                }
+                if matches!(wake.keepalive_seconds, Some(0)) {
+                    return Err(ConfigError::Invalid(format!(
+                        "job {}: remote.wake.keepaliveSeconds must be greater than zero",
+                        job.name
+                    ))
+                    .into());
+                }
+                if matches!(wake.wait_seconds, Some(0)) {
+                    return Err(ConfigError::Invalid(format!(
+                        "job {}: remote.wake.waitSeconds must be greater than zero",
+                        job.name
+                    ))
+                    .into());
+                }
+            }
+        }
         if job.name.trim().is_empty() {
             return Err(ConfigError::Invalid("job name is required".to_string()).into());
         }
@@ -113,6 +183,7 @@ fn parse_runtime(cfg: Config) -> Result<RuntimeConfig> {
             run_policy,
             excludes,
             disk_ids: disk_ids_for_job,
+            remote: job.remote,
         });
     }
 
@@ -127,6 +198,34 @@ fn parse_runtime(cfg: Config) -> Result<RuntimeConfig> {
             .unwrap_or_else(|| DEFAULT_USER_MOUNT_BASE.to_string()),
         options: cfg.options,
     })
+}
+
+fn is_ssh_rsync_source(source: &str) -> bool {
+    let source = source.trim();
+    if source.starts_with('/') || source.starts_with("rsync://") {
+        return false;
+    }
+    let Some((host, path)) = source.split_once(':') else {
+        return false;
+    };
+    !host.is_empty() && path.starts_with('/')
+}
+
+fn parse_mac_address(value: &str) -> Option<[u8; 6]> {
+    let mut mac = [0_u8; 6];
+    let mut count = 0;
+    for (index, part) in value.split(':').enumerate() {
+        if index >= mac.len() || part.len() != 2 {
+            return None;
+        }
+        mac[index] = u8::from_str_radix(part, 16).ok()?;
+        count += 1;
+    }
+    if count == mac.len() {
+        Some(mac)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -160,6 +259,83 @@ jobs:
             cfg.jobs[0].description.as_deref(),
             Some("Primary filesystem")
         );
+    }
+
+    #[test]
+    fn load_config_with_remote_power_options() {
+        let mut file = NamedTempFile::new().expect("tempfile");
+        let yaml = r#"
+backupDisks:
+  - diskId: "primary"
+    fsUuid: "uuid-1"
+jobs:
+  - name: "remote"
+    source: "root@example.com:/"
+    copies: 2
+    run: "auto"
+    remote:
+      inhibitSuspend: true
+      wake:
+        mac: "aa:bb:cc:dd:ee:ff"
+        host: "example.com"
+        broadcast: "192.0.2.255"
+        port: 9
+        keepaliveSeconds: 60
+        waitSeconds: 15
+"#;
+        file.write_all(yaml.as_bytes()).expect("write");
+        let cfg = load_config(file.path().to_string_lossy().as_ref()).expect("load");
+        let remote = cfg.jobs[0].remote.as_ref().expect("remote options");
+        assert_eq!(remote.inhibit_suspend, Some(true));
+        let wake = remote.wake.as_ref().expect("wake options");
+        assert_eq!(wake.mac, "aa:bb:cc:dd:ee:ff");
+        assert_eq!(wake.host.as_deref(), Some("example.com"));
+        assert_eq!(wake.broadcast.as_deref(), Some("192.0.2.255"));
+        assert_eq!(wake.port, Some(9));
+        assert_eq!(wake.keepalive_seconds, Some(60));
+        assert_eq!(wake.wait_seconds, Some(15));
+    }
+
+    #[test]
+    fn remote_power_options_require_remote_source() {
+        let mut file = NamedTempFile::new().expect("tempfile");
+        let yaml = r#"
+backupDisks:
+  - diskId: "primary"
+    fsUuid: "uuid-1"
+jobs:
+  - name: "local"
+    source: "/"
+    copies: 2
+    remote:
+      inhibitSuspend: true
+"#;
+        file.write_all(yaml.as_bytes()).expect("write");
+        let err = load_config(file.path().to_string_lossy().as_ref()).expect_err("invalid config");
+        assert!(err
+            .to_string()
+            .contains("remote options require an SSH-style source"));
+    }
+
+    #[test]
+    fn remote_suspend_inhibit_requires_wake() {
+        let mut file = NamedTempFile::new().expect("tempfile");
+        let yaml = r#"
+backupDisks:
+  - diskId: "primary"
+    fsUuid: "uuid-1"
+jobs:
+  - name: "remote"
+    source: "root@example.com:/"
+    copies: 2
+    remote:
+      inhibitSuspend: true
+"#;
+        file.write_all(yaml.as_bytes()).expect("write");
+        let err = load_config(file.path().to_string_lossy().as_ref()).expect_err("invalid config");
+        assert!(err
+            .to_string()
+            .contains("remote.inhibitSuspend requires remote.wake"));
     }
 
     #[test]

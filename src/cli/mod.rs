@@ -9,13 +9,13 @@ use crate::backup::BackupOptions;
 use crate::cli::args::{Cli, Command, DiskCommand};
 use crate::cli::commands::{
     backup, disk_add, disk_check, disk_df, disk_du, disk_inspect, disk_ls, exit_for_error, mount,
-    umount,
+    umount, wake,
 };
 use crate::types::RunMode;
 
 const CONFIG_FILE: &str = "/etc/timevault.yaml";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-pub(crate) const BUILD_NUMBER: u32 = 16;
+pub(crate) const BUILD_NUMBER: u32 = 17;
 const LICENSE_NAME: &str = "GNU GPL v3 or later";
 const COPYRIGHT: &str = "Copyright (C) 2026 John Allen (john.joe.allen@gmail.com)";
 const PROJECT_URL: &str = "https://github.com/johnjoeallen/timevault";
@@ -64,6 +64,11 @@ pub fn run() -> Result<()> {
             options,
             cli.send_report,
         )?,
+        Command::Wake(args) => {
+            if let Err(err) = wake::run_wake(&config_path, args, run_mode) {
+                exit_for_error(&err);
+            }
+        }
         Command::Disk { command } => match command {
             DiskCommand::Enroll(args) => {
                 if let Err(err) = disk_add::run_enroll(&config_path, cli.disk_id.as_deref(), args) {
@@ -213,6 +218,7 @@ fn print_copyright() {
 fn print_help() {
     println!("Usage:");
     println!("  timevault [backup] [options]");
+    println!("  timevault wake <job> [options]");
     println!("  timevault disk ls [--short | --columns] [<disk>:/path]");
     println!("  timevault disk register <id> [--fs-uuid <uuid> | --device <path>] [--label <label>] [--mount-options <opts>] [--force]");
     println!("  timevault disk df [<disk>]");
@@ -246,6 +252,7 @@ fn print_help() {
     println!("Options:");
     println!("  --config <path>        Config file path");
     println!("  --job <name>           Run only selected job(s)");
+    println!("  wake <job>             Send configured WOL packet and wait for ping");
     println!("  --dry-run              Do not write data");
     println!("  --safe                 Do not delete files");
     println!("  --verbose              Verbose logging");

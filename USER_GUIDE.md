@@ -51,6 +51,7 @@ Each job defines a backup source and retention policy.
 - `run`: Run policy (`auto`, `demand`, `off`).
 - `excludes`: Job-specific exclude paths.
 - `diskIds`: Optional list of disk IDs this job is allowed to run on.
+- `remote`: Optional remote power behavior for SSH-style sources.
 
 Optional job hooks are discovered by convention:
 - `/etc/timevault/scripts/{jobname}.pre`: Runs before the job starts.
@@ -68,6 +69,18 @@ Remote pre-hooks run after local pre-hooks and before rsync.
 Remote post-hooks run after rsync and before local post-hooks.
 Remote hooks receive the same environment plus `TIMEVAULT_JOB_REMOTE_SOURCE`, containing the remote path portion of the source.
 Remote hooks are best-effort discovered by SSH command execution; missing hook files are treated as success.
+
+Remote power options are available for SSH-style sources:
+- `remote.inhibitSuspend`: If `true`, Timevault starts a remote `systemd-inhibit` process for the job and stops it when the job finishes. This requires `remote.wake`.
+- `remote.wake.mac`: MAC address to wake before the job using a native Wake-on-LAN UDP packet.
+- `remote.wake.host`: Optional host name to resolve and ping after wake. Defaults to the SSH host from `source`.
+- `remote.wake.broadcast`: Optional IPv4 broadcast target. If omitted, Timevault resolves the remote host name and uses the same `/24` subnet with the last octet set to `255`.
+- `remote.wake.port`: Optional Wake-on-LAN UDP port. Default: `9`.
+- `remote.wake.keepaliveSeconds`: Optional interval for repeating the Wake-on-LAN packet while the job runs.
+- `remote.wake.waitSeconds`: Optional time to wait for the host to respond to ping after wake. Default: `15`.
+
+`remote.inhibitSuspend` does not change the remote host's persistent suspend settings.
+Timevault does not enable suspend after a backup; it only releases the temporary inhibitor it started.
 
 Example:
 ```yaml
@@ -147,6 +160,15 @@ jobs:
     source: "root@example.com:/"
     copies: 30
     run: "auto"
+    remote:
+      inhibitSuspend: true
+      wake:
+        mac: "aa:bb:cc:dd:ee:ff"
+        host: "example.com"
+        broadcast: "192.0.2.255"
+        port: 9
+        keepaliveSeconds: 60
+        waitSeconds: 15
     excludes: []
 ```
 
@@ -179,6 +201,12 @@ By default Timevault uses `/usr/sbin/sendmail -t`; set `options.report.sendmail`
 - Runs all jobs with `run: auto` unless `--job` is specified.
 - Uses the first connected disk unless `--disk-id` is set to a disk id or filesystem UUID.
 - With `--cascade`, uses the primary disk’s `current` as the source for other disks.
+
+### Wake test
+- `timevault wake <job>`
+- Sends the job's configured `remote.wake` Wake-on-LAN packet and waits for the configured host to respond to ping.
+- Does not run hooks, rsync, or remote suspend inhibition.
+- Supports `--dry-run` and `--verbose`.
 
 ### Disk register
 - `timevault disk register <id> [--fs-uuid <uuid> | --device <path>] [--label <label>] [--mount-options <opts>] [--force]`
@@ -339,6 +367,7 @@ Delete the matching file to force a full regeneration on the next run.
 ## Remote backups
 Remote job sources require passwordless SSH (keys configured for the remote host), and the remote host must have rsync installed.
 When `--exclude-pristine` is enabled for a `host:/...` source, Timevault uses SSH to inspect the remote host's package database and file hashes, then stores that host's pristine cache separately on the local machine. Remote pristine analysis supports SSH-style rsync sources, not `rsync://` daemon sources.
+Remote power options require `systemd-inhibit` on the remote host for suspend inhibition and `ping` on the Timevault host for wake readiness checks.
 
 ## Notes
 - Backup disks must contain `/.timevault` and match the configured `diskId` and `fsUuid`.

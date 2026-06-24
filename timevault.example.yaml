@@ -70,4 +70,14 @@ jobs:
     run: "auto"
     # For SSH sources, matching hooks on root@example.com are also run from
     # /etc/timevault/scripts/remote-primary.pre and .post.
+    # Optional remote power handling:
+    # remote:
+    #   inhibitSuspend: true
+    #   wake:
+    #     mac: "aa:bb:cc:dd:ee:ff"
+    #     host: "example.com"
+    #     broadcast: "192.0.2.255"
+    #     port: 9
+    #     keepaliveSeconds: 60
+    #     waitSeconds: 15
     excludes: []

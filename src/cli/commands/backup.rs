@@ -374,6 +374,7 @@ mod tests {
             run_policy: RunPolicy::Auto,
             excludes: Vec::new(),
             disk_ids: None,
+            remote: None,
         };
         assert!(!job_requires_disk(&job, "disk-a"));
         let job = crate::config::model::Job {
@@ -384,6 +385,7 @@ mod tests {
             run_policy: RunPolicy::Auto,
             excludes: Vec::new(),
             disk_ids: Some(vec!["disk-a".to_string()]),
+            remote: None,
         };
         assert!(job_requires_disk(&job, "disk-a"));
         assert!(!job_requires_disk(&job, "disk-b"));
@@ -417,6 +419,7 @@ mod tests {
             run_policy: RunPolicy::Auto,
             excludes: Vec::new(),
             disk_ids: Some(vec!["disk-b".to_string()]),
+            remote: None,
         };
         let allowed = allowed_disks_for_job(&job, &connected);
         assert_eq!(allowed.len(), 1);
@@ -451,6 +454,7 @@ mod tests {
             run_policy: RunPolicy::Auto,
             excludes: Vec::new(),
             disk_ids: None,
+            remote: None,
         };
         let allowed = allowed_disks_for_job(&job, &connected);
         assert_eq!(allowed.len(), 2);

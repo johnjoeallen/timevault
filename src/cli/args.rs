@@ -46,10 +46,16 @@ pub struct Cli {
 #[derive(Subcommand, Debug, Clone)]
 pub enum Command {
     Backup,
+    Wake(WakeArgs),
     Disk {
         #[command(subcommand)]
         command: DiskCommand,
     },
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct WakeArgs {
+    pub job: String,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -202,6 +208,15 @@ mod tests {
         assert!(args.target.is_none());
         assert!(!args.short);
         assert!(!args.columns);
+    }
+
+    #[test]
+    fn parses_wake_job() {
+        let cli = Cli::parse_from(["timevault", "wake", "spitfire"]);
+        let Some(Command::Wake(args)) = cli.command else {
+            panic!("expected wake");
+        };
+        assert_eq!(args.job, "spitfire");
     }
 
     #[test]
