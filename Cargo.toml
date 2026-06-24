@@ -22,7 +22,7 @@ walkdir = "2"
 
 [package.metadata.deb]
 maintainer = "Timevault Maintainers"
-revision = "17"
+revision = "18"
 depends = "rsync, util-linux, coreutils"
 assets = [
   ["target/release/timevault", "usr/bin/timevault", "755"],
