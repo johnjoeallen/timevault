@@ -4,6 +4,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use chrono::{Duration, Local};
 use walkdir::WalkDir;
@@ -14,6 +15,7 @@ use crate::backup::rsync::run_rsync;
 use crate::config::model::Job;
 use crate::error::{Result, TimevaultError};
 use crate::types::RunMode;
+use crate::util::command::maybe_print_command;
 use crate::util::paths::job_lock_path;
 
 pub mod pristine;
@@ -21,6 +23,7 @@ pub mod report;
 pub mod rsync;
 
 const TIMEVAULT_MARKER: &str = ".timevault";
+const SCRIPT_DIR: &str = "/etc/timevault/scripts";
 
 #[derive(Debug, Clone, Copy)]
 pub struct BackupOptions {
@@ -79,25 +82,15 @@ pub fn run_backup(
         finished_at: started_at,
         jobs: Vec::new(),
     };
-    let pristine_excludes =
-        build_pristine_excludes_for_jobs(&jobs, options, run_mode.verbose, run_mode.dry_run)?;
+    let mut pristine_excludes = PristineExcludes::default();
     for job in jobs {
         let _lock = acquire_lock_for_job(&job.name, run_mode)?;
-        let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        let tmp_dir = Path::new(&home).join("tmp");
-        if !run_mode.dry_run {
-            fs::create_dir_all(&tmp_dir)?;
-        }
-        let excludes_file = tmp_dir.join("timevault.excludes");
-        let excludes = build_exclude_list(&job, &pristine_excludes)?;
-        if run_mode.dry_run {
-            println!(
-                "dry-run: would write excludes file {}",
-                excludes_file.display()
-            );
-        } else {
-            create_excludes_file(&excludes, &excludes_file)?;
-        }
+        let backup_day = (Local::now() - Duration::days(1))
+            .format("%Y%m%d")
+            .to_string();
+        let dest = resolve_job_dest(&job, disk_mount)?;
+        let backup_dir = dest.join(&backup_day);
+
         if options.exclude_pristine_only {
             if run_mode.verbose {
                 println!(
@@ -118,14 +111,10 @@ pub fn run_backup(
             continue;
         }
 
-        let backup_day = (Local::now() - Duration::days(1))
-            .format("%Y%m%d")
-            .to_string();
         if run_mode.verbose {
             println!("  backup day: {}", backup_day);
         }
 
-        let dest = resolve_job_dest(&job, disk_mount)?;
         if run_mode.verbose {
             println!("job: {}", job.name);
             println!("  run: {}", job.run_policy.as_str());
@@ -133,6 +122,85 @@ pub fn run_backup(
             println!("  backup dir: {}", dest.display());
             println!("  copies: {}", job.copies);
             println!("  excludes: {}", job.excludes.len());
+        }
+
+        if let Some(script) = job_script_path(&job.name, JobScriptPhase::Pre) {
+            let script_rc = run_job_script(
+                &job,
+                &script,
+                JobScriptPhase::Pre,
+                &backup_dir,
+                &backup_day,
+                None,
+                run_mode,
+            )?;
+            if script_rc != 0 {
+                println!(
+                    "pre script failed for job {} with exit code {}; skipping backup",
+                    job.name, script_rc
+                );
+                report.jobs.push(BackupJobReport {
+                    name: job.name.clone(),
+                    description: job.description.clone(),
+                    source: job.source.clone(),
+                    destination: backup_dir.display().to_string(),
+                    backup_day,
+                    status: BackupJobStatus::Failed,
+                    attempts: 0,
+                    rsync_code: None,
+                });
+                continue;
+            }
+        }
+        if let Some(script_rc) = run_remote_job_script(
+            &job,
+            JobScriptPhase::Pre,
+            &backup_dir,
+            &backup_day,
+            None,
+            run_mode,
+        )? {
+            if script_rc != 0 {
+                println!(
+                    "remote pre script failed for job {} with exit code {}; skipping backup",
+                    job.name, script_rc
+                );
+                report.jobs.push(BackupJobReport {
+                    name: job.name.clone(),
+                    description: job.description.clone(),
+                    source: job.source.clone(),
+                    destination: backup_dir.display().to_string(),
+                    backup_day,
+                    status: BackupJobStatus::Failed,
+                    attempts: 0,
+                    rsync_code: None,
+                });
+                continue;
+            }
+        }
+
+        ensure_pristine_excludes_for_job(
+            &job,
+            &mut pristine_excludes,
+            options,
+            run_mode.verbose,
+            run_mode.dry_run,
+        )?;
+
+        let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        let tmp_dir = Path::new(&home).join("tmp");
+        if !run_mode.dry_run {
+            fs::create_dir_all(&tmp_dir)?;
+        }
+        let excludes_file = tmp_dir.join("timevault.excludes");
+        let excludes = build_exclude_list(&job, &pristine_excludes)?;
+        if run_mode.dry_run {
+            println!(
+                "dry-run: would write excludes file {}",
+                excludes_file.display()
+            );
+        } else {
+            create_excludes_file(&excludes, &excludes_file)?;
         }
 
         if !dest.exists() {
@@ -212,7 +280,41 @@ pub fn run_backup(
                 }
             }
         }
-        let status = status_for_rsync_code(rc);
+        let mut status = status_for_rsync_code(rc);
+        if let Some(script_rc) = run_remote_job_script(
+            &job,
+            JobScriptPhase::Post,
+            &backup_dir,
+            &backup_day,
+            Some(rc),
+            run_mode,
+        )? {
+            if script_rc != 0 {
+                println!(
+                    "remote post script failed for job {} with exit code {}",
+                    job.name, script_rc
+                );
+                status = BackupJobStatus::Failed;
+            }
+        }
+        if let Some(script) = job_script_path(&job.name, JobScriptPhase::Post) {
+            let script_rc = run_job_script(
+                &job,
+                &script,
+                JobScriptPhase::Post,
+                &backup_dir,
+                &backup_day,
+                Some(rc),
+                run_mode,
+            )?;
+            if script_rc != 0 {
+                println!(
+                    "post script failed for job {} with exit code {}",
+                    job.name, script_rc
+                );
+                status = BackupJobStatus::Failed;
+            }
+        }
         report.jobs.push(BackupJobReport {
             name: job.name,
             description: job.description,
@@ -262,10 +364,208 @@ pub fn run_pristine_only(jobs: Vec<Job>, run_mode: RunMode, options: BackupOptio
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy)]
+enum JobScriptPhase {
+    Pre,
+    Post,
+}
+
+impl JobScriptPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            JobScriptPhase::Pre => "pre",
+            JobScriptPhase::Post => "post",
+        }
+    }
+}
+
+fn run_job_script(
+    job: &Job,
+    script: &Path,
+    phase: JobScriptPhase,
+    destination: &Path,
+    backup_day: &str,
+    rsync_code: Option<i32>,
+    run_mode: RunMode,
+) -> Result<i32> {
+    let mut cmd = Command::new("/bin/sh");
+    cmd.arg(script)
+        .env("TIMEVAULT_JOB_NAME", &job.name)
+        .env("TIMEVAULT_JOB_SOURCE", &job.source)
+        .env("TIMEVAULT_JOB_DESTINATION", destination)
+        .env("TIMEVAULT_BACKUP_DAY", backup_day)
+        .env("TIMEVAULT_SCRIPT_PHASE", phase.as_str());
+    if let Some(code) = rsync_code {
+        cmd.env("TIMEVAULT_RSYNC_CODE", code.to_string());
+    }
+    if run_mode.dry_run {
+        println!(
+            "dry-run: would run {} script for job {}: {}",
+            phase.as_str(),
+            job.name,
+            script.display()
+        );
+        return Ok(0);
+    }
+    maybe_print_command(&cmd, run_mode);
+    let status = cmd.status().map_err(|e| {
+        TimevaultError::message(format!(
+            "{} script for job {} ({}): {}",
+            phase.as_str(),
+            job.name,
+            script.display(),
+            e
+        ))
+    })?;
+    Ok(status.code().unwrap_or(1))
+}
+
+fn run_remote_job_script(
+    job: &Job,
+    phase: JobScriptPhase,
+    destination: &Path,
+    backup_day: &str,
+    rsync_code: Option<i32>,
+    run_mode: RunMode,
+) -> Result<Option<i32>> {
+    let Some(remote) = remote_ssh_source(&job.source) else {
+        return Ok(None);
+    };
+    let script = remote_job_script_path(&job.name, phase);
+    if run_mode.dry_run {
+        println!(
+            "dry-run: would run remote {} script for job {} if present: {}:{}",
+            phase.as_str(),
+            job.name,
+            remote.host,
+            script
+        );
+        return Ok(Some(0));
+    }
+
+    let command = remote_script_command(
+        job,
+        &remote.source_path,
+        &script,
+        phase,
+        destination,
+        backup_day,
+        rsync_code,
+    );
+    let mut cmd = Command::new("ssh");
+    cmd.arg(&remote.host).arg(command);
+    maybe_print_command(&cmd, run_mode);
+    let status = cmd.status().map_err(|e| {
+        TimevaultError::message(format!(
+            "remote {} script for job {} ({}:{}): {}",
+            phase.as_str(),
+            job.name,
+            remote.host,
+            script,
+            e
+        ))
+    })?;
+    Ok(Some(status.code().unwrap_or(1)))
+}
+
+fn job_script_path(job_name: &str, phase: JobScriptPhase) -> Option<PathBuf> {
+    let path = Path::new(SCRIPT_DIR).join(format!("{}.{}", job_name, phase.as_str()));
+    match fs::metadata(&path) {
+        Ok(meta) if meta.is_file() => Some(path),
+        Ok(_) => None,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+        Err(_) => None,
+    }
+}
+
+fn remote_job_script_path(job_name: &str, phase: JobScriptPhase) -> String {
+    format!("{}/{}.{}", SCRIPT_DIR, job_name, phase.as_str())
+}
+
+fn remote_script_command(
+    job: &Job,
+    remote_source_path: &str,
+    script: &str,
+    phase: JobScriptPhase,
+    destination: &Path,
+    backup_day: &str,
+    rsync_code: Option<i32>,
+) -> String {
+    let mut assignments = vec![
+        env_assignment("TIMEVAULT_JOB_NAME", &job.name),
+        env_assignment("TIMEVAULT_JOB_SOURCE", &job.source),
+        env_assignment("TIMEVAULT_JOB_REMOTE_SOURCE", remote_source_path),
+        env_assignment(
+            "TIMEVAULT_JOB_DESTINATION",
+            &destination.display().to_string(),
+        ),
+        env_assignment("TIMEVAULT_BACKUP_DAY", backup_day),
+        env_assignment("TIMEVAULT_SCRIPT_PHASE", phase.as_str()),
+    ];
+    if let Some(code) = rsync_code {
+        assignments.push(env_assignment("TIMEVAULT_RSYNC_CODE", &code.to_string()));
+    }
+    format!(
+        "if [ -f {script} ]; then {env} /bin/sh {script}; fi",
+        script = shell_quote(script),
+        env = assignments.join(" ")
+    )
+}
+
+fn env_assignment(name: &str, value: &str) -> String {
+    format!("{}={}", name, shell_quote(value))
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
 #[derive(Debug, Default)]
 struct PristineExcludes {
     local: Option<Vec<String>>,
     remote: HashMap<String, Vec<String>>,
+}
+
+fn ensure_pristine_excludes_for_job(
+    job: &Job,
+    excludes: &mut PristineExcludes,
+    options: BackupOptions,
+    verbose: bool,
+    dry_run: bool,
+) -> Result<()> {
+    if !options.exclude_pristine {
+        return Ok(());
+    }
+    if dry_run {
+        if verbose {
+            println!("pristine: dry-run; skip package analysis");
+        }
+        return Ok(());
+    }
+    match pristine_source_for_job(job) {
+        Some(PristineSource::Local) if excludes.local.is_none() => {
+            excludes.local = Some(build_pristine_excludes_for_source(
+                &PristineSource::Local,
+                verbose,
+            )?);
+        }
+        Some(PristineSource::RemoteSsh { host }) if !excludes.remote.contains_key(&host) => {
+            let source = PristineSource::RemoteSsh { host: host.clone() };
+            let host_excludes = build_pristine_excludes_for_source(&source, verbose)?;
+            excludes.remote.insert(host, host_excludes);
+        }
+        None if verbose => {
+            println!(
+                "pristine: skip package analysis; job {} source is not supported for pristine analysis",
+                job.name
+            );
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn build_exclude_list(job: &Job, pristine_excludes: &PristineExcludes) -> Result<Vec<String>> {
@@ -346,7 +646,17 @@ fn pristine_source_for_job(job: &Job) -> Option<PristineSource> {
     Some(PristineSource::Local)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemoteSshSource {
+    host: String,
+    source_path: String,
+}
+
 fn remote_ssh_host_from_source(source: &str) -> Option<String> {
+    remote_ssh_source(source).map(|remote| remote.host)
+}
+
+fn remote_ssh_source(source: &str) -> Option<RemoteSshSource> {
     let source = source.trim();
     if source.starts_with('/') || source.starts_with("rsync://") {
         return None;
@@ -355,7 +665,10 @@ fn remote_ssh_host_from_source(source: &str) -> Option<String> {
     if host.is_empty() || !path.starts_with('/') {
         return None;
     }
-    Some(host.to_string())
+    Some(RemoteSshSource {
+        host: host.to_string(),
+        source_path: path.to_string(),
+    })
 }
 
 fn create_excludes_file(excludes: &[String], filename: &Path) -> io::Result<()> {
@@ -589,6 +902,44 @@ mod tests {
     }
 
     #[test]
+    fn parses_remote_rsync_source_path() {
+        assert_eq!(
+            remote_ssh_source("root@example.com:/srv/data"),
+            Some(RemoteSshSource {
+                host: "root@example.com".to_string(),
+                source_path: "/srv/data".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn remote_script_command_exports_environment() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let command = remote_script_command(
+            &job("root@example.com:/srv/data"),
+            "/srv/data",
+            "/etc/timevault/scripts/test.post",
+            JobScriptPhase::Post,
+            tmp.path(),
+            "20260101",
+            Some(24),
+        );
+
+        assert!(command.contains("if [ -f '/etc/timevault/scripts/test.post' ]; then"));
+        assert!(command.contains("TIMEVAULT_JOB_NAME='test'"));
+        assert!(command.contains("TIMEVAULT_JOB_SOURCE='root@example.com:/srv/data'"));
+        assert!(command.contains("TIMEVAULT_JOB_REMOTE_SOURCE='/srv/data'"));
+        assert!(command.contains("TIMEVAULT_SCRIPT_PHASE='post'"));
+        assert!(command.contains("TIMEVAULT_RSYNC_CODE='24'"));
+        assert!(command.contains("/bin/sh '/etc/timevault/scripts/test.post'"));
+    }
+
+    #[test]
+    fn shell_quote_handles_single_quotes() {
+        assert_eq!(shell_quote("can't"), "'can'\"'\"'t'");
+    }
+
+    #[test]
     fn remote_jobs_get_matching_remote_pristine_excludes() {
         let mut pristine = PristineExcludes::default();
         pristine.remote.insert(
@@ -650,6 +1001,70 @@ mod tests {
     #[test]
     fn rsync_vanished_files_are_reported_as_success() {
         assert_eq!(status_for_rsync_code(24), BackupJobStatus::Success);
+    }
+
+    #[test]
+    fn dry_run_job_script_does_not_execute() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let script = tmp.path().join("script.sh");
+        let marker = tmp.path().join("marker");
+        fs::write(&script, format!("#!/bin/sh\ntouch {}\n", marker.display()))
+            .expect("write script");
+
+        let rc = run_job_script(
+            &job("/"),
+            &script,
+            JobScriptPhase::Pre,
+            tmp.path(),
+            "20260101",
+            None,
+            RunMode {
+                dry_run: true,
+                safe_mode: false,
+                verbose: false,
+            },
+        )
+        .expect("script");
+
+        assert_eq!(rc, 0);
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn job_script_receives_environment() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let script = tmp.path().join("script.sh");
+        let output = tmp.path().join("env.txt");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s|%s|%s|%s|%s|%s' \"$TIMEVAULT_JOB_NAME\" \"$TIMEVAULT_JOB_SOURCE\" \"$TIMEVAULT_JOB_DESTINATION\" \"$TIMEVAULT_BACKUP_DAY\" \"$TIMEVAULT_SCRIPT_PHASE\" \"$TIMEVAULT_RSYNC_CODE\" > {}\n",
+                output.display()
+            ),
+        )
+        .expect("write script");
+        let mut perms = fs::metadata(&script).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script, perms).expect("chmod");
+
+        let rc = run_job_script(
+            &job("/source"),
+            &script,
+            JobScriptPhase::Post,
+            tmp.path(),
+            "20260101",
+            Some(24),
+            run_mode(),
+        )
+        .expect("script");
+
+        assert_eq!(rc, 0);
+        assert_eq!(
+            fs::read_to_string(output).expect("read output"),
+            format!("test|/source|{}|20260101|post|24", tmp.path().display())
+        );
     }
 
     #[test]

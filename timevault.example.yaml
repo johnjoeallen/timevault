@@ -58,6 +58,8 @@ jobs:
     source: "/"
     copies: 30
     run: "auto"
+    # Optional hooks are discovered from /etc/timevault/scripts/primary.pre
+    # and /etc/timevault/scripts/primary.post.
     # Optional disk allowlist for this job:
     # diskIds: ["primary"]
     excludes: []
@@ -66,4 +68,6 @@ jobs:
     source: "root@example.com:/"
     copies: 30
     run: "auto"
+    # For SSH sources, matching hooks on root@example.com are also run from
+    # /etc/timevault/scripts/remote-primary.pre and .post.
     excludes: []

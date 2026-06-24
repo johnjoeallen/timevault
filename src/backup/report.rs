@@ -221,9 +221,9 @@ pub fn render_html(reports: &[BackupRunReport]) -> String {
 }
 
 pub fn email_html_report(options: &ReportOptions, html: &str) -> Result<()> {
-    if options.email_to.trim().is_empty() {
+    let Some(to) = first_nonempty_header_line(&options.email_to) else {
         return Ok(());
-    }
+    };
     let sendmail = options.sendmail.as_deref().unwrap_or("/usr/sbin/sendmail");
     let from_address = first_header_line(
         options
@@ -231,7 +231,6 @@ pub fn email_html_report(options: &ReportOptions, html: &str) -> Result<()> {
             .as_deref()
             .unwrap_or("timevault@localhost"),
     );
-    let to = first_header_line(&options.email_to);
     println!("sending backup report to {}", to);
     println!("sendmail command: {} -t", sendmail);
 
@@ -385,6 +384,14 @@ fn first_header_line(value: &str) -> String {
     value.lines().next().unwrap_or("").trim().to_string()
 }
 
+fn first_nonempty_header_line(value: &str) -> Option<String> {
+    value
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_string)
+}
+
 fn escape_markdown(value: &str) -> String {
     value.replace('|', "\\|")
 }
@@ -465,6 +472,15 @@ mod tests {
         assert!(message.contains("From: Timevault <backup@example.com>\n"));
         assert!(message.contains("Message-ID: <timevault-"));
         assert!(message.contains("@example.com>\n"));
+    }
+
+    #[test]
+    fn recipient_header_uses_first_nonempty_line() {
+        assert_eq!(
+            first_nonempty_header_line("\n  admin@example.com\nignored@example.com").as_deref(),
+            Some("admin@example.com")
+        );
+        assert_eq!(first_nonempty_header_line(" \n\t ").as_deref(), None);
     }
 
     #[test]

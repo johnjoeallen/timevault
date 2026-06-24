@@ -52,6 +52,23 @@ Each job defines a backup source and retention policy.
 - `excludes`: Job-specific exclude paths.
 - `diskIds`: Optional list of disk IDs this job is allowed to run on.
 
+Optional job hooks are discovered by convention:
+- `/etc/timevault/scripts/{jobname}.pre`: Runs before the job starts.
+- `/etc/timevault/scripts/{jobname}.post`: Runs after rsync finishes.
+
+Hooks are executed with `/bin/sh`.
+During `--dry-run`, existing hooks are printed but not run.
+Both hooks receive `TIMEVAULT_JOB_NAME`, `TIMEVAULT_JOB_SOURCE`, `TIMEVAULT_JOB_DESTINATION`, `TIMEVAULT_BACKUP_DAY`, and `TIMEVAULT_SCRIPT_PHASE`.
+Post hooks also receive `TIMEVAULT_RSYNC_CODE`.
+A non-zero pre-hook exit code skips that job and records it as failed.
+A non-zero post-hook exit code records the job as failed.
+
+For SSH-style remote sources (`user@host:/path`), Timevault also checks the remote host for the same hook names under `/etc/timevault/scripts`.
+Remote pre-hooks run after local pre-hooks and before rsync.
+Remote post-hooks run after rsync and before local post-hooks.
+Remote hooks receive the same environment plus `TIMEVAULT_JOB_REMOTE_SOURCE`, containing the remote path portion of the source.
+Remote hooks are best-effort discovered by SSH command execution; missing hook files are treated as success.
+
 Example:
 ```yaml
 jobs:
