@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, ToSocketAddrs, UdpSocket};
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
@@ -499,10 +499,24 @@ impl Drop for WakeKeepalive {
 
 struct RemoteSuspendInhibitor {
     child: Child,
+    remote_host: String,
+    remote_pid: u32,
 }
 
 impl Drop for RemoteSuspendInhibitor {
     fn drop(&mut self) {
+        let mut release = Command::new("ssh");
+        release
+            .arg("-o")
+            .arg("BatchMode=yes")
+            .arg("-o")
+            .arg("ConnectTimeout=5")
+            .arg(&self.remote_host)
+            .arg(format!("kill {} >/dev/null 2>&1 || true", self.remote_pid))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let _ = release.status();
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -782,7 +796,7 @@ fn start_remote_suspend_inhibitor(
     cmd.arg(&remote.host)
         .arg(command)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null());
     maybe_print_command(&cmd, run_mode);
     let mut child = cmd.spawn().map_err(|err| {
@@ -791,6 +805,40 @@ fn start_remote_suspend_inhibitor(
             job.name, remote.host, err
         ))
     })?;
+    let stdout = child.stdout.take().ok_or_else(|| {
+        TimevaultError::message(format!(
+            "remote suspend inhibitor for job {} on {} did not expose stdout",
+            job.name, remote.host
+        ))
+    })?;
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    if let Err(err) = reader.read_line(&mut line) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(err.into());
+    }
+    let remote_pid = match line.trim().parse::<u32>() {
+        Ok(pid) => pid,
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(TimevaultError::message(format!(
+                "remote suspend inhibitor for job {} on {} returned invalid pid {}",
+                job.name,
+                remote.host,
+                line.trim()
+            )));
+        }
+    };
+    if remote_pid == 0 {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(TimevaultError::message(format!(
+            "remote suspend inhibitor for job {} on {} returned invalid pid {}",
+            job.name, remote.host, remote_pid
+        )));
+    }
     thread::sleep(StdDuration::from_millis(200));
     if let Some(status) = child.try_wait()? {
         return Err(TimevaultError::message(format!(
@@ -800,13 +848,20 @@ fn start_remote_suspend_inhibitor(
             status.code().unwrap_or(1)
         )));
     }
-    Ok(Some(RemoteSuspendInhibitor { child }))
+    Ok(Some(RemoteSuspendInhibitor {
+        child,
+        remote_host: remote.host,
+        remote_pid,
+    }))
 }
 
 fn remote_inhibit_command(job_name: &str) -> String {
+    let keepalive = "echo $$; trap 'kill \"$sleep_pid\" 2>/dev/null; exit 0' TERM INT HUP; \
+         while :; do sleep 2147483647 & sleep_pid=$!; wait \"$sleep_pid\"; done";
     format!(
-        "systemd-inhibit --what=sleep --mode=block --who=timevault --why={} sleep infinity",
-        shell_quote(&format!("Timevault backup {}", job_name))
+        "systemd-inhibit --what=sleep --mode=block --who=timevault --why={} sh -c {}",
+        shell_quote(&format!("Timevault backup {}", job_name)),
+        shell_quote(keepalive)
     )
 }
 
@@ -1330,7 +1385,9 @@ mod tests {
 
         assert!(command.contains("systemd-inhibit"));
         assert!(command.contains("--what=sleep"));
-        assert!(command.contains("sleep infinity"));
+        assert!(command.contains("echo $$"));
+        assert!(command.contains("trap"));
+        assert!(command.contains("kill"));
         assert!(!command.contains("systemctl"));
         assert!(!command.contains("enable"));
         assert!(!command.contains("disable"));
