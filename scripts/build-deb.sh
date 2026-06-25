@@ -37,12 +37,14 @@ if ! cargo deb --version >/dev/null 2>&1; then
   exit 1
 fi
 
-next_revision=$((current_revision + 1))
+# Semantic version changes are made with source changes. Packaging builds only
+# advance the build number, which is mirrored into the Debian revision.
+next_build=$((current_build + 1))
 
-perl -0pi -e "s/revision = \"\\Q$current_revision\\E\"/revision = \"$next_revision\"/" "$manifest"
-perl -0pi -e "s/pub\\(crate\\) const BUILD_NUMBER: u32 = \\Q$current_build\\E;/pub(crate) const BUILD_NUMBER: u32 = $next_revision;/" "$cli_mod"
+perl -0pi -e "s/revision = \"\\Q$current_revision\\E\"/revision = \"$next_build\"/" "$manifest"
+perl -0pi -e "s/pub\\(crate\\) const BUILD_NUMBER: u32 = \\Q$current_build\\E;/pub(crate) const BUILD_NUMBER: u32 = $next_build;/" "$cli_mod"
 
-echo "bumped Debian revision: $current_revision -> $next_revision"
+echo "bumped build number: $current_build -> $next_build"
 
 cargo build --release
 cargo deb

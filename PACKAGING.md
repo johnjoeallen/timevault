@@ -14,6 +14,9 @@
 scripts/build-deb.sh
 ```
 
+The build script increments the build number only. Semantic version changes are
+made when source changes are committed, before packaging.
+
 The package will be created under:
 
 ```
