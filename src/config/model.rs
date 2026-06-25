@@ -99,6 +99,12 @@ pub struct RemoteWakeOptions {
         skip_serializing_if = "Option::is_none"
     )]
     pub wait_seconds: Option<u64>,
+    #[serde(
+        default,
+        rename = "suspendAfterBackup",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub suspend_after_backup: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

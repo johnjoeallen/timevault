@@ -154,7 +154,7 @@ pub fn run_backup(
             println!("  excludes: {}", job.excludes.len());
         }
 
-        let _wake_keepalive = start_wake_keepalive(&job, run_mode)?;
+        let _remote_power_guard = start_remote_power_guard(&job, run_mode)?;
         let _suspend_guard = start_suspend_guard(run_mode)?;
         let _suspend_inhibitor = start_remote_suspend_inhibitor(&job, run_mode)?;
 
@@ -581,10 +581,12 @@ fn run_remote_job_script(
 
 struct WakeContext {
     host: String,
+    ssh_host: String,
     target: SocketAddrV4,
     mac: String,
     keepalive_seconds: Option<u64>,
     wait_seconds: u64,
+    suspend_after_backup: bool,
 }
 
 struct WakeKeepalive {
@@ -597,6 +599,45 @@ impl Drop for WakeKeepalive {
         drop(self.stop.take());
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
+        }
+    }
+}
+
+struct RemotePowerGuard {
+    keepalive: Option<WakeKeepalive>,
+    suspend_after_backup: bool,
+    remote_host: String,
+    job_name: String,
+}
+
+impl Drop for RemotePowerGuard {
+    fn drop(&mut self) {
+        drop(self.keepalive.take());
+        if !self.suspend_after_backup {
+            return;
+        }
+        let mut cmd = Command::new("ssh");
+        cmd.arg("-o")
+            .arg("BatchMode=yes")
+            .arg("-o")
+            .arg("ConnectTimeout=5")
+            .arg(&self.remote_host)
+            .arg("systemctl suspend")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        match cmd.status() {
+            Ok(status) if status.success() => {}
+            Ok(status) => eprintln!(
+                "failed to suspend remote host {} after job {}: ssh exited with code {}",
+                self.remote_host,
+                self.job_name,
+                status.code().unwrap_or(1)
+            ),
+            Err(err) => eprintln!(
+                "failed to suspend remote host {} after job {}: {}",
+                self.remote_host, self.job_name, err
+            ),
         }
     }
 }
@@ -654,17 +695,30 @@ pub fn wake_remote_job(job: &Job, run_mode: RunMode) -> Result<()> {
             job.name
         )));
     };
+    if ping_once(&context.host)? {
+        if run_mode.verbose {
+            println!(
+                "wake host {} already responds to ping; skipping WOL",
+                context.host
+            );
+        }
+        return Ok(());
+    }
     send_wake_packet(&context.mac, context.target)?;
     wait_for_ping(&context.host, context.wait_seconds)
 }
 
-fn start_wake_keepalive(job: &Job, run_mode: RunMode) -> Result<Option<WakeKeepalive>> {
+fn start_remote_power_guard(job: &Job, run_mode: RunMode) -> Result<Option<RemotePowerGuard>> {
     if run_mode.dry_run {
         let Some((wake, _, host)) = wake_config(job) else {
             return Ok(None);
         };
         println!(
-            "dry-run: would send WOL for job {} to {} for {}",
+            "dry-run: would check whether {} responds to ping before wake",
+            host
+        );
+        println!(
+            "dry-run: would send WOL for job {} to {} for {} if ping fails",
             job.name,
             wake_target_description(wake),
             host
@@ -676,8 +730,14 @@ fn start_wake_keepalive(job: &Job, run_mode: RunMode) -> Result<Option<WakeKeepa
         );
         if let Some(seconds) = wake.keepalive_seconds {
             println!(
-                "dry-run: would repeat WOL for job {} every {} seconds while backup runs",
+                "dry-run: would repeat WOL for job {} every {} seconds while backup runs if wake was needed",
                 job.name, seconds
+            );
+        }
+        if wake.suspend_after_backup == Some(true) {
+            println!(
+                "dry-run: would suspend remote host after job {} if it was woken for the backup",
+                job.name
             );
         }
         return Ok(None);
@@ -686,41 +746,60 @@ fn start_wake_keepalive(job: &Job, run_mode: RunMode) -> Result<Option<WakeKeepa
     let Some(context) = wake_context(job)? else {
         return Ok(None);
     };
+    if ping_once(&context.host)? {
+        if run_mode.verbose {
+            println!(
+                "wake host {} already responds to ping; skipping WOL",
+                context.host
+            );
+        }
+        return Ok(None);
+    }
+
     send_wake_packet(&context.mac, context.target)?;
     wait_for_ping(&context.host, context.wait_seconds)?;
 
-    let Some(seconds) = context.keepalive_seconds else {
-        return Ok(None);
-    };
-    let (stop, receiver) = mpsc::channel();
-    let mac = context.mac;
-    let target = context.target;
-    let handle = thread::spawn(move || loop {
-        match receiver.recv_timeout(StdDuration::from_secs(seconds)) {
-            Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
-            Err(RecvTimeoutError::Timeout) => {
-                let _ = send_wake_packet(&mac, target);
+    let keepalive = if let Some(seconds) = context.keepalive_seconds {
+        let (stop, receiver) = mpsc::channel();
+        let mac = context.mac;
+        let target = context.target;
+        let handle = thread::spawn(move || loop {
+            match receiver.recv_timeout(StdDuration::from_secs(seconds)) {
+                Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                Err(RecvTimeoutError::Timeout) => {
+                    let _ = send_wake_packet(&mac, target);
+                }
             }
-        }
-    });
+        });
+        Some(WakeKeepalive {
+            stop: Some(stop),
+            handle: Some(handle),
+        })
+    } else {
+        None
+    };
 
-    Ok(Some(WakeKeepalive {
-        stop: Some(stop),
-        handle: Some(handle),
+    Ok(Some(RemotePowerGuard {
+        keepalive,
+        suspend_after_backup: context.suspend_after_backup,
+        remote_host: context.ssh_host,
+        job_name: job.name.clone(),
     }))
 }
 
 fn wake_context(job: &Job) -> Result<Option<WakeContext>> {
-    let Some((wake, _, host)) = wake_config(job) else {
+    let Some((wake, remote, host)) = wake_config(job) else {
         return Ok(None);
     };
     let target = wake_target(wake, &host)?;
     Ok(Some(WakeContext {
         host: host.to_string(),
+        ssh_host: remote.host,
         target,
         mac: wake.mac.clone(),
         keepalive_seconds: wake.keepalive_seconds,
         wait_seconds: wake_wait_seconds(wake),
+        suspend_after_backup: wake.suspend_after_backup.unwrap_or(false),
     }))
 }
 
@@ -1478,6 +1557,7 @@ mod tests {
             interface: None,
             keepalive_seconds: None,
             wait_seconds: None,
+            suspend_after_backup: None,
         };
 
         assert_eq!(wake_host(&wake, &remote), "actual-host");

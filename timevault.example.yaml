@@ -80,4 +80,5 @@ jobs:
     #     port: 9
     #     keepaliveSeconds: 60
     #     waitSeconds: 15
+    #     suspendAfterBackup: true
     excludes: []

@@ -282,6 +282,7 @@ jobs:
         port: 9
         keepaliveSeconds: 60
         waitSeconds: 15
+        suspendAfterBackup: true
 "#;
         file.write_all(yaml.as_bytes()).expect("write");
         let cfg = load_config(file.path().to_string_lossy().as_ref()).expect("load");
@@ -294,6 +295,7 @@ jobs:
         assert_eq!(wake.port, Some(9));
         assert_eq!(wake.keepalive_seconds, Some(60));
         assert_eq!(wake.wait_seconds, Some(15));
+        assert_eq!(wake.suspend_after_backup, Some(true));
     }
 
     #[test]

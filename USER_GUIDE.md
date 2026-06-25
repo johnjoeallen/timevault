@@ -78,13 +78,14 @@ Remote power options are available for SSH-style sources:
 - `remote.wake.port`: Optional Wake-on-LAN UDP port. Default: `9`.
 - `remote.wake.keepaliveSeconds`: Optional interval for repeating the Wake-on-LAN packet while the job runs.
 - `remote.wake.waitSeconds`: Optional time to wait for the host to respond to ping after wake. Default: `15`.
+- `remote.wake.suspendAfterBackup`: Optional boolean. If `true`, Timevault suspends the remote host after the job only when the host did not respond to ping before wake and Timevault woke it for the backup. Default: `false`.
 
 `remote.inhibitSuspend` does not change the remote host's persistent suspend settings.
-Timevault does not enable suspend after a backup; it only releases the temporary inhibitor it started.
+Timevault does not enable suspend after a backup; it only releases the temporary inhibitor it started. If `remote.wake.suspendAfterBackup` is enabled, the final suspend is a separate remote `systemctl suspend` call.
 
 Suspend ownership rule:
 
-For each backup job, Timevault wakes the remote host first, then detects the current system suspend state.
+For each backup job, Timevault checks whether the remote host responds to ping, wakes it only if needed, then detects the current system suspend state.
 
 It runs:
 
@@ -107,6 +108,7 @@ Acceptance criteria:
 - If suspend was enabled before a job, Timevault masks the targets during that job and unmasks them afterwards.
 - If suspend was already disabled before a job, Timevault does not mask or unmask the targets.
 - Timevault never re-enables suspend unless it disabled suspend itself during that job.
+- If `remote.wake.suspendAfterBackup` is enabled, Timevault only suspends the remote host after jobs where the host was offline before wake.
 
 Example:
 ```yaml
@@ -195,6 +197,7 @@ jobs:
         port: 9
         keepaliveSeconds: 60
         waitSeconds: 15
+        suspendAfterBackup: true
     excludes: []
 ```
 
@@ -230,7 +233,7 @@ By default Timevault uses `/usr/sbin/sendmail -t`; set `options.report.sendmail`
 
 ### Wake test
 - `timevault wake <job>`
-- Sends the job's configured `remote.wake` Wake-on-LAN packet and waits for the configured host to respond to ping.
+- Checks whether the configured host already responds to ping, then sends the job's configured `remote.wake` Wake-on-LAN packet only when needed and waits for ping.
 - Does not run hooks, rsync, or remote suspend inhibition.
 - Supports `--dry-run` and `--verbose`.
 
