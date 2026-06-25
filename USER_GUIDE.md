@@ -85,7 +85,9 @@ Timevault does not enable suspend after a backup; it only releases the temporary
 
 Suspend ownership rule:
 
-For each backup job, Timevault checks whether the remote host responds to ping, wakes it only if needed, then detects the current system suspend state.
+For each SSH-style backup job with `remote.wake`, Timevault checks whether the remote host responds to ping, wakes it only if needed, then detects the Timevault runner's local suspend state.
+Jobs without `remote.wake` do not perform wake-related suspend work.
+Cascade jobs copied from a remote job ignore wake and suspend handling after their source is rewritten to the primary disk's local snapshot path.
 
 It runs:
 
@@ -101,7 +103,7 @@ Interpretation:
 Behaviour:
 - If suspend is currently allowed/enabled, Timevault disables suspend by masking the targets, records that it changed suspend state for that job, and unmasks the targets during that job's cleanup.
 - If suspend is already disabled/masked, Timevault does not call `systemctl mask` again, records that it did not change suspend state, and does not call `systemctl unmask` during cleanup.
-- When suspend was already disabled before the backup, Timevault logs that it will leave suspend disabled.
+- When local suspend was already disabled before the backup, Timevault logs that it will leave suspend disabled.
 - The job order is: wake, check suspend status, disable suspend if necessary, run the backup, then re-enable suspend only if Timevault disabled it.
 
 Acceptance criteria:

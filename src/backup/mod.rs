@@ -155,7 +155,7 @@ pub fn run_backup(
         }
 
         let _remote_power_guard = start_remote_power_guard(&job, run_mode)?;
-        let _suspend_guard = start_suspend_guard(run_mode)?;
+        let _suspend_guard = start_suspend_guard(&job, run_mode)?;
         let _suspend_inhibitor = start_remote_suspend_inhibitor(&job, run_mode)?;
 
         if let Some(script) = job_script_path(&job.name, JobScriptPhase::Pre) {
@@ -371,10 +371,16 @@ fn status_for_rsync_code(rc: i32) -> BackupJobStatus {
     }
 }
 
-fn start_suspend_guard(run_mode: RunMode) -> Result<SuspendGuard> {
+fn start_suspend_guard(job: &Job, run_mode: RunMode) -> Result<SuspendGuard> {
+    if !has_active_wake_config(job) {
+        return Ok(SuspendGuard {
+            changed_suspend_state: false,
+        });
+    }
+
     if run_mode.dry_run {
         println!(
-            "dry-run: would check suspend state: systemctl is-enabled {}",
+            "dry-run: would check local suspend state: systemctl is-enabled {}",
             SUSPEND_TARGETS.join(" ")
         );
         return Ok(SuspendGuard {
@@ -398,7 +404,7 @@ fn start_suspend_guard(run_mode: RunMode) -> Result<SuspendGuard> {
             changed_suspend_state: true,
         })
     } else {
-        println!("suspend was already disabled before backup; leaving it disabled");
+        println!("local suspend was already disabled before backup; leaving it disabled");
         Ok(SuspendGuard {
             changed_suspend_state: false,
         })
@@ -821,6 +827,10 @@ fn wake_config<'a>(
     };
     let host = wake_host(wake, &remote).to_string();
     Some((wake, remote, host))
+}
+
+fn has_active_wake_config(job: &Job) -> bool {
+    wake_config(job).is_some()
 }
 
 fn wake_target_description(wake: &crate::config::model::RemoteWakeOptions) -> String {
@@ -1561,6 +1571,37 @@ mod tests {
         };
 
         assert_eq!(wake_host(&wake, &remote), "actual-host");
+    }
+
+    #[test]
+    fn suspend_guard_scope_requires_active_wake_source() {
+        let mut remote_job = job("root@example.com:/srv/data");
+        remote_job.remote = Some(crate::config::model::RemoteJobOptions {
+            inhibit_suspend: Some(true),
+            wake: Some(crate::config::model::RemoteWakeOptions {
+                mac: "aa:bb:cc:dd:ee:ff".to_string(),
+                host: Some("example.com".to_string()),
+                broadcast: Some("192.0.2.255".to_string()),
+                port: None,
+                interface: None,
+                keepalive_seconds: None,
+                wait_seconds: None,
+                suspend_after_backup: None,
+            }),
+        });
+
+        assert!(has_active_wake_config(&remote_job));
+
+        let mut cascade_job = remote_job.clone();
+        cascade_job.source = "/mnt/primary/test/current".to_string();
+        assert!(!has_active_wake_config(&cascade_job));
+
+        let mut no_wake_job = job("root@example.com:/srv/data");
+        no_wake_job.remote = Some(crate::config::model::RemoteJobOptions {
+            inhibit_suspend: Some(true),
+            wake: None,
+        });
+        assert!(!has_active_wake_config(&no_wake_job));
     }
 
     #[test]
