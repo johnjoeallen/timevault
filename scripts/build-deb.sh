@@ -32,10 +32,27 @@ if ! command -v cargo >/dev/null 2>&1; then
   exit 1
 fi
 
+if ! command -v git >/dev/null 2>&1; then
+  echo "git is required" >&2
+  exit 1
+fi
+
 if ! cargo deb --version >/dev/null 2>&1; then
   echo "cargo-deb is required; install it with: cargo install cargo-deb" >&2
   exit 1
 fi
+
+if ! git -C "$repo_root" diff --quiet -- "$manifest" "$cli_mod" \
+  || ! git -C "$repo_root" diff --cached --quiet -- "$manifest" "$cli_mod"; then
+  echo "refusing to auto-commit build number bump because Cargo.toml or src/cli/mod.rs is dirty" >&2
+  exit 1
+fi
+
+cargo build --release
+cargo deb
+
+echo "built package:"
+ls -1 "$repo_root"/target/debian/*.deb
 
 # Semantic version changes are made with source changes. Packaging builds only
 # advance the build number, which is mirrored into the Debian revision.
@@ -46,8 +63,5 @@ perl -0pi -e "s/pub\\(crate\\) const BUILD_NUMBER: u32 = \\Q$current_build\\E;/p
 
 echo "bumped build number: $current_build -> $next_build"
 
-cargo build --release
-cargo deb
-
-echo "built package:"
-ls -1 "$repo_root"/target/debian/*.deb
+git -C "$repo_root" add "$manifest" "$cli_mod"
+git -C "$repo_root" commit -m "Bump build number to $next_build"

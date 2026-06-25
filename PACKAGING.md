@@ -14,8 +14,9 @@
 scripts/build-deb.sh
 ```
 
-The build script increments the build number only. Semantic version changes are
-made when source changes are committed, before packaging.
+The build script builds the current tree first, then increments the build number
+and commits that packaging-only bump for the next package build. Semantic version
+changes are made when source changes are committed, before packaging.
 
 The package will be created under:
 
