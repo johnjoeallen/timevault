@@ -3,7 +3,7 @@ use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, ToSocketAddrs, UdpSocket};
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{symlink, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
@@ -28,6 +28,12 @@ pub mod rsync;
 
 const TIMEVAULT_MARKER: &str = ".timevault";
 const SCRIPT_DIR: &str = "/etc/timevault/scripts";
+const SUSPEND_TARGETS: [&str; 4] = [
+    "sleep.target",
+    "suspend.target",
+    "hibernate.target",
+    "hybrid-sleep.target",
+];
 
 #[derive(Debug, Clone, Copy)]
 pub struct BackupOptions {
@@ -42,6 +48,26 @@ struct LockGuard {
 impl Drop for LockGuard {
     fn drop(&mut self) {
         let _ = unlock_file(&self.path);
+    }
+}
+
+struct SuspendGuard {
+    changed_suspend_state: bool,
+}
+
+impl Drop for SuspendGuard {
+    fn drop(&mut self) {
+        if self.changed_suspend_state {
+            let mut cmd = privileged_systemctl_command("unmask");
+            match cmd.status() {
+                Ok(status) if status.success() => {}
+                Ok(status) => eprintln!(
+                    "failed to re-enable suspend after backup: systemctl unmask exited with code {}",
+                    status.code().unwrap_or(1)
+                ),
+                Err(err) => eprintln!("failed to re-enable suspend after backup: {}", err),
+            }
+        }
     }
 }
 
@@ -129,6 +155,7 @@ pub fn run_backup(
         }
 
         let _wake_keepalive = start_wake_keepalive(&job, run_mode)?;
+        let _suspend_guard = start_suspend_guard(run_mode)?;
         let _suspend_inhibitor = start_remote_suspend_inhibitor(&job, run_mode)?;
 
         if let Some(script) = job_script_path(&job.name, JobScriptPhase::Pre) {
@@ -342,6 +369,83 @@ fn status_for_rsync_code(rc: i32) -> BackupJobStatus {
         0 | 24 => BackupJobStatus::Success,
         _ => BackupJobStatus::Failed,
     }
+}
+
+fn start_suspend_guard(run_mode: RunMode) -> Result<SuspendGuard> {
+    if run_mode.dry_run {
+        println!(
+            "dry-run: would check suspend state: systemctl is-enabled {}",
+            SUSPEND_TARGETS.join(" ")
+        );
+        return Ok(SuspendGuard {
+            changed_suspend_state: false,
+        });
+    }
+
+    if suspend_is_allowed()? {
+        let mut cmd = privileged_systemctl_command("mask");
+        maybe_print_command(&cmd, run_mode);
+        let status = cmd.status().map_err(|err| {
+            TimevaultError::message(format!("failed to disable suspend before backup: {}", err))
+        })?;
+        if !status.success() {
+            return Err(TimevaultError::message(format!(
+                "failed to disable suspend before backup: systemctl mask exited with code {}",
+                status.code().unwrap_or(1)
+            )));
+        }
+        Ok(SuspendGuard {
+            changed_suspend_state: true,
+        })
+    } else {
+        println!("suspend was already disabled before backup; leaving it disabled");
+        Ok(SuspendGuard {
+            changed_suspend_state: false,
+        })
+    }
+}
+
+fn suspend_is_allowed() -> Result<bool> {
+    let mut cmd = Command::new("systemctl");
+    cmd.arg("is-enabled").args(SUSPEND_TARGETS);
+    let output = cmd.output().map_err(|err| {
+        TimevaultError::message(format!("failed to detect suspend state: {}", err))
+    })?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{}\n{}", stdout, stderr);
+    if output.status.success() || !combined.trim().is_empty() {
+        Ok(suspend_is_allowed_from_systemctl_output(&combined))
+    } else {
+        Err(TimevaultError::message(format!(
+            "failed to detect suspend state: systemctl is-enabled exited with code {}",
+            output.status.code().unwrap_or(1)
+        )))
+    }
+}
+
+fn suspend_is_allowed_from_systemctl_output(output: &str) -> bool {
+    !output.lines().any(|line| line.trim() == "masked")
+}
+
+fn privileged_systemctl_command(action: &str) -> Command {
+    let mut cmd = if running_as_root() {
+        let mut cmd = Command::new("systemctl");
+        cmd.arg(action);
+        cmd
+    } else {
+        let mut cmd = Command::new("sudo");
+        cmd.arg("systemctl").arg(action);
+        cmd
+    };
+    cmd.args(SUSPEND_TARGETS);
+    cmd
+}
+
+fn running_as_root() -> bool {
+    fs::metadata("/proc/self")
+        .map(|meta| meta.uid() == 0)
+        .unwrap_or(false)
 }
 
 pub fn run_pristine_only(jobs: Vec<Job>, run_mode: RunMode, options: BackupOptions) -> Result<()> {
@@ -1391,6 +1495,27 @@ mod tests {
         assert!(!command.contains("systemctl"));
         assert!(!command.contains("enable"));
         assert!(!command.contains("disable"));
+    }
+
+    #[test]
+    fn suspend_static_targets_are_allowed() {
+        let output = "static\nstatic\nstatic\nstatic\n";
+
+        assert!(suspend_is_allowed_from_systemctl_output(output));
+    }
+
+    #[test]
+    fn suspend_masked_target_means_already_disabled() {
+        let output = "static\nmasked\nstatic\nstatic\n";
+
+        assert!(!suspend_is_allowed_from_systemctl_output(output));
+    }
+
+    #[test]
+    fn suspend_disabled_but_unmasked_targets_are_allowed() {
+        let output = "disabled\nstatic\nenabled\nindirect\n";
+
+        assert!(suspend_is_allowed_from_systemctl_output(output));
     }
 
     #[test]

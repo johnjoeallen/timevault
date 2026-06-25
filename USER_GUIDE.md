@@ -82,6 +82,32 @@ Remote power options are available for SSH-style sources:
 `remote.inhibitSuspend` does not change the remote host's persistent suspend settings.
 Timevault does not enable suspend after a backup; it only releases the temporary inhibitor it started.
 
+Suspend ownership rule:
+
+For each backup job, Timevault wakes the remote host first, then detects the current system suspend state.
+
+It runs:
+
+```sh
+systemctl is-enabled sleep.target suspend.target hibernate.target hybrid-sleep.target
+```
+
+Interpretation:
+- If any target reports `masked`, suspend/hibernate is already disabled.
+- If no target reports `masked`, suspend/hibernate is currently allowed/enabled.
+- `static` is normal for these targets and is treated as allowed/enabled.
+
+Behaviour:
+- If suspend is currently allowed/enabled, Timevault disables suspend by masking the targets, records that it changed suspend state for that job, and unmasks the targets during that job's cleanup.
+- If suspend is already disabled/masked, Timevault does not call `systemctl mask` again, records that it did not change suspend state, and does not call `systemctl unmask` during cleanup.
+- When suspend was already disabled before the backup, Timevault logs that it will leave suspend disabled.
+- The job order is: wake, check suspend status, disable suspend if necessary, run the backup, then re-enable suspend only if Timevault disabled it.
+
+Acceptance criteria:
+- If suspend was enabled before a job, Timevault masks the targets during that job and unmasks them afterwards.
+- If suspend was already disabled before a job, Timevault does not mask or unmask the targets.
+- Timevault never re-enables suspend unless it disabled suspend itself during that job.
+
 Example:
 ```yaml
 jobs:
