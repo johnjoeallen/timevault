@@ -15,7 +15,7 @@ use crate::types::RunMode;
 
 const CONFIG_FILE: &str = "/etc/timevault.yaml";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-pub(crate) const BUILD_NUMBER: u32 = 0;
+pub(crate) const BUILD_NUMBER: u32 = 1;
 const LICENSE_NAME: &str = "GNU GPL v3 or later";
 const COPYRIGHT: &str = "Copyright (C) 2026 John Allen (john.joe.allen@gmail.com)";
 const PROJECT_URL: &str = "https://github.com/johnjoeallen/timevault";
