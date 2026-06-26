@@ -78,7 +78,7 @@ Remote power options are available for SSH-style sources:
 - `remote.wake.port`: Optional Wake-on-LAN UDP port. Default: `9`.
 - `remote.wake.interface`: Optional local interface name used when falling back to active interface broadcasts.
 - `remote.wake.keepaliveSeconds`: Optional interval for repeating the Wake-on-LAN packet while the job runs.
-- `remote.wake.waitSeconds`: Optional time to wait for the host to respond to ping after wake. Default: `15`.
+- `remote.wake.waitSeconds`: Optional time to wait for the host to respond to ping after wake. Timevault repeats the Wake-on-LAN packet between readiness checks during this wait. Default: `15`.
 - `remote.wake.suspendAfterBackup`: Optional boolean. If `true`, Timevault suspends the remote host after the job only when the host did not respond to ping before wake and Timevault woke it for the backup. Default: `false`.
 
 `remote.inhibitSuspend` does not change the remote host's persistent suspend settings.
@@ -236,7 +236,7 @@ By default Timevault uses `/usr/sbin/sendmail -t`; set `options.report.sendmail`
 
 ### Wake test
 - `timevault wake <job>`
-- Checks whether the configured host already responds to ping, then sends the job's configured `remote.wake` Wake-on-LAN packet only when needed and waits for ping.
+- Checks whether the configured host already responds to ping, then sends the job's configured `remote.wake` Wake-on-LAN packet only when needed and waits for ping, repeating Wake-on-LAN between readiness checks.
 - Does not run hooks, rsync, or remote suspend inhibition.
 - Supports `--dry-run` and `--verbose`.
 

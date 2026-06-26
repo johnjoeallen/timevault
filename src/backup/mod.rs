@@ -2,14 +2,14 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::CStr;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, ToSocketAddrs, UdpSocket};
 use std::os::unix::fs::{symlink, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
-use std::time::Duration as StdDuration;
+use std::time::{Duration as StdDuration, Instant};
 
 use chrono::{Duration, Local};
 use walkdir::WalkDir;
@@ -35,6 +35,7 @@ const SUSPEND_TARGETS: [&str; 4] = [
     "hibernate.target",
     "hybrid-sleep.target",
 ];
+const PING_ATTEMPT_TIMEOUT: StdDuration = StdDuration::from_secs(2);
 
 #[derive(Debug, Clone, Copy)]
 pub struct BackupOptions {
@@ -115,254 +116,304 @@ pub fn run_backup(
     };
     let mut pristine_excludes = PristineExcludes::default();
     for job in jobs {
-        let _lock = acquire_lock_for_job(&job.name, run_mode)?;
         let backup_day = (Local::now() - Duration::days(1))
             .format("%Y%m%d")
             .to_string();
-        let dest = resolve_job_dest(&job, disk_mount)?;
-        let backup_dir = dest.join(&backup_day);
-
-        if options.exclude_pristine_only {
-            if run_mode.verbose {
-                println!(
-                    "pristine: exclude-only mode enabled; skipping backup for job {}",
-                    job.name
-                );
-            }
-            report.jobs.push(BackupJobReport {
-                name: job.name.clone(),
-                description: job.description.clone(),
-                source: job.source.clone(),
-                destination: disk_mount.display().to_string(),
-                backup_day: "-".to_string(),
-                status: BackupJobStatus::Skipped,
-                attempts: 0,
-                rsync_code: None,
-            });
-            continue;
-        }
-
-        if run_mode.verbose {
-            println!("  backup day: {}", backup_day);
-        }
-
-        if run_mode.verbose {
-            println!("job: {}", job.name);
-            println!("  run: {}", job.run_policy.as_str());
-            println!("  source: {}", job.source);
-            println!("  backup dir: {}", dest.display());
-            println!("  copies: {}", job.copies);
-            println!("  excludes: {}", job.excludes.len());
-        }
-
-        let _remote_power_guard = start_remote_power_guard(&job, run_mode)?;
-        let _suspend_guard = start_suspend_guard(&job, run_mode)?;
-        let _suspend_inhibitor = start_remote_suspend_inhibitor(&job, run_mode)?;
-
-        if let Some(script) = job_script_path(&job.name, JobScriptPhase::Pre) {
-            let script_rc = run_job_script(
-                &job,
-                &script,
-                JobScriptPhase::Pre,
-                &backup_dir,
-                &backup_day,
-                None,
-                run_mode,
-            )?;
-            if script_rc != 0 {
-                println!(
-                    "pre script failed for job {} with exit code {}; skipping backup",
-                    job.name, script_rc
-                );
-                report.jobs.push(BackupJobReport {
-                    name: job.name.clone(),
-                    description: job.description.clone(),
-                    source: job.source.clone(),
-                    destination: backup_dir.display().to_string(),
-                    backup_day,
-                    status: BackupJobStatus::Failed,
-                    attempts: 0,
-                    rsync_code: None,
-                });
-                continue;
-            }
-        }
-        if let Some(script_rc) = run_remote_job_script(
+        match run_backup_job(
             &job,
-            JobScriptPhase::Pre,
-            &backup_dir,
             &backup_day,
-            None,
+            rsync_extra,
             run_mode,
-        )? {
-            if script_rc != 0 {
-                println!(
-                    "remote pre script failed for job {} with exit code {}; skipping backup",
-                    job.name, script_rc
-                );
-                report.jobs.push(BackupJobReport {
-                    name: job.name.clone(),
-                    description: job.description.clone(),
-                    source: job.source.clone(),
-                    destination: backup_dir.display().to_string(),
-                    backup_day,
-                    status: BackupJobStatus::Failed,
-                    attempts: 0,
-                    rsync_code: None,
-                });
-                continue;
-            }
-        }
-
-        ensure_pristine_excludes_for_job(
-            &job,
-            &mut pristine_excludes,
+            disk_mount,
             options,
-            run_mode.verbose,
-            run_mode.dry_run,
-        )?;
-
-        let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        let tmp_dir = Path::new(&home).join("tmp");
-        if !run_mode.dry_run {
-            fs::create_dir_all(&tmp_dir)?;
-        }
-        let excludes_file = tmp_dir.join("timevault.excludes");
-        let excludes = build_exclude_list(&job, &pristine_excludes)?;
-        if run_mode.dry_run {
-            println!(
-                "dry-run: would write excludes file {}",
-                excludes_file.display()
-            );
-        } else {
-            create_excludes_file(&excludes, &excludes_file)?;
-        }
-
-        if !dest.exists() {
-            if run_mode.dry_run {
-                println!("dry-run: mkdir -p {}", dest.display());
-            } else {
-                fs::create_dir_all(&dest)?;
+            &mut pristine_excludes,
+        ) {
+            Ok(job_report) => report.jobs.push(job_report),
+            Err(err) => {
+                println!("job {} failed: {}", job.name, err);
+                report
+                    .jobs
+                    .push(failed_job_report(&job, disk_mount, &backup_day, run_mode));
             }
         }
-
-        expire_old_backups(&job, &dest, run_mode)?;
-
-        let current = dest.join("current");
-        let backup_dir = dest.join(&backup_day);
-
-        if current.exists() && !backup_dir.exists() {
-            if run_mode.dry_run {
-                println!("dry-run: mkdir -p {}", backup_dir.display());
-            } else {
-                fs::create_dir_all(&backup_dir)?;
-            }
-            copy_snapshot_without_symlinks(&current, &backup_dir, run_mode)?;
-        }
-
-        let mut rc = 1;
-        let mut attempts = 0;
-        for attempt in 1..=3 {
-            attempts = attempt;
-            rc = run_rsync(
-                &job.source,
-                &backup_dir,
-                &excludes_file,
-                rsync_extra,
-                run_mode,
-            )?;
-            if rc == 0 || rc == 24 {
-                break;
-            }
-            if attempt < 3 {
-                println!(
-                    "rsync failed with exit code {}; retrying ({}/3)",
-                    rc,
-                    attempt + 1
-                );
-            }
-        }
-        let rsync_ok = rc == 0 || rc == 24;
-        if !rsync_ok {
-            println!("rsync failed with exit code {}; current not updated", rc);
-        }
-
-        if rsync_ok && backup_dir.exists() {
-            let current_link = dest.join("current");
-            if let Ok(meta) = fs::symlink_metadata(&current_link) {
-                if meta.file_type().is_symlink() || meta.is_file() {
-                    if run_mode.safe_mode || run_mode.dry_run {
-                        if run_mode.dry_run {
-                            println!("dry-run: rm -f {}", current_link.display());
-                        } else {
-                            println!("skip remove (safe-mode): {}", current_link.display());
-                        }
-                    } else {
-                        let _ = fs::remove_file(&current_link);
-                    }
-                } else if meta.is_dir() {
-                    println!(
-                        "skip updating current (directory exists): {}",
-                        current_link.display()
-                    );
-                }
-            }
-            if !current_link.exists() {
-                if run_mode.dry_run {
-                    println!("dry-run: ln -s {} {}", backup_day, current_link.display());
-                } else {
-                    symlink(&backup_day, &current_link)?;
-                }
-            }
-        }
-        let mut status = status_for_rsync_code(rc);
-        if let Some(script_rc) = run_remote_job_script(
-            &job,
-            JobScriptPhase::Post,
-            &backup_dir,
-            &backup_day,
-            Some(rc),
-            run_mode,
-        )? {
-            if script_rc != 0 {
-                println!(
-                    "remote post script failed for job {} with exit code {}",
-                    job.name, script_rc
-                );
-                status = BackupJobStatus::Failed;
-            }
-        }
-        if let Some(script) = job_script_path(&job.name, JobScriptPhase::Post) {
-            let script_rc = run_job_script(
-                &job,
-                &script,
-                JobScriptPhase::Post,
-                &backup_dir,
-                &backup_day,
-                Some(rc),
-                run_mode,
-            )?;
-            if script_rc != 0 {
-                println!(
-                    "post script failed for job {} with exit code {}",
-                    job.name, script_rc
-                );
-                status = BackupJobStatus::Failed;
-            }
-        }
-        report.jobs.push(BackupJobReport {
-            name: job.name,
-            description: job.description,
-            source: job.source,
-            destination: backup_dir.display().to_string(),
-            backup_day,
-            status,
-            attempts,
-            rsync_code: Some(rc),
-        });
     }
     report.finished_at = Local::now();
     Ok(report)
+}
+
+fn run_backup_job(
+    job: &Job,
+    backup_day: &str,
+    rsync_extra: &[String],
+    run_mode: RunMode,
+    disk_mount: &Path,
+    options: BackupOptions,
+    pristine_excludes: &mut PristineExcludes,
+) -> Result<BackupJobReport> {
+    let _lock = acquire_lock_for_job(&job.name, run_mode)?;
+    let dest = resolve_job_dest(job, disk_mount)?;
+    let backup_dir = dest.join(backup_day);
+
+    if options.exclude_pristine_only {
+        if run_mode.verbose {
+            println!(
+                "pristine: exclude-only mode enabled; skipping backup for job {}",
+                job.name
+            );
+        }
+        return Ok(BackupJobReport {
+            name: job.name.clone(),
+            description: job.description.clone(),
+            source: job.source.clone(),
+            destination: disk_mount.display().to_string(),
+            backup_day: "-".to_string(),
+            status: BackupJobStatus::Skipped,
+            attempts: 0,
+            rsync_code: None,
+        });
+    }
+
+    if run_mode.verbose {
+        println!("  backup day: {}", backup_day);
+    }
+
+    if run_mode.verbose {
+        println!("job: {}", job.name);
+        println!("  run: {}", job.run_policy.as_str());
+        println!("  source: {}", job.source);
+        println!("  backup dir: {}", dest.display());
+        println!("  copies: {}", job.copies);
+        println!("  excludes: {}", job.excludes.len());
+    }
+
+    let _remote_power_guard = start_remote_power_guard(job, run_mode)?;
+    let _suspend_guard = start_suspend_guard(job, run_mode)?;
+    let _suspend_inhibitor = start_remote_suspend_inhibitor(job, run_mode)?;
+
+    if let Some(script) = job_script_path(&job.name, JobScriptPhase::Pre) {
+        let script_rc = run_job_script(
+            job,
+            &script,
+            JobScriptPhase::Pre,
+            &backup_dir,
+            backup_day,
+            None,
+            run_mode,
+        )?;
+        if script_rc != 0 {
+            println!(
+                "pre script failed for job {} with exit code {}; skipping backup",
+                job.name, script_rc
+            );
+            return Ok(BackupJobReport {
+                name: job.name.clone(),
+                description: job.description.clone(),
+                source: job.source.clone(),
+                destination: backup_dir.display().to_string(),
+                backup_day: backup_day.to_string(),
+                status: BackupJobStatus::Failed,
+                attempts: 0,
+                rsync_code: None,
+            });
+        }
+    }
+    if let Some(script_rc) = run_remote_job_script(
+        job,
+        JobScriptPhase::Pre,
+        &backup_dir,
+        backup_day,
+        None,
+        run_mode,
+    )? {
+        if script_rc != 0 {
+            println!(
+                "remote pre script failed for job {} with exit code {}; skipping backup",
+                job.name, script_rc
+            );
+            return Ok(BackupJobReport {
+                name: job.name.clone(),
+                description: job.description.clone(),
+                source: job.source.clone(),
+                destination: backup_dir.display().to_string(),
+                backup_day: backup_day.to_string(),
+                status: BackupJobStatus::Failed,
+                attempts: 0,
+                rsync_code: None,
+            });
+        }
+    }
+
+    ensure_pristine_excludes_for_job(
+        job,
+        pristine_excludes,
+        options,
+        run_mode.verbose,
+        run_mode.dry_run,
+    )?;
+
+    let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let tmp_dir = Path::new(&home).join("tmp");
+    if !run_mode.dry_run {
+        fs::create_dir_all(&tmp_dir)?;
+    }
+    let excludes_file = tmp_dir.join("timevault.excludes");
+    let excludes = build_exclude_list(job, pristine_excludes)?;
+    if run_mode.dry_run {
+        println!(
+            "dry-run: would write excludes file {}",
+            excludes_file.display()
+        );
+    } else {
+        create_excludes_file(&excludes, &excludes_file)?;
+    }
+
+    if !dest.exists() {
+        if run_mode.dry_run {
+            println!("dry-run: mkdir -p {}", dest.display());
+        } else {
+            fs::create_dir_all(&dest)?;
+        }
+    }
+
+    expire_old_backups(job, &dest, run_mode)?;
+
+    let current = dest.join("current");
+    let backup_dir = dest.join(backup_day);
+
+    if current.exists() && !backup_dir.exists() {
+        if run_mode.dry_run {
+            println!("dry-run: mkdir -p {}", backup_dir.display());
+        } else {
+            fs::create_dir_all(&backup_dir)?;
+        }
+        copy_snapshot_without_symlinks(&current, &backup_dir, run_mode)?;
+    }
+
+    let mut rc = 1;
+    let mut attempts = 0;
+    for attempt in 1..=3 {
+        attempts = attempt;
+        rc = run_rsync(
+            &job.source,
+            &backup_dir,
+            &excludes_file,
+            rsync_extra,
+            run_mode,
+        )?;
+        if rc == 0 || rc == 24 {
+            break;
+        }
+        if attempt < 3 {
+            println!(
+                "rsync failed with exit code {}; retrying ({}/3)",
+                rc,
+                attempt + 1
+            );
+        }
+    }
+    let rsync_ok = rc == 0 || rc == 24;
+    if !rsync_ok {
+        println!("rsync failed with exit code {}; current not updated", rc);
+    }
+
+    if rsync_ok && backup_dir.exists() {
+        let current_link = dest.join("current");
+        if let Ok(meta) = fs::symlink_metadata(&current_link) {
+            if meta.file_type().is_symlink() || meta.is_file() {
+                if run_mode.safe_mode || run_mode.dry_run {
+                    if run_mode.dry_run {
+                        println!("dry-run: rm -f {}", current_link.display());
+                    } else {
+                        println!("skip remove (safe-mode): {}", current_link.display());
+                    }
+                } else {
+                    let _ = fs::remove_file(&current_link);
+                }
+            } else if meta.is_dir() {
+                println!(
+                    "skip updating current (directory exists): {}",
+                    current_link.display()
+                );
+            }
+        }
+        if !current_link.exists() {
+            if run_mode.dry_run {
+                println!("dry-run: ln -s {} {}", backup_day, current_link.display());
+            } else {
+                symlink(backup_day, &current_link)?;
+            }
+        }
+    }
+    let mut status = status_for_rsync_code(rc);
+    if let Some(script_rc) = run_remote_job_script(
+        job,
+        JobScriptPhase::Post,
+        &backup_dir,
+        backup_day,
+        Some(rc),
+        run_mode,
+    )? {
+        if script_rc != 0 {
+            println!(
+                "remote post script failed for job {} with exit code {}",
+                job.name, script_rc
+            );
+            status = BackupJobStatus::Failed;
+        }
+    }
+    if let Some(script) = job_script_path(&job.name, JobScriptPhase::Post) {
+        let script_rc = run_job_script(
+            job,
+            &script,
+            JobScriptPhase::Post,
+            &backup_dir,
+            backup_day,
+            Some(rc),
+            run_mode,
+        )?;
+        if script_rc != 0 {
+            println!(
+                "post script failed for job {} with exit code {}",
+                job.name, script_rc
+            );
+            status = BackupJobStatus::Failed;
+        }
+    }
+    Ok(BackupJobReport {
+        name: job.name.clone(),
+        description: job.description.clone(),
+        source: job.source.clone(),
+        destination: backup_dir.display().to_string(),
+        backup_day: backup_day.to_string(),
+        status,
+        attempts,
+        rsync_code: Some(rc),
+    })
+}
+
+fn failed_job_report(
+    job: &Job,
+    disk_mount: &Path,
+    backup_day: &str,
+    run_mode: RunMode,
+) -> BackupJobReport {
+    let destination = resolve_job_dest(job, disk_mount)
+        .map(|dest| dest.join(backup_day).display().to_string())
+        .unwrap_or_else(|_| disk_mount.display().to_string());
+    BackupJobReport {
+        name: job.name.clone(),
+        description: job.description.clone(),
+        source: job.source.clone(),
+        destination,
+        backup_day: if run_mode.dry_run {
+            "-".to_string()
+        } else {
+            backup_day.to_string()
+        },
+        status: BackupJobStatus::Failed,
+        attempts: 0,
+        rsync_code: None,
+    }
 }
 
 fn status_for_rsync_code(rc: i32) -> BackupJobStatus {
@@ -689,7 +740,7 @@ pub fn wake_remote_job(job: &Job, run_mode: RunMode) -> Result<()> {
             host
         );
         println!(
-            "dry-run: would wait up to {} seconds for {} to respond to ping",
+            "dry-run: would wait up to {} seconds for {} to respond to ping, repeating WOL between checks",
             wake_wait_seconds(wake),
             host
         );
@@ -702,7 +753,7 @@ pub fn wake_remote_job(job: &Job, run_mode: RunMode) -> Result<()> {
             job.name
         )));
     };
-    if ping_once(&context.host)? {
+    if ping_once(&context.host, run_mode)? {
         if run_mode.verbose {
             println!(
                 "wake host {} already responds to ping; skipping WOL",
@@ -711,8 +762,21 @@ pub fn wake_remote_job(job: &Job, run_mode: RunMode) -> Result<()> {
         }
         return Ok(());
     }
+    if run_mode.verbose {
+        println!(
+            "wake host {} did not respond; sending WOL to {} target(s)",
+            context.host,
+            context.targets.len()
+        );
+    }
     send_wake_packets(&context.mac, &context.targets)?;
-    wait_for_ping(&context.host, context.wait_seconds)
+    wait_for_ping_with_wake(
+        &context.host,
+        context.wait_seconds,
+        &context.mac,
+        &context.targets,
+        run_mode,
+    )
 }
 
 fn start_remote_power_guard(job: &Job, run_mode: RunMode) -> Result<Option<RemotePowerGuard>> {
@@ -731,7 +795,7 @@ fn start_remote_power_guard(job: &Job, run_mode: RunMode) -> Result<Option<Remot
             host
         );
         println!(
-            "dry-run: would wait up to {} seconds for {} to respond to ping",
+            "dry-run: would wait up to {} seconds for {} to respond to ping, repeating WOL between checks",
             wake_wait_seconds(wake),
             host
         );
@@ -753,7 +817,7 @@ fn start_remote_power_guard(job: &Job, run_mode: RunMode) -> Result<Option<Remot
     let Some(context) = wake_context(job)? else {
         return Ok(None);
     };
-    if ping_once(&context.host)? {
+    if ping_once(&context.host, run_mode)? {
         if run_mode.verbose {
             println!(
                 "wake host {} already responds to ping; skipping WOL",
@@ -763,8 +827,21 @@ fn start_remote_power_guard(job: &Job, run_mode: RunMode) -> Result<Option<Remot
         return Ok(None);
     }
 
+    if run_mode.verbose {
+        println!(
+            "wake host {} did not respond; sending WOL to {} target(s)",
+            context.host,
+            context.targets.len()
+        );
+    }
     send_wake_packets(&context.mac, &context.targets)?;
-    wait_for_ping(&context.host, context.wait_seconds)?;
+    wait_for_ping_with_wake(
+        &context.host,
+        context.wait_seconds,
+        &context.mac,
+        &context.targets,
+        run_mode,
+    )?;
 
     let keepalive = if let Some(seconds) = context.keepalive_seconds {
         let (stop, receiver) = mpsc::channel();
@@ -1018,34 +1095,208 @@ fn parse_mac_address(value: &str) -> Option<[u8; 6]> {
     }
 }
 
-fn wait_for_ping(host: &str, timeout_seconds: u64) -> Result<()> {
-    let deadline = std::time::Instant::now() + StdDuration::from_secs(timeout_seconds);
+fn wait_for_ping_with_wake(
+    host: &str,
+    timeout_seconds: u64,
+    mac: &str,
+    targets: &[SocketAddrV4],
+    run_mode: RunMode,
+) -> Result<()> {
+    let deadline = Instant::now() + StdDuration::from_secs(timeout_seconds);
+    if run_mode.verbose {
+        println!(
+            "waiting up to {} seconds for wake host {}",
+            timeout_seconds, host
+        );
+    }
     loop {
-        if ping_once(host)? {
-            return Ok(());
-        }
-        if std::time::Instant::now() >= deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             return Err(TimevaultError::message(format!(
                 "wake host {} did not respond to ping within {} seconds",
                 host, timeout_seconds
             )));
         }
-        thread::sleep(StdDuration::from_secs(1));
+
+        if ping_once_with_timeout(host, remaining.min(PING_ATTEMPT_TIMEOUT), run_mode)? {
+            if run_mode.verbose {
+                println!("wake host {} is reachable", host);
+            }
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(TimevaultError::message(format!(
+                "wake host {} did not respond to ping within {} seconds",
+                host, timeout_seconds
+            )));
+        }
+
+        if run_mode.verbose {
+            println!(
+                "wake host {} is not reachable yet; sending another WOL packet to {} target(s)",
+                host,
+                targets.len()
+            );
+        }
+        send_wake_packets(mac, targets)?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if !remaining.is_zero() {
+            thread::sleep(remaining.min(StdDuration::from_secs(1)));
+        }
     }
 }
 
-fn ping_once(host: &str) -> Result<bool> {
-    let status = Command::new("ping")
+fn ping_once(host: &str, run_mode: RunMode) -> Result<bool> {
+    ping_once_with_timeout(host, PING_ATTEMPT_TIMEOUT, run_mode)
+}
+
+fn ping_once_with_timeout(host: &str, timeout: StdDuration, run_mode: RunMode) -> Result<bool> {
+    let deadline = Instant::now() + timeout;
+    let addresses = resolve_host_ipv4_with_timeout(host, timeout, run_mode)?;
+    if addresses.is_empty() {
+        if run_mode.verbose {
+            println!("wake host {} did not resolve to an IPv4 address", host);
+        }
+        return Ok(false);
+    }
+    for address in addresses {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        if run_mode.verbose {
+            println!("checking wake host {} at {}", host, address);
+        }
+        if ping_ipv4_once_with_timeout(address, remaining)? {
+            return Ok(true);
+        }
+        if run_mode.verbose {
+            println!(
+                "wake host {} resolved to {}, but ping failed",
+                host, address
+            );
+        }
+    }
+    Ok(false)
+}
+
+fn resolve_host_ipv4_with_timeout(
+    host: &str,
+    timeout: StdDuration,
+    run_mode: RunMode,
+) -> Result<Vec<Ipv4Addr>> {
+    if let Ok(address) = host.parse::<Ipv4Addr>() {
+        if run_mode.verbose {
+            println!("wake host {} is already an IPv4 address", host);
+        }
+        return Ok(vec![address]);
+    }
+
+    if run_mode.verbose {
+        println!(
+            "resolving wake host {} with a {} second timeout",
+            host,
+            timeout.as_secs()
+        );
+    }
+    let mut child = Command::new("getent")
+        .arg("ahostsv4")
+        .arg(host)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|err| TimevaultError::message(format!("resolve {}: {}", host, err)))?;
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            if !status.success() {
+                if run_mode.verbose {
+                    println!(
+                        "wake host {} DNS lookup failed with exit code {}",
+                        host,
+                        status.code().unwrap_or(1)
+                    );
+                }
+                return Ok(Vec::new());
+            }
+            let mut output = String::new();
+            if let Some(mut stdout) = child.stdout.take() {
+                stdout.read_to_string(&mut output)?;
+            }
+            let addresses = parse_getent_ahostsv4(&output);
+            if run_mode.verbose {
+                if addresses.is_empty() {
+                    println!("wake host {} DNS lookup returned no IPv4 addresses", host);
+                } else {
+                    println!(
+                        "wake host {} resolved to {}",
+                        host,
+                        addresses
+                            .iter()
+                            .map(Ipv4Addr::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+            }
+            return Ok(addresses);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            if run_mode.verbose {
+                println!("wake host {} DNS lookup timed out", host);
+            }
+            return Ok(Vec::new());
+        }
+        thread::sleep(StdDuration::from_millis(50));
+    }
+}
+
+fn parse_getent_ahostsv4(output: &str) -> Vec<Ipv4Addr> {
+    let mut addresses = Vec::new();
+    let mut seen = HashSet::new();
+    for line in output.lines() {
+        let Some(first) = line.split_whitespace().next() else {
+            continue;
+        };
+        let Ok(address) = first.parse::<Ipv4Addr>() else {
+            continue;
+        };
+        if seen.insert(address) {
+            addresses.push(address);
+        }
+    }
+    addresses
+}
+
+fn ping_ipv4_once_with_timeout(address: Ipv4Addr, timeout: StdDuration) -> Result<bool> {
+    let mut child = Command::new("ping")
         .arg("-c")
         .arg("1")
         .arg("-W")
         .arg("1")
-        .arg(host)
+        .arg(address.to_string())
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
-        .map_err(|err| TimevaultError::message(format!("ping {}: {}", host, err)))?;
-    Ok(status.success())
+        .spawn()
+        .map_err(|err| TimevaultError::message(format!("ping {}: {}", address, err)))?;
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status.success());
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(false);
+        }
+        thread::sleep(StdDuration::from_millis(50));
+    }
 }
 
 fn remote_dns_host(ssh_host: &str) -> &str {
@@ -1663,6 +1914,20 @@ mod tests {
     }
 
     #[test]
+    fn parse_getent_ahostsv4_deduplicates_addresses() {
+        let output = "\
+192.0.2.10 STREAM example.com
+192.0.2.10 DGRAM
+192.0.2.11 STREAM example.com
+";
+
+        assert_eq!(
+            parse_getent_ahostsv4(output),
+            vec![Ipv4Addr::new(192, 0, 2, 10), Ipv4Addr::new(192, 0, 2, 11)]
+        );
+    }
+
+    #[test]
     fn remote_dns_host_strips_ssh_user() {
         assert_eq!(remote_dns_host("root@spitfire"), "spitfire");
         assert_eq!(remote_dns_host("spitfire"), "spitfire");
@@ -1717,6 +1982,37 @@ mod tests {
             wake: None,
         });
         assert!(!has_active_wake_config(&no_wake_job));
+    }
+
+    #[test]
+    fn failed_job_does_not_stop_later_jobs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let source = tmp.path().join("source");
+        fs::create_dir_all(&source).expect("source");
+        let mut failed = job(source.to_string_lossy().as_ref());
+        failed.name = "../bad".to_string();
+        let mut next = job(source.to_string_lossy().as_ref());
+        next.name = "next".to_string();
+        let mut mode = run_mode();
+        mode.dry_run = true;
+
+        let report = run_backup(
+            vec![failed, next],
+            &[],
+            mode,
+            tmp.path(),
+            BackupOptions {
+                exclude_pristine: false,
+                exclude_pristine_only: false,
+            },
+        )
+        .expect("backup report");
+
+        assert_eq!(report.jobs.len(), 2);
+        assert_eq!(report.jobs[0].name, "../bad");
+        assert_eq!(report.jobs[0].status, BackupJobStatus::Failed);
+        assert_eq!(report.jobs[1].name, "next");
+        assert_eq!(report.jobs[1].status, BackupJobStatus::Success);
     }
 
     #[test]
