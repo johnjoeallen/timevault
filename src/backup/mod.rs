@@ -456,7 +456,7 @@ fn start_suspend_guard(job: &Job, run_mode: RunMode) -> Result<SuspendGuard> {
         });
     }
 
-    if suspend_is_allowed(&remote.host)? {
+    if suspend_is_allowed(&remote.host, run_mode)? {
         let mut cmd = remote_systemctl_command(&remote.host, "mask");
         maybe_print_command(&cmd, run_mode);
         let status = cmd.status().map_err(|err| {
@@ -488,8 +488,9 @@ fn start_suspend_guard(job: &Job, run_mode: RunMode) -> Result<SuspendGuard> {
     }
 }
 
-fn suspend_is_allowed(remote_host: &str) -> Result<bool> {
+fn suspend_is_allowed(remote_host: &str, run_mode: RunMode) -> Result<bool> {
     let mut cmd = remote_systemctl_command(remote_host, "is-enabled");
+    maybe_print_command(&cmd, run_mode);
     let output = cmd.output().map_err(|err| {
         TimevaultError::message(format!(
             "failed to detect suspend state on backup source host {}: {}",
