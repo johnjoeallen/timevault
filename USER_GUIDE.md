@@ -71,7 +71,7 @@ Remote hooks receive the same environment plus `TIMEVAULT_JOB_REMOTE_SOURCE`, co
 Remote hooks are best-effort discovered by SSH command execution; missing hook files are treated as success.
 
 Remote power options are available for SSH-style sources:
-- `remote.inhibitSuspend`: If `true`, Timevault starts a remote `systemd-inhibit` process for the job and stops it when the job finishes. This requires `remote.wake`.
+- `remote.inhibitSuspend`: If `true`, Timevault checks suspend state on the backup source host before the job. If suspend is currently allowed, Timevault masks the suspend targets for the job and unmasks them when the job finishes. If suspend was already masked, Timevault leaves it masked. This requires `remote.wake`.
 - `remote.wake.mac`: MAC address to wake before the job using a native Wake-on-LAN UDP packet.
 - `remote.wake.host`: Optional host name to resolve and ping after wake. Defaults to the SSH host from `source`.
 - `remote.wake.broadcast`: Optional IPv4 broadcast target. If omitted, Timevault resolves the remote host name and uses the same `/24` subnet with the last octet set to `255`. If DNS lookup fails, Timevault sends the wake packet to all active local IPv4 interface broadcasts.
@@ -81,16 +81,16 @@ Remote power options are available for SSH-style sources:
 - `remote.wake.waitSeconds`: Optional time to wait for the host to respond to ping after wake. Timevault repeats the Wake-on-LAN packet between readiness checks during this wait. Default: `15`.
 - `remote.wake.suspendAfterBackup`: Optional boolean. If `true`, Timevault suspends the remote host after the job only when the host did not respond to ping before wake and Timevault woke it for the backup. Default: `false`.
 
-`remote.inhibitSuspend` does not change the remote host's persistent suspend settings.
-Timevault does not enable suspend after a backup; it only releases the temporary inhibitor it started. If `remote.wake.suspendAfterBackup` is enabled, the final suspend is a separate remote `systemctl suspend` call.
+`remote.inhibitSuspend` only unmasks suspend targets when Timevault masked them for that job.
+Timevault does not enable suspend after a backup if it was already disabled before the backup. If `remote.wake.suspendAfterBackup` is enabled, the final suspend is a separate remote `systemctl suspend` call.
 
 Suspend ownership rule:
 
-For each SSH-style backup job with `remote.wake`, Timevault checks whether the remote host responds to ping, wakes it only if needed, then detects the Timevault runner's local suspend state.
+For each SSH-style backup job with `remote.wake`, Timevault checks whether the backup source host responds to ping, wakes it only if needed, then detects the backup source host's suspend state over SSH.
 Jobs without `remote.wake` do not perform wake-related suspend work.
 Cascade jobs copied from a remote job ignore wake and suspend handling after their source is rewritten to the primary disk's local snapshot path.
 
-It runs:
+It runs on the backup source host:
 
 ```sh
 systemctl is-enabled sleep.target suspend.target hibernate.target hybrid-sleep.target
@@ -102,14 +102,14 @@ Interpretation:
 - `static` is normal for these targets and is treated as allowed/enabled.
 
 Behaviour:
-- If suspend is currently allowed/enabled, Timevault disables suspend by masking the targets, records that it changed suspend state for that job, and unmasks the targets during that job's cleanup.
-- If suspend is already disabled/masked, Timevault does not call `systemctl mask` again, records that it did not change suspend state, and does not call `systemctl unmask` during cleanup.
-- When local suspend was already disabled before the backup, Timevault logs that it will leave suspend disabled.
+- If suspend is currently allowed/enabled on the backup source host, Timevault disables suspend on that host by masking the targets, records that it changed suspend state for that job, and unmasks the targets during that job's cleanup.
+- If suspend is already disabled/masked on the backup source host, Timevault does not call `systemctl mask` again, records that it did not change suspend state, and does not call `systemctl unmask` during cleanup.
+- When suspend was already disabled on the backup source host before the backup, Timevault logs that it will leave suspend disabled.
 - The job order is: wake, check suspend status, disable suspend if necessary, run the backup, then re-enable suspend only if Timevault disabled it.
 
 Acceptance criteria:
-- If suspend was enabled before a job, Timevault masks the targets during that job and unmasks them afterwards.
-- If suspend was already disabled before a job, Timevault does not mask or unmask the targets.
+- If suspend was enabled on the backup source host before a job, Timevault masks the targets during that job and unmasks them afterwards.
+- If suspend was already disabled on the backup source host before a job, Timevault does not mask or unmask the targets.
 - Timevault never re-enables suspend unless it disabled suspend itself during that job.
 - If `remote.wake.suspendAfterBackup` is enabled, Timevault only suspends the remote host after jobs where the host was offline before wake.
 
@@ -399,7 +399,7 @@ Delete the matching file to force a full regeneration on the next run.
 ## Remote backups
 Remote job sources require passwordless SSH (keys configured for the remote host), and the remote host must have rsync installed.
 When `--exclude-pristine` is enabled for a `host:/...` source, Timevault uses SSH to inspect the remote host's package database and file hashes, then stores that host's pristine cache separately on the local machine. Remote pristine analysis supports SSH-style rsync sources, not `rsync://` daemon sources.
-Remote power options require `systemd-inhibit` on the remote host for suspend inhibition and `ping` on the Timevault host for wake readiness checks.
+Remote power options require `systemctl` over SSH on the remote host for suspend handling and `ping` on the Timevault host for wake readiness checks.
 
 ## Notes
 - Backup disks must contain `/.timevault` and match the configured `diskId` and `fsUuid`.

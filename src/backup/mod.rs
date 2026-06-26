@@ -2,11 +2,11 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::CStr;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, ToSocketAddrs, UdpSocket};
-use std::os::unix::fs::{symlink, MetadataExt};
+use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration as StdDuration, Instant};
@@ -55,19 +55,27 @@ impl Drop for LockGuard {
 
 struct SuspendGuard {
     changed_suspend_state: bool,
+    remote_host: Option<String>,
 }
 
 impl Drop for SuspendGuard {
     fn drop(&mut self) {
         if self.changed_suspend_state {
-            let mut cmd = privileged_systemctl_command("unmask");
+            let Some(remote_host) = self.remote_host.as_deref() else {
+                return;
+            };
+            let mut cmd = remote_systemctl_command(remote_host, "unmask");
             match cmd.status() {
                 Ok(status) if status.success() => {}
                 Ok(status) => eprintln!(
-                    "failed to re-enable suspend after backup: systemctl unmask exited with code {}",
+                    "failed to re-enable suspend on backup source host {} after backup: ssh exited with code {}",
+                    remote_host,
                     status.code().unwrap_or(1)
                 ),
-                Err(err) => eprintln!("failed to re-enable suspend after backup: {}", err),
+                Err(err) => eprintln!(
+                    "failed to re-enable suspend on backup source host {} after backup: {}",
+                    remote_host, err
+                ),
             }
         }
     }
@@ -188,7 +196,6 @@ fn run_backup_job(
 
     let _remote_power_guard = start_remote_power_guard(job, run_mode)?;
     let _suspend_guard = start_suspend_guard(job, run_mode)?;
-    let _suspend_inhibitor = start_remote_suspend_inhibitor(job, run_mode)?;
 
     if let Some(script) = job_script_path(&job.name, JobScriptPhase::Pre) {
         let script_rc = run_job_script(
@@ -424,50 +431,70 @@ fn status_for_rsync_code(rc: i32) -> BackupJobStatus {
 }
 
 fn start_suspend_guard(job: &Job, run_mode: RunMode) -> Result<SuspendGuard> {
-    if !has_active_wake_config(job) {
+    if !has_remote_suspend_guard_config(job) {
         return Ok(SuspendGuard {
             changed_suspend_state: false,
+            remote_host: None,
         });
     }
+    let Some(remote) = remote_ssh_source(&job.source) else {
+        return Ok(SuspendGuard {
+            changed_suspend_state: false,
+            remote_host: None,
+        });
+    };
 
     if run_mode.dry_run {
         println!(
-            "dry-run: would check local suspend state: systemctl is-enabled {}",
+            "dry-run: would check suspend state on backup source host {}: systemctl is-enabled {}",
+            remote.host,
             SUSPEND_TARGETS.join(" ")
         );
         return Ok(SuspendGuard {
             changed_suspend_state: false,
+            remote_host: None,
         });
     }
 
-    if suspend_is_allowed()? {
-        let mut cmd = privileged_systemctl_command("mask");
+    if suspend_is_allowed(&remote.host)? {
+        let mut cmd = remote_systemctl_command(&remote.host, "mask");
         maybe_print_command(&cmd, run_mode);
         let status = cmd.status().map_err(|err| {
-            TimevaultError::message(format!("failed to disable suspend before backup: {}", err))
+            TimevaultError::message(format!(
+                "failed to disable suspend on backup source host {} before backup: {}",
+                remote.host, err
+            ))
         })?;
         if !status.success() {
             return Err(TimevaultError::message(format!(
-                "failed to disable suspend before backup: systemctl mask exited with code {}",
+                "failed to disable suspend on backup source host {} before backup: ssh exited with code {}",
+                remote.host,
                 status.code().unwrap_or(1)
             )));
         }
         Ok(SuspendGuard {
             changed_suspend_state: true,
+            remote_host: Some(remote.host),
         })
     } else {
-        println!("local suspend was already disabled before backup; leaving it disabled");
+        println!(
+            "suspend on backup source host {} was already disabled before backup; leaving it disabled",
+            remote.host
+        );
         Ok(SuspendGuard {
             changed_suspend_state: false,
+            remote_host: None,
         })
     }
 }
 
-fn suspend_is_allowed() -> Result<bool> {
-    let mut cmd = Command::new("systemctl");
-    cmd.arg("is-enabled").args(SUSPEND_TARGETS);
+fn suspend_is_allowed(remote_host: &str) -> Result<bool> {
+    let mut cmd = remote_systemctl_command(remote_host, "is-enabled");
     let output = cmd.output().map_err(|err| {
-        TimevaultError::message(format!("failed to detect suspend state: {}", err))
+        TimevaultError::message(format!(
+            "failed to detect suspend state on backup source host {}: {}",
+            remote_host, err
+        ))
     })?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -476,7 +503,8 @@ fn suspend_is_allowed() -> Result<bool> {
         Ok(suspend_is_allowed_from_systemctl_output(&combined))
     } else {
         Err(TimevaultError::message(format!(
-            "failed to detect suspend state: systemctl is-enabled exited with code {}",
+            "failed to detect suspend state on backup source host {}: ssh exited with code {}",
+            remote_host,
             output.status.code().unwrap_or(1)
         )))
     }
@@ -486,24 +514,13 @@ fn suspend_is_allowed_from_systemctl_output(output: &str) -> bool {
     !output.lines().any(|line| line.trim() == "masked")
 }
 
-fn privileged_systemctl_command(action: &str) -> Command {
-    let mut cmd = if running_as_root() {
-        let mut cmd = Command::new("systemctl");
-        cmd.arg(action);
-        cmd
-    } else {
-        let mut cmd = Command::new("sudo");
-        cmd.arg("systemctl").arg(action);
-        cmd
-    };
-    cmd.args(SUSPEND_TARGETS);
+fn remote_systemctl_command(remote_host: &str, action: &str) -> Command {
+    let mut cmd = Command::new("ssh");
+    cmd.arg(remote_host)
+        .arg("systemctl")
+        .arg(action)
+        .args(SUSPEND_TARGETS);
     cmd
-}
-
-fn running_as_root() -> bool {
-    fs::metadata("/proc/self")
-        .map(|meta| meta.uid() == 0)
-        .unwrap_or(false)
 }
 
 pub fn run_pristine_only(jobs: Vec<Job>, run_mode: RunMode, options: BackupOptions) -> Result<()> {
@@ -700,31 +717,6 @@ impl Drop for RemotePowerGuard {
     }
 }
 
-struct RemoteSuspendInhibitor {
-    child: Child,
-    remote_host: String,
-    remote_pid: u32,
-}
-
-impl Drop for RemoteSuspendInhibitor {
-    fn drop(&mut self) {
-        let mut release = Command::new("ssh");
-        release
-            .arg("-o")
-            .arg("BatchMode=yes")
-            .arg("-o")
-            .arg("ConnectTimeout=5")
-            .arg(&self.remote_host)
-            .arg(format!("kill {} >/dev/null 2>&1 || true", self.remote_pid))
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let _ = release.status();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
 pub fn wake_remote_job(job: &Job, run_mode: RunMode) -> Result<()> {
     if run_mode.dry_run {
         let Some((wake, _, host)) = wake_config(job) else {
@@ -909,6 +901,13 @@ fn wake_config<'a>(
 
 fn has_active_wake_config(job: &Job) -> bool {
     wake_config(job).is_some()
+}
+
+fn has_remote_suspend_guard_config(job: &Job) -> bool {
+    job.remote
+        .as_ref()
+        .is_some_and(|remote| remote.inhibit_suspend == Some(true))
+        && has_active_wake_config(job)
 }
 
 fn wake_target_description(wake: &crate::config::model::RemoteWakeOptions) -> String {
@@ -1305,104 +1304,6 @@ fn remote_dns_host(ssh_host: &str) -> &str {
     } else {
         ssh_host
     }
-}
-
-fn start_remote_suspend_inhibitor(
-    job: &Job,
-    run_mode: RunMode,
-) -> Result<Option<RemoteSuspendInhibitor>> {
-    let Some(remote_options) = &job.remote else {
-        return Ok(None);
-    };
-    if remote_options.wake.is_none() {
-        return Ok(None);
-    }
-    if remote_options.inhibit_suspend != Some(true) {
-        return Ok(None);
-    }
-    let Some(remote) = remote_ssh_source(&job.source) else {
-        return Ok(None);
-    };
-    let command = remote_inhibit_command(&job.name);
-    if run_mode.dry_run {
-        println!(
-            "dry-run: would inhibit suspend on {} for job {}: {}",
-            remote.host, job.name, command
-        );
-        return Ok(None);
-    }
-
-    let mut cmd = Command::new("ssh");
-    cmd.arg(&remote.host)
-        .arg(command)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    maybe_print_command(&cmd, run_mode);
-    let mut child = cmd.spawn().map_err(|err| {
-        TimevaultError::message(format!(
-            "remote suspend inhibitor for job {} on {}: {}",
-            job.name, remote.host, err
-        ))
-    })?;
-    let stdout = child.stdout.take().ok_or_else(|| {
-        TimevaultError::message(format!(
-            "remote suspend inhibitor for job {} on {} did not expose stdout",
-            job.name, remote.host
-        ))
-    })?;
-    let mut reader = BufReader::new(stdout);
-    let mut line = String::new();
-    if let Err(err) = reader.read_line(&mut line) {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(err.into());
-    }
-    let remote_pid = match line.trim().parse::<u32>() {
-        Ok(pid) => pid,
-        Err(_) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(TimevaultError::message(format!(
-                "remote suspend inhibitor for job {} on {} returned invalid pid {}",
-                job.name,
-                remote.host,
-                line.trim()
-            )));
-        }
-    };
-    if remote_pid == 0 {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(TimevaultError::message(format!(
-            "remote suspend inhibitor for job {} on {} returned invalid pid {}",
-            job.name, remote.host, remote_pid
-        )));
-    }
-    thread::sleep(StdDuration::from_millis(200));
-    if let Some(status) = child.try_wait()? {
-        return Err(TimevaultError::message(format!(
-            "remote suspend inhibitor for job {} on {} exited early with code {}",
-            job.name,
-            remote.host,
-            status.code().unwrap_or(1)
-        )));
-    }
-    Ok(Some(RemoteSuspendInhibitor {
-        child,
-        remote_host: remote.host,
-        remote_pid,
-    }))
-}
-
-fn remote_inhibit_command(job_name: &str) -> String {
-    let keepalive = "echo $$; trap 'kill \"$sleep_pid\" 2>/dev/null; exit 0' TERM INT HUP; \
-         while :; do sleep 2147483647 & sleep_pid=$!; wait \"$sleep_pid\"; done";
-    format!(
-        "systemd-inhibit --what=sleep --mode=block --who=timevault --why={} sh -c {}",
-        shell_quote(&format!("Timevault backup {}", job_name)),
-        shell_quote(keepalive)
-    )
 }
 
 fn job_script_path(job_name: &str, phase: JobScriptPhase) -> Option<PathBuf> {
@@ -1971,10 +1872,12 @@ mod tests {
         });
 
         assert!(has_active_wake_config(&remote_job));
+        assert!(has_remote_suspend_guard_config(&remote_job));
 
         let mut cascade_job = remote_job.clone();
         cascade_job.source = "/mnt/primary/test/current".to_string();
         assert!(!has_active_wake_config(&cascade_job));
+        assert!(!has_remote_suspend_guard_config(&cascade_job));
 
         let mut no_wake_job = job("root@example.com:/srv/data");
         no_wake_job.remote = Some(crate::config::model::RemoteJobOptions {
@@ -1982,6 +1885,16 @@ mod tests {
             wake: None,
         });
         assert!(!has_active_wake_config(&no_wake_job));
+        assert!(!has_remote_suspend_guard_config(&no_wake_job));
+
+        let mut wake_without_inhibit_job = remote_job.clone();
+        wake_without_inhibit_job
+            .remote
+            .as_mut()
+            .unwrap()
+            .inhibit_suspend = None;
+        assert!(has_active_wake_config(&wake_without_inhibit_job));
+        assert!(!has_remote_suspend_guard_config(&wake_without_inhibit_job));
     }
 
     #[test]
@@ -2013,20 +1926,6 @@ mod tests {
         assert_eq!(report.jobs[0].status, BackupJobStatus::Failed);
         assert_eq!(report.jobs[1].name, "next");
         assert_eq!(report.jobs[1].status, BackupJobStatus::Success);
-    }
-
-    #[test]
-    fn remote_inhibit_command_does_not_toggle_suspend_settings() {
-        let command = remote_inhibit_command("remote-primary");
-
-        assert!(command.contains("systemd-inhibit"));
-        assert!(command.contains("--what=sleep"));
-        assert!(command.contains("echo $$"));
-        assert!(command.contains("trap"));
-        assert!(command.contains("kill"));
-        assert!(!command.contains("systemctl"));
-        assert!(!command.contains("enable"));
-        assert!(!command.contains("disable"));
     }
 
     #[test]
