@@ -74,8 +74,9 @@ Remote power options are available for SSH-style sources:
 - `remote.inhibitSuspend`: If `true`, Timevault starts a remote `systemd-inhibit` process for the job and stops it when the job finishes. This requires `remote.wake`.
 - `remote.wake.mac`: MAC address to wake before the job using a native Wake-on-LAN UDP packet.
 - `remote.wake.host`: Optional host name to resolve and ping after wake. Defaults to the SSH host from `source`.
-- `remote.wake.broadcast`: Optional IPv4 broadcast target. If omitted, Timevault resolves the remote host name and uses the same `/24` subnet with the last octet set to `255`.
+- `remote.wake.broadcast`: Optional IPv4 broadcast target. If omitted, Timevault resolves the remote host name and uses the same `/24` subnet with the last octet set to `255`. If DNS lookup fails, Timevault sends the wake packet to all active local IPv4 interface broadcasts.
 - `remote.wake.port`: Optional Wake-on-LAN UDP port. Default: `9`.
+- `remote.wake.interface`: Optional local interface name used when falling back to active interface broadcasts.
 - `remote.wake.keepaliveSeconds`: Optional interval for repeating the Wake-on-LAN packet while the job runs.
 - `remote.wake.waitSeconds`: Optional time to wait for the host to respond to ping after wake. Default: `15`.
 - `remote.wake.suspendAfterBackup`: Optional boolean. If `true`, Timevault suspends the remote host after the job only when the host did not respond to ping before wake and Timevault woke it for the backup. Default: `false`.

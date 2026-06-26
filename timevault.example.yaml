@@ -77,6 +77,7 @@ jobs:
     #     mac: "aa:bb:cc:dd:ee:ff"
     #     host: "example.com"
     #     broadcast: "192.0.2.255"
+    #     interface: "eth0"
     #     port: 9
     #     keepaliveSeconds: 60
     #     waitSeconds: 15

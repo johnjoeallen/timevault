@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
+use std::ffi::CStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, ToSocketAddrs, UdpSocket};
@@ -588,7 +589,7 @@ fn run_remote_job_script(
 struct WakeContext {
     host: String,
     ssh_host: String,
-    target: SocketAddrV4,
+    targets: Vec<SocketAddrV4>,
     mac: String,
     keepalive_seconds: Option<u64>,
     wait_seconds: u64,
@@ -710,7 +711,7 @@ pub fn wake_remote_job(job: &Job, run_mode: RunMode) -> Result<()> {
         }
         return Ok(());
     }
-    send_wake_packet(&context.mac, context.target)?;
+    send_wake_packets(&context.mac, &context.targets)?;
     wait_for_ping(&context.host, context.wait_seconds)
 }
 
@@ -762,18 +763,18 @@ fn start_remote_power_guard(job: &Job, run_mode: RunMode) -> Result<Option<Remot
         return Ok(None);
     }
 
-    send_wake_packet(&context.mac, context.target)?;
+    send_wake_packets(&context.mac, &context.targets)?;
     wait_for_ping(&context.host, context.wait_seconds)?;
 
     let keepalive = if let Some(seconds) = context.keepalive_seconds {
         let (stop, receiver) = mpsc::channel();
         let mac = context.mac;
-        let target = context.target;
+        let targets = context.targets;
         let handle = thread::spawn(move || loop {
             match receiver.recv_timeout(StdDuration::from_secs(seconds)) {
                 Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
                 Err(RecvTimeoutError::Timeout) => {
-                    let _ = send_wake_packet(&mac, target);
+                    let _ = send_wake_packets(&mac, &targets);
                 }
             }
         });
@@ -797,11 +798,11 @@ fn wake_context(job: &Job) -> Result<Option<WakeContext>> {
     let Some((wake, remote, host)) = wake_config(job) else {
         return Ok(None);
     };
-    let target = wake_target(wake, &host)?;
+    let targets = wake_targets(wake, &host)?;
     Ok(Some(WakeContext {
         host: host.to_string(),
         ssh_host: remote.host,
-        target,
+        targets,
         mac: wake.mac.clone(),
         keepalive_seconds: wake.keepalive_seconds,
         wait_seconds: wake_wait_seconds(wake),
@@ -836,7 +837,10 @@ fn has_active_wake_config(job: &Job) -> bool {
 fn wake_target_description(wake: &crate::config::model::RemoteWakeOptions) -> String {
     match &wake.broadcast {
         Some(broadcast) => format!("{}:{}", broadcast, wake.port.unwrap_or(9)),
-        None => format!("DNS-inferred /24 broadcast:{}", wake.port.unwrap_or(9)),
+        None => format!(
+            "DNS-inferred /24 broadcast or active interface broadcasts:{}",
+            wake.port.unwrap_or(9)
+        ),
     }
 }
 
@@ -855,17 +859,31 @@ fn wake_host<'a>(
         .unwrap_or_else(|| remote_dns_host(&remote.host))
 }
 
-fn wake_target(
+fn wake_targets(
     wake: &crate::config::model::RemoteWakeOptions,
     dns_host: &str,
-) -> Result<SocketAddrV4> {
-    let broadcast = match &wake.broadcast {
-        Some(value) => value.parse::<Ipv4Addr>().map_err(|err| {
+) -> Result<Vec<SocketAddrV4>> {
+    let port = wake.port.unwrap_or(9);
+    if let Some(value) = &wake.broadcast {
+        let broadcast = value.parse::<Ipv4Addr>().map_err(|err| {
             TimevaultError::message(format!("remote.wake.broadcast {}: {}", value, err))
-        })?,
-        None => inferred_broadcast_for_host(dns_host)?,
-    };
-    Ok(SocketAddrV4::new(broadcast, wake.port.unwrap_or(9)))
+        })?;
+        return Ok(vec![SocketAddrV4::new(broadcast, port)]);
+    }
+
+    match inferred_broadcast_for_host(dns_host) {
+        Ok(broadcast) => Ok(vec![SocketAddrV4::new(broadcast, port)]),
+        Err(dns_err) => {
+            let targets = active_interface_broadcast_targets(wake.interface.as_deref(), port)?;
+            if targets.is_empty() {
+                return Err(TimevaultError::message(format!(
+                    "{}; no active IPv4 broadcast interfaces found",
+                    dns_err
+                )));
+            }
+            Ok(targets)
+        }
+    }
 }
 
 fn inferred_broadcast_for_host(host: &str) -> Result<Ipv4Addr> {
@@ -884,6 +902,84 @@ fn inferred_broadcast_for_host(host: &str) -> Result<Ipv4Addr> {
     let mut octets = ip.octets();
     octets[3] = 255;
     Ok(Ipv4Addr::from(octets))
+}
+
+fn active_interface_broadcast_targets(
+    interface: Option<&str>,
+    port: u16,
+) -> Result<Vec<SocketAddrV4>> {
+    let interface = interface.map(str::trim).filter(|value| !value.is_empty());
+    let broadcasts = active_interface_broadcasts(interface)?;
+    Ok(broadcasts
+        .into_iter()
+        .map(|broadcast| SocketAddrV4::new(broadcast, port))
+        .collect())
+}
+
+#[cfg(unix)]
+fn active_interface_broadcasts(interface: Option<&str>) -> Result<Vec<Ipv4Addr>> {
+    let mut addrs: *mut libc::ifaddrs = std::ptr::null_mut();
+    if unsafe { libc::getifaddrs(&mut addrs) } != 0 {
+        return Err(TimevaultError::message(format!(
+            "enumerate network interfaces: {}",
+            io::Error::last_os_error()
+        )));
+    }
+
+    let mut broadcasts = Vec::new();
+    let mut seen = HashSet::new();
+    let mut cursor = addrs;
+    while !cursor.is_null() {
+        let ifaddr = unsafe { &*cursor };
+        if !ifaddr.ifa_addr.is_null() && !ifaddr.ifa_ifu.is_null() {
+            let name = unsafe { CStr::from_ptr(ifaddr.ifa_name) }.to_string_lossy();
+            let flags = ifaddr.ifa_flags as libc::c_uint;
+            let is_active = flags & (libc::IFF_UP as libc::c_uint) != 0
+                && flags & (libc::IFF_RUNNING as libc::c_uint) != 0
+                && flags & (libc::IFF_LOOPBACK as libc::c_uint) == 0
+                && flags & (libc::IFF_BROADCAST as libc::c_uint) != 0;
+            let matches_interface = interface.map_or(true, |expected| expected == name);
+            if is_active && matches_interface {
+                let family = unsafe { (*ifaddr.ifa_addr).sa_family as libc::c_int };
+                if family == libc::AF_INET {
+                    let broadcast = unsafe {
+                        let sockaddr = &*(ifaddr.ifa_ifu as *const libc::sockaddr_in);
+                        Ipv4Addr::from(u32::from_be(sockaddr.sin_addr.s_addr))
+                    };
+                    if seen.insert(broadcast) {
+                        broadcasts.push(broadcast);
+                    }
+                }
+            }
+        }
+        cursor = ifaddr.ifa_next;
+    }
+
+    unsafe { libc::freeifaddrs(addrs) };
+    Ok(broadcasts)
+}
+
+#[cfg(not(unix))]
+fn active_interface_broadcasts(_interface: Option<&str>) -> Result<Vec<Ipv4Addr>> {
+    Err(TimevaultError::message(
+        "enumerate network interfaces: unsupported platform",
+    ))
+}
+
+fn send_wake_packets(mac: &str, targets: &[SocketAddrV4]) -> Result<()> {
+    let mut failures = Vec::new();
+    for target in targets {
+        if let Err(err) = send_wake_packet(mac, *target) {
+            failures.push(format!("{}: {}", target, err));
+        }
+    }
+    if failures.len() == targets.len() {
+        return Err(TimevaultError::message(format!(
+            "send wake packet failed for all targets: {}",
+            failures.join("; ")
+        )));
+    }
+    Ok(())
 }
 
 fn send_wake_packet(mac: &str, target: SocketAddrV4) -> Result<()> {
@@ -1544,6 +1640,25 @@ mod tests {
         assert_eq!(
             inferred_broadcast_for_host("127.0.0.1").expect("broadcast"),
             Ipv4Addr::new(127, 0, 0, 255)
+        );
+    }
+
+    #[test]
+    fn wake_targets_uses_explicit_configured_broadcast() {
+        let wake = crate::config::model::RemoteWakeOptions {
+            mac: "aa:bb:cc:dd:ee:ff".to_string(),
+            host: None,
+            broadcast: Some("192.0.2.255".to_string()),
+            port: Some(7),
+            interface: None,
+            keepalive_seconds: None,
+            wait_seconds: None,
+            suspend_after_backup: None,
+        };
+
+        assert_eq!(
+            wake_targets(&wake, "does-not-need-dns").expect("targets"),
+            vec![SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 255), 7)]
         );
     }
 
