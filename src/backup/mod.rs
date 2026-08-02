@@ -139,9 +139,13 @@ pub fn run_backup(
             Ok(job_report) => report.jobs.push(job_report),
             Err(err) => {
                 println!("job {} failed: {}", job.name, err);
-                report
-                    .jobs
-                    .push(failed_job_report(&job, disk_mount, &backup_day, run_mode));
+                report.jobs.push(failed_job_report(
+                    &job,
+                    disk_mount,
+                    &backup_day,
+                    run_mode,
+                    err.to_string(),
+                ));
             }
         }
     }
@@ -178,6 +182,7 @@ fn run_backup_job(
             status: BackupJobStatus::Skipped,
             attempts: 0,
             rsync_code: None,
+            failure_reason: None,
         });
     }
 
@@ -198,7 +203,7 @@ fn run_backup_job(
     let _suspend_guard = start_suspend_guard(job, run_mode)?;
 
     if let Some(script) = job_script_path(&job.name, JobScriptPhase::Pre) {
-        let script_rc = run_job_script(
+        let script_result = run_job_script(
             job,
             &script,
             JobScriptPhase::Pre,
@@ -207,10 +212,10 @@ fn run_backup_job(
             None,
             run_mode,
         )?;
-        if script_rc != 0 {
+        if script_result.exit_code != 0 {
             println!(
                 "pre script failed for job {} with exit code {}; skipping backup",
-                job.name, script_rc
+                job.name, script_result.exit_code
             );
             return Ok(BackupJobReport {
                 name: job.name.clone(),
@@ -221,10 +226,15 @@ fn run_backup_job(
                 status: BackupJobStatus::Failed,
                 attempts: 0,
                 rsync_code: None,
+                failure_reason: Some(script_failure_reason(
+                    "pre",
+                    script_result.exit_code,
+                    &script_result.stderr,
+                )),
             });
         }
     }
-    if let Some(script_rc) = run_remote_job_script(
+    if let Some(script_result) = run_remote_job_script(
         job,
         JobScriptPhase::Pre,
         &backup_dir,
@@ -232,10 +242,10 @@ fn run_backup_job(
         None,
         run_mode,
     )? {
-        if script_rc != 0 {
+        if script_result.exit_code != 0 {
             println!(
                 "remote pre script failed for job {} with exit code {}; skipping backup",
-                job.name, script_rc
+                job.name, script_result.exit_code
             );
             return Ok(BackupJobReport {
                 name: job.name.clone(),
@@ -246,6 +256,11 @@ fn run_backup_job(
                 status: BackupJobStatus::Failed,
                 attempts: 0,
                 rsync_code: None,
+                failure_reason: Some(script_failure_reason(
+                    "remote pre",
+                    script_result.exit_code,
+                    &script_result.stderr,
+                )),
             });
         }
     }
@@ -298,15 +313,18 @@ fn run_backup_job(
 
     let mut rc = 1;
     let mut attempts = 0;
+    let mut rsync_stderr = String::new();
     for attempt in 1..=3 {
         attempts = attempt;
-        rc = run_rsync(
+        let rsync_result = run_rsync(
             &job.source,
             &backup_dir,
             &excludes_file,
             rsync_extra,
             run_mode,
         )?;
+        rc = rsync_result.exit_code;
+        rsync_stderr = rsync_result.stderr;
         if rc == 0 || rc == 24 {
             break;
         }
@@ -319,6 +337,11 @@ fn run_backup_job(
         }
     }
     let rsync_ok = rc == 0 || rc == 24;
+    let mut failure_reason = if rsync_ok {
+        None
+    } else {
+        Some(rsync_failure_reason(rc, &rsync_stderr))
+    };
     if !rsync_ok {
         println!("rsync failed with exit code {}; current not updated", rc);
     }
@@ -334,7 +357,13 @@ fn run_backup_job(
                         println!("skip remove (safe-mode): {}", current_link.display());
                     }
                 } else {
-                    let _ = fs::remove_file(&current_link);
+                    fs::remove_file(&current_link).map_err(|err| {
+                        TimevaultError::message(format!(
+                            "remove current link {}: {}",
+                            current_link.display(),
+                            err
+                        ))
+                    })?;
                 }
             } else if meta.is_dir() {
                 println!(
@@ -347,12 +376,18 @@ fn run_backup_job(
             if run_mode.dry_run {
                 println!("dry-run: ln -s {} {}", backup_day, current_link.display());
             } else {
-                symlink(backup_day, &current_link)?;
+                symlink(backup_day, &current_link).map_err(|err| {
+                    TimevaultError::message(format!(
+                        "create current link {}: {}",
+                        current_link.display(),
+                        err
+                    ))
+                })?;
             }
         }
     }
     let mut status = status_for_rsync_code(rc);
-    if let Some(script_rc) = run_remote_job_script(
+    if let Some(script_result) = run_remote_job_script(
         job,
         JobScriptPhase::Post,
         &backup_dir,
@@ -360,16 +395,21 @@ fn run_backup_job(
         Some(rc),
         run_mode,
     )? {
-        if script_rc != 0 {
+        if script_result.exit_code != 0 {
             println!(
                 "remote post script failed for job {} with exit code {}",
-                job.name, script_rc
+                job.name, script_result.exit_code
             );
             status = BackupJobStatus::Failed;
+            failure_reason = Some(script_failure_reason(
+                "remote post",
+                script_result.exit_code,
+                &script_result.stderr,
+            ));
         }
     }
     if let Some(script) = job_script_path(&job.name, JobScriptPhase::Post) {
-        let script_rc = run_job_script(
+        let script_result = run_job_script(
             job,
             &script,
             JobScriptPhase::Post,
@@ -378,12 +418,17 @@ fn run_backup_job(
             Some(rc),
             run_mode,
         )?;
-        if script_rc != 0 {
+        if script_result.exit_code != 0 {
             println!(
                 "post script failed for job {} with exit code {}",
-                job.name, script_rc
+                job.name, script_result.exit_code
             );
             status = BackupJobStatus::Failed;
+            failure_reason = Some(script_failure_reason(
+                "post",
+                script_result.exit_code,
+                &script_result.stderr,
+            ));
         }
     }
     Ok(BackupJobReport {
@@ -395,6 +440,7 @@ fn run_backup_job(
         status,
         attempts,
         rsync_code: Some(rc),
+        failure_reason,
     })
 }
 
@@ -403,6 +449,7 @@ fn failed_job_report(
     disk_mount: &Path,
     backup_day: &str,
     run_mode: RunMode,
+    failure_reason: String,
 ) -> BackupJobReport {
     let destination = resolve_job_dest(job, disk_mount)
         .map(|dest| dest.join(backup_day).display().to_string())
@@ -420,6 +467,7 @@ fn failed_job_report(
         status: BackupJobStatus::Failed,
         attempts: 0,
         rsync_code: None,
+        failure_reason: Some(failure_reason),
     }
 }
 
@@ -427,6 +475,25 @@ fn status_for_rsync_code(rc: i32) -> BackupJobStatus {
     match rc {
         0 | 24 => BackupJobStatus::Success,
         _ => BackupJobStatus::Failed,
+    }
+}
+
+fn rsync_failure_reason(exit_code: i32, stderr: &str) -> String {
+    let stderr = stderr.split_whitespace().collect::<Vec<_>>().join(" ");
+    if stderr.is_empty() {
+        format!("rsync failed with exit code {}", exit_code)
+    } else {
+        format!("rsync failed with exit code {}: {}", exit_code, stderr)
+    }
+}
+
+fn script_failure_reason(kind: &str, exit_code: i32, stderr: &str) -> String {
+    let detail = stderr.split_whitespace().collect::<Vec<_>>().join(" ");
+    let summary = format!("{} script exited with code {}", kind, exit_code);
+    if detail.is_empty() {
+        summary
+    } else {
+        format!("{}: {}", summary, detail)
     }
 }
 
@@ -574,7 +641,7 @@ fn run_job_script(
     backup_day: &str,
     rsync_code: Option<i32>,
     run_mode: RunMode,
-) -> Result<i32> {
+) -> Result<ScriptResult> {
     let mut cmd = Command::new("/bin/sh");
     cmd.arg(script)
         .env("TIMEVAULT_JOB_NAME", &job.name)
@@ -592,10 +659,13 @@ fn run_job_script(
             job.name,
             script.display()
         );
-        return Ok(0);
+        return Ok(ScriptResult {
+            exit_code: 0,
+            stderr: String::new(),
+        });
     }
     maybe_print_command(&cmd, run_mode);
-    let status = cmd.status().map_err(|e| {
+    let output = cmd.output().map_err(|e| {
         TimevaultError::message(format!(
             "{} script for job {} ({}): {}",
             phase.as_str(),
@@ -604,7 +674,17 @@ fn run_job_script(
             e
         ))
     })?;
-    Ok(status.code().unwrap_or(1))
+    io::stdout().write_all(&output.stdout)?;
+    io::stderr().write_all(&output.stderr)?;
+    Ok(ScriptResult {
+        exit_code: output.status.code().unwrap_or(1),
+        stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+    })
+}
+
+struct ScriptResult {
+    exit_code: i32,
+    stderr: String,
 }
 
 fn run_remote_job_script(
@@ -614,7 +694,7 @@ fn run_remote_job_script(
     backup_day: &str,
     rsync_code: Option<i32>,
     run_mode: RunMode,
-) -> Result<Option<i32>> {
+) -> Result<Option<ScriptResult>> {
     let Some(remote) = remote_ssh_source(&job.source) else {
         return Ok(None);
     };
@@ -627,7 +707,10 @@ fn run_remote_job_script(
             remote.host,
             script
         );
-        return Ok(Some(0));
+        return Ok(Some(ScriptResult {
+            exit_code: 0,
+            stderr: String::new(),
+        }));
     }
 
     let command = remote_script_command(
@@ -642,7 +725,7 @@ fn run_remote_job_script(
     let mut cmd = Command::new("ssh");
     cmd.arg(&remote.host).arg(command);
     maybe_print_command(&cmd, run_mode);
-    let status = cmd.status().map_err(|e| {
+    let output = cmd.output().map_err(|e| {
         TimevaultError::message(format!(
             "remote {} script for job {} ({}:{}): {}",
             phase.as_str(),
@@ -652,7 +735,12 @@ fn run_remote_job_script(
             e
         ))
     })?;
-    Ok(Some(status.code().unwrap_or(1)))
+    io::stdout().write_all(&output.stdout)?;
+    io::stderr().write_all(&output.stderr)?;
+    Ok(Some(ScriptResult {
+        exit_code: output.status.code().unwrap_or(1),
+        stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+    }))
 }
 
 struct WakeContext {
@@ -2015,6 +2103,26 @@ mod tests {
     }
 
     #[test]
+    fn rsync_failure_reason_includes_stderr() {
+        assert_eq!(
+            rsync_failure_reason(11, "rsync: write failed: No space left on device\n"),
+            "rsync failed with exit code 11: rsync: write failed: No space left on device"
+        );
+    }
+
+    #[test]
+    fn script_failure_reason_includes_stderr() {
+        assert_eq!(
+            script_failure_reason(
+                "remote pre",
+                255,
+                "ssh: connect to host mail.moyville.net port 22: Connection timed out\n",
+            ),
+            "remote pre script exited with code 255: ssh: connect to host mail.moyville.net port 22: Connection timed out"
+        );
+    }
+
+    #[test]
     fn dry_run_job_script_does_not_execute() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let script = tmp.path().join("script.sh");
@@ -2037,7 +2145,7 @@ mod tests {
         )
         .expect("script");
 
-        assert_eq!(rc, 0);
+        assert_eq!(rc.exit_code, 0);
         assert!(!marker.exists());
     }
 
@@ -2071,7 +2179,7 @@ mod tests {
         )
         .expect("script");
 
-        assert_eq!(rc, 0);
+        assert_eq!(rc.exit_code, 0);
         assert_eq!(
             fs::read_to_string(output).expect("read output"),
             format!("test|/source|{}|20260101|post|24", tmp.path().display())

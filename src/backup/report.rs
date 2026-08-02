@@ -25,6 +25,7 @@ pub struct BackupJobReport {
     pub status: BackupJobStatus,
     pub attempts: usize,
     pub rsync_code: Option<i32>,
+    pub failure_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,15 +83,16 @@ pub fn render_markdown(reports: &[BackupRunReport]) -> String {
             report.finished_at.format("%Y-%m-%d %H:%M:%S %Z")
         ));
         body.push_str(
-            "| Job | Name | Status | Rsync | Attempts | Snapshot | Source | Destination |\n",
+            "| Job | Name | Status | Reason | Rsync | Attempts | Snapshot | Source | Destination |\n",
         );
-        body.push_str("| --- | --- | --- | ---: | ---: | --- | --- | --- |\n");
+        body.push_str("| --- | --- | --- | --- | ---: | ---: | --- | --- | --- |\n");
         for job in &report.jobs {
             body.push_str(&format!(
-                "| {} | {} | {} | {} | {} | {} | `{}` | `{}` |\n",
+                "| {} | {} | {} | {} | {} | {} | {} | `{}` | `{}` |\n",
                 escape_markdown(job_display_name(job)),
                 escape_markdown(&job.name),
                 job.status.as_str(),
+                escape_markdown(job.failure_reason.as_deref().unwrap_or("-")),
                 job.rsync_code
                     .map(|code| code.to_string())
                     .unwrap_or_else(|| "-".to_string()),
@@ -184,6 +186,7 @@ pub fn render_html(reports: &[BackupRunReport]) -> String {
             "Job",
             "Name",
             "Status",
+            "Reason",
             "Rsync",
             "Attempts",
             "Snapshot",
@@ -202,6 +205,7 @@ pub fn render_html(reports: &[BackupRunReport]) -> String {
             body.push_str(&table_cell(job_display_name(job)));
             body.push_str(&table_cell(&job.name));
             body.push_str(&status_cell(job.status));
+            body.push_str(&table_cell(job.failure_reason.as_deref().unwrap_or("-")));
             body.push_str(&table_cell(
                 &job.rsync_code
                     .map(|code| code.to_string())
@@ -500,6 +504,7 @@ mod tests {
                 status: BackupJobStatus::Success,
                 attempts: 1,
                 rsync_code: Some(0),
+                failure_reason: None,
             }],
         }]);
 
@@ -511,6 +516,31 @@ mod tests {
         assert!(html.contains("background:#0f766e"));
         assert!(html.contains("background:#dcfce7"));
         assert!(html.contains("<table"));
+    }
+
+    #[test]
+    fn reports_include_failure_reasons() {
+        let now = Local::now();
+        let report = BackupRunReport {
+            disk_id: "disk".to_string(),
+            mountpoint: "/mnt/backup".to_string(),
+            started_at: now,
+            finished_at: now,
+            jobs: vec![BackupJobReport {
+                name: "root".to_string(),
+                description: None,
+                source: "/source".to_string(),
+                destination: "/dest".to_string(),
+                backup_day: "20260601".to_string(),
+                status: BackupJobStatus::Failed,
+                attempts: 3,
+                rsync_code: Some(11),
+                failure_reason: Some("rsync failed: No space left on device".to_string()),
+            }],
+        };
+
+        assert!(render_markdown(&[report.clone()]).contains("No space left on device"));
+        assert!(render_html(&[report]).contains("No space left on device"));
     }
 
     #[test]

@@ -1,8 +1,15 @@
+use std::io::{self, Write};
 use std::path::Path;
+use std::process::{Command, Stdio};
 
-use crate::error::Result;
+use crate::error::{Result, TimevaultError};
 use crate::types::RunMode;
-use crate::util::command::run_nice_ionice;
+use crate::util::command::maybe_print_command;
+
+pub struct RsyncResult {
+    pub exit_code: i32,
+    pub stderr: String,
+}
 
 pub fn run_rsync(
     source: &str,
@@ -10,7 +17,7 @@ pub fn run_rsync(
     excludes_file: &Path,
     extra: &[String],
     run_mode: RunMode,
-) -> Result<i32> {
+) -> Result<RsyncResult> {
     let source = normalize_rsync_source(source);
     let backup_dir = ensure_trailing_slash(&backup_dir.to_string_lossy());
     let mut args = vec![
@@ -26,7 +33,36 @@ pub fn run_rsync(
     args.extend(extra.iter().cloned());
     args.push(source);
     args.push(backup_dir);
-    run_nice_ionice(&args, run_mode)
+    let mut cmd = Command::new("nice");
+    cmd.arg("-n")
+        .arg("19")
+        .arg("ionice")
+        .arg("-c")
+        .arg("3")
+        .arg("-n7");
+    cmd.args(&args);
+
+    if run_mode.dry_run {
+        maybe_print_command(&cmd, run_mode);
+        return Ok(RsyncResult {
+            exit_code: 0,
+            stderr: String::new(),
+        });
+    }
+
+    maybe_print_command(&cmd, run_mode);
+    let output = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|err| TimevaultError::message(format!("rsync: {}", err)))?;
+    io::stdout().write_all(&output.stdout)?;
+    io::stderr().write_all(&output.stderr)?;
+
+    Ok(RsyncResult {
+        exit_code: output.status.code().unwrap_or(1),
+        stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+    })
 }
 
 fn normalize_rsync_source(source: &str) -> String {
