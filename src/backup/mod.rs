@@ -199,7 +199,19 @@ fn run_backup_job(
         println!("  excludes: {}", job.excludes.len());
     }
 
-    let _remote_power_guard = start_remote_power_guard(job, run_mode)?;
+    let mut remote_power_guard = match start_remote_power_guard(job, run_mode) {
+        Ok(guard) => guard,
+        Err(err) if wake_offline_if_unreachable(job) => {
+            println!("job {} offline: {}", job.name, err);
+            return Ok(offline_job_report(
+                job,
+                disk_mount,
+                backup_day,
+                err.to_string(),
+            ));
+        }
+        Err(err) => return Err(err),
+    };
     let _suspend_guard = start_suspend_guard(job, run_mode)?;
 
     if let Some(script) = job_script_path(&job.name, JobScriptPhase::Pre) {
@@ -431,6 +443,11 @@ fn run_backup_job(
             ));
         }
     }
+    if status != BackupJobStatus::Failed {
+        if let Some(guard) = remote_power_guard.as_mut() {
+            guard.backup_completed = true;
+        }
+    }
     Ok(BackupJobReport {
         name: job.name.clone(),
         description: job.description.clone(),
@@ -468,6 +485,25 @@ fn failed_job_report(
         attempts: 0,
         rsync_code: None,
         failure_reason: Some(failure_reason),
+    }
+}
+
+fn offline_job_report(
+    job: &Job,
+    disk_mount: &Path,
+    backup_day: &str,
+    reason: String,
+) -> BackupJobReport {
+    BackupJobReport {
+        name: job.name.clone(),
+        description: job.description.clone(),
+        source: job.source.clone(),
+        destination: disk_mount.display().to_string(),
+        backup_day: backup_day.to_string(),
+        status: BackupJobStatus::Offline,
+        attempts: 0,
+        rsync_code: None,
+        failure_reason: Some(reason),
     }
 }
 
@@ -751,6 +787,7 @@ struct WakeContext {
     keepalive_seconds: Option<u64>,
     wait_seconds: u64,
     suspend_after_backup: bool,
+    shutdown_after_backup: bool,
 }
 
 struct WakeKeepalive {
@@ -770,6 +807,8 @@ impl Drop for WakeKeepalive {
 struct RemotePowerGuard {
     keepalive: Option<WakeKeepalive>,
     suspend_after_backup: bool,
+    shutdown_after_backup: bool,
+    backup_completed: bool,
     remote_host: String,
     job_name: String,
 }
@@ -777,7 +816,7 @@ struct RemotePowerGuard {
 impl Drop for RemotePowerGuard {
     fn drop(&mut self) {
         drop(self.keepalive.take());
-        if !self.suspend_after_backup {
+        if !self.backup_completed || (!self.suspend_after_backup && !self.shutdown_after_backup) {
             return;
         }
         let mut cmd = Command::new("ssh");
@@ -786,21 +825,37 @@ impl Drop for RemotePowerGuard {
             .arg("-o")
             .arg("ConnectTimeout=5")
             .arg(&self.remote_host)
-            .arg("systemctl suspend")
+            .arg(if self.shutdown_after_backup {
+                "systemctl poweroff"
+            } else {
+                "systemctl suspend"
+            })
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         match cmd.status() {
             Ok(status) if status.success() => {}
             Ok(status) => eprintln!(
-                "failed to suspend remote host {} after job {}: ssh exited with code {}",
+                "failed to {} remote host {} after job {}: ssh exited with code {}",
+                if self.shutdown_after_backup {
+                    "power off"
+                } else {
+                    "suspend"
+                },
                 self.remote_host,
                 self.job_name,
                 status.code().unwrap_or(1)
             ),
             Err(err) => eprintln!(
-                "failed to suspend remote host {} after job {}: {}",
-                self.remote_host, self.job_name, err
+                "failed to {} remote host {} after job {}: {}",
+                if self.shutdown_after_backup {
+                    "power off"
+                } else {
+                    "suspend"
+                },
+                self.remote_host,
+                self.job_name,
+                err
             ),
         }
     }
@@ -886,9 +941,14 @@ fn start_remote_power_guard(job: &Job, run_mode: RunMode) -> Result<Option<Remot
                 job.name, seconds
             );
         }
-        if wake.suspend_after_backup == Some(true) {
+        if wake.suspend_after_backup == Some(true) || wake.shutdown_after_backup == Some(true) {
             println!(
-                "dry-run: would suspend remote host after job {} if it was woken for the backup",
+                "dry-run: would {} remote host after job {} if it was woken for the backup",
+                if wake.shutdown_after_backup == Some(true) {
+                    "power off"
+                } else {
+                    "suspend"
+                },
                 job.name
             );
         }
@@ -947,6 +1007,8 @@ fn start_remote_power_guard(job: &Job, run_mode: RunMode) -> Result<Option<Remot
     Ok(Some(RemotePowerGuard {
         keepalive,
         suspend_after_backup: context.suspend_after_backup,
+        shutdown_after_backup: context.shutdown_after_backup,
+        backup_completed: false,
         remote_host: context.ssh_host,
         job_name: job.name.clone(),
     }))
@@ -965,7 +1027,14 @@ fn wake_context(job: &Job) -> Result<Option<WakeContext>> {
         keepalive_seconds: wake.keepalive_seconds,
         wait_seconds: wake_wait_seconds(wake),
         suspend_after_backup: wake.suspend_after_backup.unwrap_or(false),
+        shutdown_after_backup: wake.shutdown_after_backup.unwrap_or(false),
     }))
+}
+
+fn wake_offline_if_unreachable(job: &Job) -> bool {
+    wake_config(job)
+        .and_then(|(wake, _, _)| wake.offline_if_unreachable)
+        .unwrap_or(false)
 }
 
 fn wake_config<'a>(
@@ -1300,44 +1369,44 @@ fn resolve_host_ipv4_with_timeout(
     loop {
         if let Some(status) = child.try_wait()? {
             if !status.success() {
-                if run_mode.verbose {
-                    println!(
-                        "wake host {} DNS lookup failed with exit code {}",
-                        host,
-                        status.code().unwrap_or(1)
-                    );
-                }
-                return Ok(Vec::new());
+                return Err(TimevaultError::message(format!(
+                    "wake host {} DNS lookup failed with exit code {}",
+                    host,
+                    status.code().unwrap_or(1)
+                )));
             }
             let mut output = String::new();
             if let Some(mut stdout) = child.stdout.take() {
                 stdout.read_to_string(&mut output)?;
             }
             let addresses = parse_getent_ahostsv4(&output);
+            if addresses.is_empty() {
+                return Err(TimevaultError::message(format!(
+                    "wake host {} DNS lookup returned no IPv4 addresses",
+                    host
+                )));
+            }
             if run_mode.verbose {
-                if addresses.is_empty() {
-                    println!("wake host {} DNS lookup returned no IPv4 addresses", host);
-                } else {
-                    println!(
-                        "wake host {} resolved to {}",
-                        host,
-                        addresses
-                            .iter()
-                            .map(Ipv4Addr::to_string)
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    );
-                }
+                println!(
+                    "wake host {} resolved to {}",
+                    host,
+                    addresses
+                        .iter()
+                        .map(Ipv4Addr::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
             }
             return Ok(addresses);
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            if run_mode.verbose {
-                println!("wake host {} DNS lookup timed out", host);
-            }
-            return Ok(Vec::new());
+            return Err(TimevaultError::message(format!(
+                "wake host {} DNS lookup timed out after {} seconds",
+                host,
+                timeout.as_secs()
+            )));
         }
         thread::sleep(StdDuration::from_millis(50));
     }
@@ -1895,6 +1964,8 @@ mod tests {
             keepalive_seconds: None,
             wait_seconds: None,
             suspend_after_backup: None,
+            shutdown_after_backup: None,
+            offline_if_unreachable: None,
         };
 
         assert_eq!(
@@ -1938,6 +2009,8 @@ mod tests {
             keepalive_seconds: None,
             wait_seconds: None,
             suspend_after_backup: None,
+            shutdown_after_backup: None,
+            offline_if_unreachable: None,
         };
 
         assert_eq!(wake_host(&wake, &remote), "actual-host");
@@ -1957,6 +2030,8 @@ mod tests {
                 keepalive_seconds: None,
                 wait_seconds: None,
                 suspend_after_backup: None,
+                shutdown_after_backup: None,
+                offline_if_unreachable: None,
             }),
         });
 

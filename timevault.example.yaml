@@ -82,4 +82,6 @@ jobs:
     #     keepaliveSeconds: 60
     #     waitSeconds: 15
     #     suspendAfterBackup: true
+    #     shutdownAfterBackup: true # power off after a successful backup if WOL was needed
+    #     offlineIfUnreachable: true # report offline instead of failing when WOL times out
     excludes: []

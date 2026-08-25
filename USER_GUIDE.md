@@ -80,9 +80,11 @@ Remote power options are available for SSH-style sources:
 - `remote.wake.keepaliveSeconds`: Optional interval for repeating the Wake-on-LAN packet while the job runs.
 - `remote.wake.waitSeconds`: Optional time to wait for the host to respond to ping after wake. Timevault repeats the Wake-on-LAN packet between readiness checks during this wait. Default: `15`.
 - `remote.wake.suspendAfterBackup`: Optional boolean. If `true`, Timevault suspends the remote host after the job only when the host did not respond to ping before wake and Timevault woke it for the backup. Default: `false`.
+- `remote.wake.shutdownAfterBackup`: Optional boolean. If `true`, Timevault powers off the remote host (`systemctl poweroff`) after a successful backup when it had to be woken. Default: `false`. This takes precedence over `suspendAfterBackup` if both are enabled.
+- `remote.wake.offlineIfUnreachable`: Optional boolean. If `true`, a host that still does not respond after the configured WOL wait is reported as `offline` and skipped rather than reported as a failed backup. Default: `false`.
 
 `remote.inhibitSuspend` only unmasks suspend targets when Timevault masked them for that job.
-Timevault does not enable suspend after a backup if it was already disabled before the backup. If `remote.wake.suspendAfterBackup` is enabled, the final suspend is a separate remote `systemctl suspend` call.
+Timevault does not enable suspend after a backup if it was already disabled before the backup. If `remote.wake.suspendAfterBackup` is enabled, the final suspend is a separate remote `systemctl suspend` call; `shutdownAfterBackup` uses `systemctl poweroff` instead.
 
 Suspend ownership rule:
 
@@ -399,7 +401,7 @@ Delete the matching file to force a full regeneration on the next run.
 ## Remote backups
 Remote job sources require passwordless SSH (keys configured for the remote host), and the remote host must have rsync installed.
 When `--exclude-pristine` is enabled for a `host:/...` source, Timevault uses SSH to inspect the remote host's package database and file hashes, then stores that host's pristine cache separately on the local machine. Remote pristine analysis supports SSH-style rsync sources, not `rsync://` daemon sources.
-Remote power options require `systemctl` over SSH on the remote host for suspend handling and `ping` on the Timevault host for wake readiness checks.
+Remote power options require `systemctl` over SSH on the remote host for suspend/shutdown handling and `ping` on the Timevault host for wake readiness checks.
 
 ## Notes
 - Backup disks must contain `/.timevault` and match the configured `diskId` and `fsUuid`.

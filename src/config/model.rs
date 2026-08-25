@@ -105,6 +105,20 @@ pub struct RemoteWakeOptions {
         skip_serializing_if = "Option::is_none"
     )]
     pub suspend_after_backup: Option<bool>,
+    /// Power off the remote host after a successful backup when it had to be woken.
+    #[serde(
+        default,
+        rename = "shutdownAfterBackup",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub shutdown_after_backup: Option<bool>,
+    /// Treat a host that does not answer after WOL as offline and skip its backup.
+    #[serde(
+        default,
+        rename = "offlineIfUnreachable",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub offline_if_unreachable: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

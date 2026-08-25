@@ -15,5 +15,14 @@ pub fn run_wake(config_path: &Path, args: WakeArgs, run_mode: RunMode) -> Result
         )));
     };
     println!("wake job: {}", job.name);
-    wake_remote_job(job, run_mode)
+    match wake_remote_job(job, run_mode) {
+        Ok(()) => {
+            println!("wake succeeded: job {} completed", job.name);
+            Ok(())
+        }
+        Err(err) => Err(TimevaultError::message(format!(
+            "wake failed: job {}: {}",
+            job.name, err
+        ))),
+    }
 }

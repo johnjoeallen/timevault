@@ -283,6 +283,8 @@ jobs:
         keepaliveSeconds: 60
         waitSeconds: 15
         suspendAfterBackup: true
+        shutdownAfterBackup: true
+        offlineIfUnreachable: true
 "#;
         file.write_all(yaml.as_bytes()).expect("write");
         let cfg = load_config(file.path().to_string_lossy().as_ref()).expect("load");
@@ -296,6 +298,8 @@ jobs:
         assert_eq!(wake.keepalive_seconds, Some(60));
         assert_eq!(wake.wait_seconds, Some(15));
         assert_eq!(wake.suspend_after_backup, Some(true));
+        assert_eq!(wake.shutdown_after_backup, Some(true));
+        assert_eq!(wake.offline_if_unreachable, Some(true));
     }
 
     #[test]

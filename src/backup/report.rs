@@ -33,6 +33,7 @@ pub enum BackupJobStatus {
     Success,
     Partial,
     Failed,
+    Offline,
     Skipped,
 }
 
@@ -42,6 +43,7 @@ impl BackupJobStatus {
             BackupJobStatus::Success => "success",
             BackupJobStatus::Partial => "partial",
             BackupJobStatus::Failed => "failed",
+            BackupJobStatus::Offline => "offline",
             BackupJobStatus::Skipped => "skipped",
         }
     }
@@ -346,6 +348,7 @@ fn status_cell(status: BackupJobStatus) -> String {
         BackupJobStatus::Success => ("#dcfce7", "#166534"),
         BackupJobStatus::Partial => ("#ffedd5", "#9a3412"),
         BackupJobStatus::Failed => ("#fee2e2", "#991b1b"),
+        BackupJobStatus::Offline => ("#fef3c7", "#92400e"),
         BackupJobStatus::Skipped => ("#e2e8f0", "#334155"),
     };
     format!(
