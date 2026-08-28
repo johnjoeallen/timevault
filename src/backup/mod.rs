@@ -36,8 +36,10 @@ const SUSPEND_TARGETS: [&str; 4] = [
     "hybrid-sleep.target",
 ];
 const PING_ATTEMPT_TIMEOUT: StdDuration = StdDuration::from_secs(2);
-const DEFAULT_SSH_RETRY_ATTEMPTS: usize = 3;
-const DEFAULT_SSH_RETRY_BACKOFF_SECONDS: u64 = 5;
+// Six probes with linear 10-second backoff wait 150 seconds between attempts.
+// Including probe time, this gives a waking host roughly three minutes to become ready.
+const DEFAULT_REMOTE_PROBE_ATTEMPTS: usize = 6;
+const DEFAULT_REMOTE_PROBE_BACKOFF_SECONDS: u64 = 10;
 
 #[derive(Debug, Clone, Copy)]
 pub struct BackupOptions {
@@ -1047,16 +1049,16 @@ fn wake_context(job: &Job) -> Result<Option<WakeContext>> {
         keepalive_seconds: wake.keepalive_seconds,
         ping_probe_attempts: wake
             .ping_probe_attempts
-            .unwrap_or(DEFAULT_SSH_RETRY_ATTEMPTS),
+            .unwrap_or(DEFAULT_REMOTE_PROBE_ATTEMPTS),
         ping_probe_backoff_seconds: wake
             .ping_probe_backoff_seconds
-            .unwrap_or(DEFAULT_SSH_RETRY_BACKOFF_SECONDS),
+            .unwrap_or(DEFAULT_REMOTE_PROBE_BACKOFF_SECONDS),
         ssh_probe_attempts: wake
             .ssh_probe_attempts
-            .unwrap_or(DEFAULT_SSH_RETRY_ATTEMPTS),
+            .unwrap_or(DEFAULT_REMOTE_PROBE_ATTEMPTS),
         ssh_probe_backoff_seconds: wake
             .ssh_probe_backoff_seconds
-            .unwrap_or(DEFAULT_SSH_RETRY_BACKOFF_SECONDS),
+            .unwrap_or(DEFAULT_REMOTE_PROBE_BACKOFF_SECONDS),
         suspend_after_backup: wake.suspend_after_backup.unwrap_or(false),
         shutdown_after_backup: wake.shutdown_after_backup.unwrap_or(false),
     }))
@@ -1112,18 +1114,18 @@ fn wake_target_description(wake: &crate::config::model::RemoteWakeOptions) -> St
 fn ping_probe_options(wake: &crate::config::model::RemoteWakeOptions) -> (usize, u64) {
     (
         wake.ping_probe_attempts
-            .unwrap_or(DEFAULT_SSH_RETRY_ATTEMPTS),
+            .unwrap_or(DEFAULT_REMOTE_PROBE_ATTEMPTS),
         wake.ping_probe_backoff_seconds
-            .unwrap_or(DEFAULT_SSH_RETRY_BACKOFF_SECONDS),
+            .unwrap_or(DEFAULT_REMOTE_PROBE_BACKOFF_SECONDS),
     )
 }
 
 fn ssh_probe_options(wake: &crate::config::model::RemoteWakeOptions) -> (usize, u64) {
     (
         wake.ssh_probe_attempts
-            .unwrap_or(DEFAULT_SSH_RETRY_ATTEMPTS),
+            .unwrap_or(DEFAULT_REMOTE_PROBE_ATTEMPTS),
         wake.ssh_probe_backoff_seconds
-            .unwrap_or(DEFAULT_SSH_RETRY_BACKOFF_SECONDS),
+            .unwrap_or(DEFAULT_REMOTE_PROBE_BACKOFF_SECONDS),
     )
 }
 
@@ -2132,8 +2134,8 @@ mod tests {
             .as_ref()
             .and_then(|remote| remote.wake.as_ref())
             .expect("wake options");
-        assert_eq!(ping_probe_options(wake), (3, 5));
-        assert_eq!(ssh_probe_options(wake), (3, 5));
+        assert_eq!(ping_probe_options(wake), (6, 10));
+        assert_eq!(ssh_probe_options(wake), (6, 10));
 
         let wake = remote_job
             .remote
