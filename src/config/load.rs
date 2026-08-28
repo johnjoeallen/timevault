@@ -127,6 +127,20 @@ fn parse_runtime(cfg: Config) -> Result<RuntimeConfig> {
                     ))
                     .into());
                 }
+                if matches!(wake.ping_probe_attempts, Some(0)) {
+                    return Err(ConfigError::Invalid(format!(
+                        "job {}: remote.wake.pingProbeAttempts must be greater than zero",
+                        job.name
+                    ))
+                    .into());
+                }
+                if matches!(wake.ssh_probe_attempts, Some(0)) {
+                    return Err(ConfigError::Invalid(format!(
+                        "job {}: remote.wake.sshProbeAttempts must be greater than zero",
+                        job.name
+                    ))
+                    .into());
+                }
             }
         }
         if job.name.trim().is_empty() {
@@ -282,6 +296,10 @@ jobs:
         port: 9
         keepaliveSeconds: 60
         waitSeconds: 15
+        pingProbeAttempts: 4
+        pingProbeBackoffSeconds: 10
+        sshProbeAttempts: 5
+        sshProbeBackoffSeconds: 2
         suspendAfterBackup: true
         shutdownAfterBackup: true
         offlineIfUnreachable: true
@@ -297,6 +315,10 @@ jobs:
         assert_eq!(wake.port, Some(9));
         assert_eq!(wake.keepalive_seconds, Some(60));
         assert_eq!(wake.wait_seconds, Some(15));
+        assert_eq!(wake.ping_probe_attempts, Some(4));
+        assert_eq!(wake.ping_probe_backoff_seconds, Some(10));
+        assert_eq!(wake.ssh_probe_attempts, Some(5));
+        assert_eq!(wake.ssh_probe_backoff_seconds, Some(2));
         assert_eq!(wake.suspend_after_backup, Some(true));
         assert_eq!(wake.shutdown_after_backup, Some(true));
         assert_eq!(wake.offline_if_unreachable, Some(true));
@@ -342,6 +364,29 @@ jobs:
         assert!(err
             .to_string()
             .contains("remote.inhibitSuspend requires remote.wake"));
+    }
+
+    #[test]
+    fn remote_ping_probe_attempts_must_be_positive() {
+        let mut file = NamedTempFile::new().expect("tempfile");
+        let yaml = r#"
+backupDisks:
+  - diskId: "primary"
+    fsUuid: "uuid-1"
+jobs:
+  - name: "remote"
+    source: "root@example.com:/"
+    copies: 2
+    remote:
+      wake:
+        mac: "aa:bb:cc:dd:ee:ff"
+        pingProbeAttempts: 0
+"#;
+        file.write_all(yaml.as_bytes()).expect("write");
+        let err = load_config(file.path().to_string_lossy().as_ref()).expect_err("invalid config");
+        assert!(err
+            .to_string()
+            .contains("remote.wake.pingProbeAttempts must be greater than zero"));
     }
 
     #[test]

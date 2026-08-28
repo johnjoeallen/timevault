@@ -101,6 +101,30 @@ pub struct RemoteWakeOptions {
     pub wait_seconds: Option<u64>,
     #[serde(
         default,
+        rename = "pingProbeAttempts",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub ping_probe_attempts: Option<usize>,
+    #[serde(
+        default,
+        rename = "pingProbeBackoffSeconds",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub ping_probe_backoff_seconds: Option<u64>,
+    #[serde(
+        default,
+        rename = "sshProbeAttempts",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub ssh_probe_attempts: Option<usize>,
+    #[serde(
+        default,
+        rename = "sshProbeBackoffSeconds",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub ssh_probe_backoff_seconds: Option<u64>,
+    #[serde(
+        default,
         rename = "suspendAfterBackup",
         skip_serializing_if = "Option::is_none"
     )]

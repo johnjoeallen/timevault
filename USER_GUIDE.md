@@ -78,17 +78,21 @@ Remote power options are available for SSH-style sources:
 - `remote.wake.port`: Optional Wake-on-LAN UDP port. Default: `9`.
 - `remote.wake.interface`: Optional local interface name used when falling back to active interface broadcasts.
 - `remote.wake.keepaliveSeconds`: Optional interval for repeating the Wake-on-LAN packet while the job runs.
-- `remote.wake.waitSeconds`: Optional time to wait for the host to respond to ping after wake. Timevault repeats the Wake-on-LAN packet between readiness checks during this wait. Default: `15`.
+- `remote.wake.waitSeconds`: Legacy maximum wait setting for wake readiness. It is retained for configuration compatibility; use the probe options below for new configurations.
+- `remote.wake.pingProbeAttempts`: Optional number of ping readiness attempts after WOL. Default: `3`.
+- `remote.wake.pingProbeBackoffSeconds`: Optional base delay between ping readiness attempts. The delay increases by this amount for each retry (by default, 5 seconds then 10 seconds). Default: `5`.
+- `remote.wake.sshProbeAttempts`: Optional number of `ssh <host> echo` readiness attempts after ping succeeds. Default: `3`.
+- `remote.wake.sshProbeBackoffSeconds`: Optional base delay between SSH readiness attempts. The delay increases by this amount for each retry (by default, 5 seconds then 10 seconds). Default: `5`.
 - `remote.wake.suspendAfterBackup`: Optional boolean. If `true`, Timevault suspends the remote host after the job only when the host did not respond to ping before wake and Timevault woke it for the backup. Default: `false`.
 - `remote.wake.shutdownAfterBackup`: Optional boolean. If `true`, Timevault powers off the remote host (`systemctl poweroff`) after a successful backup when it had to be woken. Default: `false`. This takes precedence over `suspendAfterBackup` if both are enabled.
-- `remote.wake.offlineIfUnreachable`: Optional boolean. If `true`, a host that still does not respond after the configured WOL wait is reported as `offline` and skipped rather than reported as a failed backup. Default: `false`.
+- `remote.wake.offlineIfUnreachable`: Optional boolean. If `true`, a host that fails its configured ping or SSH readiness probes is reported as `offline` and skipped rather than reported as a failed backup. Default: `false`.
 
 `remote.inhibitSuspend` only unmasks suspend targets when Timevault masked them for that job.
 Timevault does not enable suspend after a backup if it was already disabled before the backup. If `remote.wake.suspendAfterBackup` is enabled, the final suspend is a separate remote `systemctl suspend` call; `shutdownAfterBackup` uses `systemctl poweroff` instead.
 
 Suspend ownership rule:
 
-For each SSH-style backup job with `remote.wake`, Timevault checks whether the backup source host responds to ping, wakes it only if needed, then detects the backup source host's suspend state over SSH.
+For each SSH-style backup job with `remote.wake`, Timevault checks whether the backup source host responds to ping and wakes it only if needed. After WOL, it waits for ping readiness, then waits for an SSH `echo` readiness probe before detecting the backup source host's suspend state.
 Jobs without `remote.wake` do not perform wake-related suspend work.
 Cascade jobs copied from a remote job ignore wake and suspend handling after their source is rewritten to the primary disk's local snapshot path.
 
