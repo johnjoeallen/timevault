@@ -77,15 +77,16 @@ Remote power options are available for SSH-style sources:
 - `remote.host`: Optional host name to ping. Defaults to the SSH host from `source`.
 - `remote.broadcast`, `remote.port`, `remote.interface`, `remote.keepaliveSeconds`: Optional WOL delivery and keepalive settings; used only when `remote.wol` is `true`.
 - `remote.probeTimeoutSeconds`: Total readiness budget for ping followed by an SSH `echo` probe. Default: `180`.
+- `remote.minimumUptimeSeconds`: After TimeVault sends WOL, skip the backup when the host uptime is below this many seconds, because the WOL caused a cold boot. Default: `300`. A host that was already running or resumed from suspend has significant uptime and proceeds normally.
 - `remote.afterBackup`: Action after a successful backup: `none` (default), `suspend`, or `shutdown`.
 - `remote.offlineIfUnreachable`: If `true`, a host that fails readiness is reported as `offline` and skipped rather than reported as a failed backup. Default: `false`.
 
 `remote.inhibitSuspend` only unmasks suspend targets when Timevault masked them for that job.
-`remote.afterBackup: suspend` uses a separate remote `systemctl suspend` call; `remote.afterBackup: shutdown` uses `systemctl poweroff` instead.
+`remote.afterBackup: suspend` uses a separate remote `systemctl suspend` call; `remote.afterBackup: shutdown` uses `systemctl poweroff` instead. When WOL caused a cold boot and TimeVault skips the backup, it powers the host off by default (and also when `afterBackup: shutdown` is configured).
 
 Suspend ownership rule:
 
-For each SSH-style backup job with `remote` options, Timevault probes the backup source host with ping and then SSH. If `remote.wol` is enabled, it sends WOL only when the initial ping fails. Both probes must succeed within `probeTimeoutSeconds` before the backup starts.
+For each SSH-style backup job with `remote` options, Timevault probes the backup source host with ping and then SSH. If `remote.wol` is enabled, it sends WOL only when the initial ping fails. Both probes must succeed within `probeTimeoutSeconds` before the backup starts. When TimeVault sent WOL, it then reads `/proc/uptime`; an uptime below `minimumUptimeSeconds` skips that job to avoid backing up a newly cold-booted host.
 Cascade jobs copied from a remote job ignore wake and suspend handling after their source is rewritten to the primary disk's local snapshot path.
 
 It runs on the backup source host:
@@ -198,6 +199,7 @@ jobs:
       port: 9
       keepaliveSeconds: 60
       probeTimeoutSeconds: 180
+      minimumUptimeSeconds: 300
       afterBackup: suspend
     excludes: []
 ```

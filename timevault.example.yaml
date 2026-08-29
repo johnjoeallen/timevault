@@ -81,6 +81,7 @@ jobs:
     #   port: 9
     #   keepaliveSeconds: 60
     #   probeTimeoutSeconds: 180
+    #   minimumUptimeSeconds: 300 # skip when WOL caused a cold boot
     #   afterBackup: shutdown # allowed: none, suspend, shutdown
     #   offlineIfUnreachable: true # report offline instead of failing when readiness times out
     excludes: []

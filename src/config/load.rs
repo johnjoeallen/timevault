@@ -121,6 +121,13 @@ fn parse_runtime(cfg: Config) -> Result<RuntimeConfig> {
                 ))
                 .into());
             }
+            if matches!(remote.minimum_uptime_seconds, Some(0)) {
+                return Err(ConfigError::Invalid(format!(
+                    "job {}: remote.minimumUptimeSeconds must be greater than zero",
+                    job.name
+                ))
+                .into());
+            }
         }
         if job.name.trim().is_empty() {
             return Err(ConfigError::Invalid("job name is required".to_string()).into());
@@ -275,6 +282,7 @@ jobs:
       port: 9
       keepaliveSeconds: 60
       probeTimeoutSeconds: 120
+      minimumUptimeSeconds: 600
       afterBackup: shutdown
       offlineIfUnreachable: true
 "#;
@@ -289,6 +297,7 @@ jobs:
         assert_eq!(remote.port, Some(9));
         assert_eq!(remote.keepalive_seconds, Some(60));
         assert_eq!(remote.probe_timeout_seconds, Some(120));
+        assert_eq!(remote.minimum_uptime_seconds, Some(600));
         assert_eq!(
             remote.after_backup,
             Some(crate::config::model::RemoteAfterBackup::Shutdown)

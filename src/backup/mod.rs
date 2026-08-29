@@ -37,6 +37,7 @@ const SUSPEND_TARGETS: [&str; 4] = [
 ];
 const PING_ATTEMPT_TIMEOUT: StdDuration = StdDuration::from_secs(2);
 const DEFAULT_REMOTE_PROBE_TIMEOUT_SECONDS: u64 = 180;
+const DEFAULT_REMOTE_MINIMUM_UPTIME_SECONDS: u64 = 300;
 
 #[derive(Debug, Clone, Copy)]
 pub struct BackupOptions {
@@ -201,7 +202,18 @@ fn run_backup_job(
     }
 
     let mut remote_power_guard = match start_remote_power_guard(job, run_mode) {
-        Ok(guard) => guard,
+        Ok(RemotePowerStart::Ready(guard)) => guard,
+        Ok(RemotePowerStart::FreshBoot {
+            uptime_seconds,
+            _power_guard,
+        }) => {
+            let reason = format!(
+                "host was started by Wake-on-LAN and has only {}s uptime",
+                uptime_seconds
+            );
+            println!("job {} skipped: {}", job.name, reason);
+            return Ok(skipped_job_report(job, disk_mount, backup_day, reason));
+        }
         Err(err) if remote_offline_if_unreachable(job) => {
             println!("job {} offline: {}", job.name, err);
             return Ok(offline_job_report(
@@ -508,6 +520,25 @@ fn offline_job_report(
     }
 }
 
+fn skipped_job_report(
+    job: &Job,
+    disk_mount: &Path,
+    backup_day: &str,
+    reason: String,
+) -> BackupJobReport {
+    BackupJobReport {
+        name: job.name.clone(),
+        description: job.description.clone(),
+        source: job.source.clone(),
+        destination: disk_mount.display().to_string(),
+        backup_day: backup_day.to_string(),
+        status: BackupJobStatus::Skipped,
+        attempts: 0,
+        rsync_code: None,
+        failure_reason: Some(reason),
+    }
+}
+
 fn status_for_rsync_code(rc: i32) -> BackupJobStatus {
     match rc {
         0 | 24 => BackupJobStatus::Success,
@@ -788,7 +819,8 @@ struct WakeContext {
     mac: Option<String>,
     keepalive_seconds: Option<u64>,
     probe_timeout: StdDuration,
-    after_backup: RemoteAfterBackup,
+    minimum_uptime_seconds: u64,
+    after_backup: Option<RemoteAfterBackup>,
 }
 
 struct WakeKeepalive {
@@ -811,6 +843,14 @@ struct RemotePowerGuard {
     backup_completed: bool,
     remote_host: String,
     job_name: String,
+}
+
+enum RemotePowerStart {
+    Ready(Option<RemotePowerGuard>),
+    FreshBoot {
+        uptime_seconds: u64,
+        _power_guard: Option<RemotePowerGuard>,
+    },
 }
 
 impl Drop for RemotePowerGuard {
@@ -927,10 +967,10 @@ pub fn wake_remote_job(job: &Job, run_mode: RunMode) -> Result<()> {
     wait_for_ssh_until(&context.ssh_host, deadline, run_mode)
 }
 
-fn start_remote_power_guard(job: &Job, run_mode: RunMode) -> Result<Option<RemotePowerGuard>> {
+fn start_remote_power_guard(job: &Job, run_mode: RunMode) -> Result<RemotePowerStart> {
     if run_mode.dry_run {
         let Some((remote, _, host)) = remote_config(job) else {
-            return Ok(None);
+            return Ok(RemotePowerStart::Ready(None));
         };
         println!(
             "dry-run: would probe {} by ping and SSH for up to {} seconds",
@@ -944,6 +984,12 @@ fn start_remote_power_guard(job: &Job, run_mode: RunMode) -> Result<Option<Remot
                 "dry-run: would send WOL for job {} to {} if ping fails",
                 job.name,
                 wake_target_description(remote)
+            );
+            println!(
+                "dry-run: would check uptime after WOL and skip the backup below {} seconds",
+                remote
+                    .minimum_uptime_seconds
+                    .unwrap_or(DEFAULT_REMOTE_MINIMUM_UPTIME_SECONDS)
             );
         }
         println!(
@@ -971,11 +1017,11 @@ fn start_remote_power_guard(job: &Job, run_mode: RunMode) -> Result<Option<Remot
                 job.name
             );
         }
-        return Ok(None);
+        return Ok(RemotePowerStart::Ready(None));
     }
 
     let Some(context) = remote_context(job)? else {
-        return Ok(None);
+        return Ok(RemotePowerStart::Ready(None));
     };
     let deadline = Instant::now() + context.probe_timeout;
     let was_woken = if ping_once(&context.host, run_mode)? {
@@ -1006,6 +1052,23 @@ fn start_remote_power_guard(job: &Job, run_mode: RunMode) -> Result<Option<Remot
     };
     wait_for_ssh_until(&context.ssh_host, deadline, run_mode)?;
 
+    if was_woken {
+        let uptime_seconds = remote_uptime_seconds(&context.ssh_host, run_mode)?;
+        if uptime_seconds < context.minimum_uptime_seconds {
+            let power_off_after_cold_boot = should_power_off_after_cold_boot(context.after_backup);
+            return Ok(RemotePowerStart::FreshBoot {
+                uptime_seconds,
+                _power_guard: power_off_after_cold_boot.then(|| RemotePowerGuard {
+                    keepalive: None,
+                    after_backup: RemoteAfterBackup::Shutdown,
+                    backup_completed: true,
+                    remote_host: context.ssh_host,
+                    job_name: job.name.clone(),
+                }),
+            });
+        }
+    }
+
     let keepalive = if was_woken {
         context.keepalive_seconds.map(|seconds| {
             let (stop, receiver) = mpsc::channel();
@@ -1028,13 +1091,13 @@ fn start_remote_power_guard(job: &Job, run_mode: RunMode) -> Result<Option<Remot
         None
     };
 
-    Ok(Some(RemotePowerGuard {
+    Ok(RemotePowerStart::Ready(Some(RemotePowerGuard {
         keepalive,
-        after_backup: context.after_backup,
+        after_backup: context.after_backup.unwrap_or(RemoteAfterBackup::None),
         backup_completed: false,
         remote_host: context.ssh_host,
         job_name: job.name.clone(),
-    }))
+    })))
 }
 
 fn remote_context(job: &Job) -> Result<Option<WakeContext>> {
@@ -1059,7 +1122,10 @@ fn remote_context(job: &Job) -> Result<Option<WakeContext>> {
                 .probe_timeout_seconds
                 .unwrap_or(DEFAULT_REMOTE_PROBE_TIMEOUT_SECONDS),
         ),
-        after_backup: options.after_backup.unwrap_or(RemoteAfterBackup::None),
+        minimum_uptime_seconds: options
+            .minimum_uptime_seconds
+            .unwrap_or(DEFAULT_REMOTE_MINIMUM_UPTIME_SECONDS),
+        after_backup: options.after_backup,
     }))
 }
 
@@ -1304,6 +1370,42 @@ fn wait_for_ssh_until(ssh_host: &str, deadline: Instant, run_mode: RunMode) -> R
             )))
         }
     })
+}
+
+fn remote_uptime_seconds(ssh_host: &str, run_mode: RunMode) -> Result<u64> {
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ConnectTimeout=5")
+        .arg(ssh_host)
+        .arg("cut -d. -f1 /proc/uptime")
+        .stdin(Stdio::null());
+    maybe_print_command(&cmd, run_mode);
+    let output = cmd.output().map_err(|err| {
+        TimevaultError::message(format!("read remote uptime from {}: {}", ssh_host, err))
+    })?;
+    if !output.status.success() {
+        return Err(TimevaultError::message(format!(
+            "read remote uptime from {}: ssh exited with code {}",
+            ssh_host,
+            output.status.code().unwrap_or(1)
+        )));
+    }
+    parse_uptime_seconds(&String::from_utf8_lossy(&output.stdout)).ok_or_else(|| {
+        TimevaultError::message(format!(
+            "read remote uptime from {}: invalid /proc/uptime output",
+            ssh_host
+        ))
+    })
+}
+
+fn parse_uptime_seconds(output: &str) -> Option<u64> {
+    output.trim().split('.').next()?.parse().ok()
+}
+
+fn should_power_off_after_cold_boot(after_backup: Option<RemoteAfterBackup>) -> bool {
+    matches!(after_backup, None | Some(RemoteAfterBackup::Shutdown))
 }
 
 fn retry_remote_readiness_until<T, F>(
@@ -2057,6 +2159,52 @@ mod tests {
                 .probe_timeout,
             StdDuration::from_secs(30)
         );
+    }
+
+    #[test]
+    fn minimum_uptime_defaults_and_can_be_overridden() {
+        let mut remote_job = job("root@example.com:/srv/data");
+        remote_job.remote = Some(RemoteJobOptions {
+            wol: Some(true),
+            mac: Some("aa:bb:cc:dd:ee:ff".to_string()),
+            broadcast: Some("192.0.2.255".to_string()),
+            ..RemoteJobOptions::default()
+        });
+        assert_eq!(
+            remote_context(&remote_job)
+                .expect("context")
+                .expect("remote")
+                .minimum_uptime_seconds,
+            DEFAULT_REMOTE_MINIMUM_UPTIME_SECONDS
+        );
+        remote_job.remote.as_mut().unwrap().minimum_uptime_seconds = Some(600);
+        assert_eq!(
+            remote_context(&remote_job)
+                .expect("context")
+                .expect("remote")
+                .minimum_uptime_seconds,
+            600
+        );
+    }
+
+    #[test]
+    fn parses_remote_uptime_seconds() {
+        assert_eq!(parse_uptime_seconds("123.45\\n"), Some(123));
+        assert_eq!(parse_uptime_seconds("not-a-number"), None);
+    }
+
+    #[test]
+    fn cold_boots_power_off_by_default_or_when_configured_to_shutdown() {
+        assert!(should_power_off_after_cold_boot(None));
+        assert!(should_power_off_after_cold_boot(Some(
+            RemoteAfterBackup::Shutdown
+        )));
+        assert!(!should_power_off_after_cold_boot(Some(
+            RemoteAfterBackup::None
+        )));
+        assert!(!should_power_off_after_cold_boot(Some(
+            RemoteAfterBackup::Suspend
+        )));
     }
 
     #[test]

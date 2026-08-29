@@ -99,6 +99,12 @@ pub struct RemoteJobOptions {
     pub probe_timeout_seconds: Option<u64>,
     #[serde(
         default,
+        rename = "minimumUptimeSeconds",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub minimum_uptime_seconds: Option<u64>,
+    #[serde(
+        default,
         rename = "afterBackup",
         skip_serializing_if = "Option::is_none"
     )]
