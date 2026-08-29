@@ -73,15 +73,14 @@ jobs:
     # Optional remote power handling:
     # remote:
     #   inhibitSuspend: true
-    #   wake:
-    #     mac: "aa:bb:cc:dd:ee:ff"
-    #     host: "example.com"
-    #     broadcast: "192.0.2.255"
-    #     interface: "eth0"
-    #     port: 9
-    #     keepaliveSeconds: 60
-    #     waitSeconds: 15
-    #     suspendAfterBackup: true
-    #     shutdownAfterBackup: true # power off after a successful backup if WOL was needed
-    #     offlineIfUnreachable: true # report offline instead of failing when WOL times out
+    #   wol: true
+    #   mac: "aa:bb:cc:dd:ee:ff"
+    #   host: "example.com"
+    #   broadcast: "192.0.2.255"
+    #   interface: "eth0"
+    #   port: 9
+    #   keepaliveSeconds: 60
+    #   probeTimeoutSeconds: 180
+    #   afterBackup: shutdown # allowed: none, suspend, shutdown
+    #   offlineIfUnreachable: true # report offline instead of failing when readiness times out
     excludes: []

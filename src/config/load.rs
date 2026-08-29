@@ -68,79 +68,58 @@ fn parse_runtime(cfg: Config) -> Result<RuntimeConfig> {
             .into());
         }
         if let Some(remote) = &job.remote {
-            if remote.inhibit_suspend == Some(true) && remote.wake.is_none() {
+            if remote.wol == Some(true) {
+                let Some(mac) = remote.mac.as_deref() else {
+                    return Err(ConfigError::Invalid(format!(
+                        "job {}: remote.mac is required when remote.wol is true",
+                        job.name
+                    ))
+                    .into());
+                };
+                if mac.trim().is_empty() || parse_mac_address(mac).is_none() {
+                    return Err(ConfigError::Invalid(format!(
+                        "job {}: remote.mac is invalid",
+                        job.name
+                    ))
+                    .into());
+                }
+            }
+            if matches!(&remote.host, Some(host) if host.trim().is_empty()) {
                 return Err(ConfigError::Invalid(format!(
-                    "job {}: remote.inhibitSuspend requires remote.wake",
+                    "job {}: remote.host is empty",
                     job.name
                 ))
                 .into());
             }
-            if let Some(wake) = &remote.wake {
-                if wake.mac.trim().is_empty() {
+            if let Some(broadcast) = &remote.broadcast {
+                if broadcast.parse::<Ipv4Addr>().is_err() {
                     return Err(ConfigError::Invalid(format!(
-                        "job {}: remote.wake.mac is empty",
+                        "job {}: remote.broadcast must be an IPv4 address",
                         job.name
                     ))
                     .into());
                 }
-                if parse_mac_address(&wake.mac).is_none() {
-                    return Err(ConfigError::Invalid(format!(
-                        "job {}: remote.wake.mac is invalid",
-                        job.name
-                    ))
-                    .into());
-                }
-                if matches!(&wake.host, Some(host) if host.trim().is_empty()) {
-                    return Err(ConfigError::Invalid(format!(
-                        "job {}: remote.wake.host is empty",
-                        job.name
-                    ))
-                    .into());
-                }
-                if let Some(broadcast) = &wake.broadcast {
-                    if broadcast.parse::<Ipv4Addr>().is_err() {
-                        return Err(ConfigError::Invalid(format!(
-                            "job {}: remote.wake.broadcast must be an IPv4 address",
-                            job.name
-                        ))
-                        .into());
-                    }
-                }
-                if matches!(wake.port, Some(0)) {
-                    return Err(ConfigError::Invalid(format!(
-                        "job {}: remote.wake.port must be greater than zero",
-                        job.name
-                    ))
-                    .into());
-                }
-                if matches!(wake.keepalive_seconds, Some(0)) {
-                    return Err(ConfigError::Invalid(format!(
-                        "job {}: remote.wake.keepaliveSeconds must be greater than zero",
-                        job.name
-                    ))
-                    .into());
-                }
-                if matches!(wake.wait_seconds, Some(0)) {
-                    return Err(ConfigError::Invalid(format!(
-                        "job {}: remote.wake.waitSeconds must be greater than zero",
-                        job.name
-                    ))
-                    .into());
-                }
-                if matches!(wake.ping_probe_attempts, Some(0)) {
-                    return Err(ConfigError::Invalid(format!(
-                        "job {}: remote.wake.pingProbeAttempts must be greater than zero",
-                        job.name
-                    ))
-                    .into());
-                }
-                if matches!(wake.ssh_probe_attempts, Some(0)) {
-                    return Err(ConfigError::Invalid(format!(
-                        "job {}: remote.wake.sshProbeAttempts must be greater than zero",
-                        job.name
-                    ))
-                    .into());
-                }
+            }
+            if matches!(remote.port, Some(0)) {
+                return Err(ConfigError::Invalid(format!(
+                    "job {}: remote.port must be greater than zero",
+                    job.name
+                ))
+                .into());
+            }
+            if matches!(remote.keepalive_seconds, Some(0)) {
+                return Err(ConfigError::Invalid(format!(
+                    "job {}: remote.keepaliveSeconds must be greater than zero",
+                    job.name
+                ))
+                .into());
+            }
+            if matches!(remote.probe_timeout_seconds, Some(0)) {
+                return Err(ConfigError::Invalid(format!(
+                    "job {}: remote.probeTimeoutSeconds must be greater than zero",
+                    job.name
+                ))
+                .into());
             }
         }
         if job.name.trim().is_empty() {
@@ -289,39 +268,32 @@ jobs:
     run: "auto"
     remote:
       inhibitSuspend: true
-      wake:
-        mac: "aa:bb:cc:dd:ee:ff"
-        host: "example.com"
-        broadcast: "192.0.2.255"
-        port: 9
-        keepaliveSeconds: 60
-        waitSeconds: 15
-        pingProbeAttempts: 4
-        pingProbeBackoffSeconds: 10
-        sshProbeAttempts: 5
-        sshProbeBackoffSeconds: 2
-        suspendAfterBackup: true
-        shutdownAfterBackup: true
-        offlineIfUnreachable: true
+      wol: true
+      mac: "aa:bb:cc:dd:ee:ff"
+      host: "example.com"
+      broadcast: "192.0.2.255"
+      port: 9
+      keepaliveSeconds: 60
+      probeTimeoutSeconds: 120
+      afterBackup: shutdown
+      offlineIfUnreachable: true
 "#;
         file.write_all(yaml.as_bytes()).expect("write");
         let cfg = load_config(file.path().to_string_lossy().as_ref()).expect("load");
         let remote = cfg.jobs[0].remote.as_ref().expect("remote options");
         assert_eq!(remote.inhibit_suspend, Some(true));
-        let wake = remote.wake.as_ref().expect("wake options");
-        assert_eq!(wake.mac, "aa:bb:cc:dd:ee:ff");
-        assert_eq!(wake.host.as_deref(), Some("example.com"));
-        assert_eq!(wake.broadcast.as_deref(), Some("192.0.2.255"));
-        assert_eq!(wake.port, Some(9));
-        assert_eq!(wake.keepalive_seconds, Some(60));
-        assert_eq!(wake.wait_seconds, Some(15));
-        assert_eq!(wake.ping_probe_attempts, Some(4));
-        assert_eq!(wake.ping_probe_backoff_seconds, Some(10));
-        assert_eq!(wake.ssh_probe_attempts, Some(5));
-        assert_eq!(wake.ssh_probe_backoff_seconds, Some(2));
-        assert_eq!(wake.suspend_after_backup, Some(true));
-        assert_eq!(wake.shutdown_after_backup, Some(true));
-        assert_eq!(wake.offline_if_unreachable, Some(true));
+        assert_eq!(remote.wol, Some(true));
+        assert_eq!(remote.mac.as_deref(), Some("aa:bb:cc:dd:ee:ff"));
+        assert_eq!(remote.host.as_deref(), Some("example.com"));
+        assert_eq!(remote.broadcast.as_deref(), Some("192.0.2.255"));
+        assert_eq!(remote.port, Some(9));
+        assert_eq!(remote.keepalive_seconds, Some(60));
+        assert_eq!(remote.probe_timeout_seconds, Some(120));
+        assert_eq!(
+            remote.after_backup,
+            Some(crate::config::model::RemoteAfterBackup::Shutdown)
+        );
+        assert_eq!(remote.offline_if_unreachable, Some(true));
     }
 
     #[test]
@@ -346,7 +318,7 @@ jobs:
     }
 
     #[test]
-    fn remote_suspend_inhibit_requires_wake() {
+    fn remote_wol_requires_mac() {
         let mut file = NamedTempFile::new().expect("tempfile");
         let yaml = r#"
 backupDisks:
@@ -357,17 +329,47 @@ jobs:
     source: "root@example.com:/"
     copies: 2
     remote:
-      inhibitSuspend: true
+      wol: true
 "#;
         file.write_all(yaml.as_bytes()).expect("write");
         let err = load_config(file.path().to_string_lossy().as_ref()).expect_err("invalid config");
         assert!(err
             .to_string()
-            .contains("remote.inhibitSuspend requires remote.wake"));
+            .contains("remote.mac is required when remote.wol is true"));
     }
 
     #[test]
-    fn remote_ping_probe_attempts_must_be_positive() {
+    fn remote_probe_mode_does_not_require_mac() {
+        let mut file = NamedTempFile::new().expect("tempfile");
+        let yaml = r#"
+backupDisks:
+  - diskId: "primary"
+    fsUuid: "uuid-1"
+jobs:
+  - name: "spitfire"
+    source: "root@spitfire:/"
+    copies: 2
+    remote:
+      wol: false
+      host: "spitfire"
+      probeTimeoutSeconds: 30
+      afterBackup: shutdown
+      offlineIfUnreachable: true
+"#;
+        file.write_all(yaml.as_bytes()).expect("write");
+        let cfg = load_config(file.path().to_string_lossy().as_ref()).expect("load");
+        let remote = cfg.jobs[0].remote.as_ref().expect("remote options");
+        assert_eq!(remote.wol, Some(false));
+        assert_eq!(remote.mac, None);
+        assert_eq!(remote.probe_timeout_seconds, Some(30));
+        assert_eq!(
+            remote.after_backup,
+            Some(crate::config::model::RemoteAfterBackup::Shutdown)
+        );
+    }
+
+    #[test]
+    fn remote_probe_timeout_must_be_positive() {
         let mut file = NamedTempFile::new().expect("tempfile");
         let yaml = r#"
 backupDisks:
@@ -378,15 +380,13 @@ jobs:
     source: "root@example.com:/"
     copies: 2
     remote:
-      wake:
-        mac: "aa:bb:cc:dd:ee:ff"
-        pingProbeAttempts: 0
+      probeTimeoutSeconds: 0
 "#;
         file.write_all(yaml.as_bytes()).expect("write");
         let err = load_config(file.path().to_string_lossy().as_ref()).expect_err("invalid config");
         assert!(err
             .to_string()
-            .contains("remote.wake.pingProbeAttempts must be greater than zero"));
+            .contains("remote.probeTimeoutSeconds must be greater than zero"));
     }
 
     #[test]

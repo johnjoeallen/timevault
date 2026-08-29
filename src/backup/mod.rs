@@ -17,7 +17,7 @@ use walkdir::WalkDir;
 use crate::backup::pristine::{build_pristine_excludes_for_source, PristineSource};
 use crate::backup::report::{BackupJobReport, BackupJobStatus, BackupRunReport};
 use crate::backup::rsync::run_rsync;
-use crate::config::model::Job;
+use crate::config::model::{Job, RemoteAfterBackup, RemoteJobOptions};
 use crate::error::{Result, TimevaultError};
 use crate::types::RunMode;
 use crate::util::command::maybe_print_command;
@@ -36,10 +36,7 @@ const SUSPEND_TARGETS: [&str; 4] = [
     "hybrid-sleep.target",
 ];
 const PING_ATTEMPT_TIMEOUT: StdDuration = StdDuration::from_secs(2);
-// Six probes with linear 10-second backoff wait 150 seconds between attempts.
-// Including probe time, this gives a waking host roughly three minutes to become ready.
-const DEFAULT_REMOTE_PROBE_ATTEMPTS: usize = 6;
-const DEFAULT_REMOTE_PROBE_BACKOFF_SECONDS: u64 = 10;
+const DEFAULT_REMOTE_PROBE_TIMEOUT_SECONDS: u64 = 180;
 
 #[derive(Debug, Clone, Copy)]
 pub struct BackupOptions {
@@ -205,7 +202,7 @@ fn run_backup_job(
 
     let mut remote_power_guard = match start_remote_power_guard(job, run_mode) {
         Ok(guard) => guard,
-        Err(err) if wake_offline_if_unreachable(job) => {
+        Err(err) if remote_offline_if_unreachable(job) => {
             println!("job {} offline: {}", job.name, err);
             return Ok(offline_job_report(
                 job,
@@ -786,15 +783,12 @@ fn run_remote_job_script(
 struct WakeContext {
     host: String,
     ssh_host: String,
+    wol: bool,
     targets: Vec<SocketAddrV4>,
-    mac: String,
+    mac: Option<String>,
     keepalive_seconds: Option<u64>,
-    ping_probe_attempts: usize,
-    ping_probe_backoff_seconds: u64,
-    ssh_probe_attempts: usize,
-    ssh_probe_backoff_seconds: u64,
-    suspend_after_backup: bool,
-    shutdown_after_backup: bool,
+    probe_timeout: StdDuration,
+    after_backup: RemoteAfterBackup,
 }
 
 struct WakeKeepalive {
@@ -813,8 +807,7 @@ impl Drop for WakeKeepalive {
 
 struct RemotePowerGuard {
     keepalive: Option<WakeKeepalive>,
-    suspend_after_backup: bool,
-    shutdown_after_backup: bool,
+    after_backup: RemoteAfterBackup,
     backup_completed: bool,
     remote_host: String,
     job_name: String,
@@ -823,7 +816,7 @@ struct RemotePowerGuard {
 impl Drop for RemotePowerGuard {
     fn drop(&mut self) {
         drop(self.keepalive.take());
-        if !self.backup_completed || (!self.suspend_after_backup && !self.shutdown_after_backup) {
+        if !self.backup_completed || self.after_backup == RemoteAfterBackup::None {
             return;
         }
         let mut cmd = Command::new("ssh");
@@ -832,10 +825,10 @@ impl Drop for RemotePowerGuard {
             .arg("-o")
             .arg("ConnectTimeout=5")
             .arg(&self.remote_host)
-            .arg(if self.shutdown_after_backup {
-                "systemctl poweroff"
-            } else {
-                "systemctl suspend"
+            .arg(match self.after_backup {
+                RemoteAfterBackup::Shutdown => "systemctl poweroff",
+                RemoteAfterBackup::Suspend => "systemctl suspend",
+                RemoteAfterBackup::None => return,
             })
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -844,7 +837,7 @@ impl Drop for RemotePowerGuard {
             Ok(status) if status.success() => {}
             Ok(status) => eprintln!(
                 "failed to {} remote host {} after job {}: ssh exited with code {}",
-                if self.shutdown_after_backup {
+                if self.after_backup == RemoteAfterBackup::Shutdown {
                     "power off"
                 } else {
                     "suspend"
@@ -855,7 +848,7 @@ impl Drop for RemotePowerGuard {
             ),
             Err(err) => eprintln!(
                 "failed to {} remote host {} after job {}: {}",
-                if self.shutdown_after_backup {
+                if self.after_backup == RemoteAfterBackup::Shutdown {
                     "power off"
                 } else {
                     "suspend"
@@ -870,33 +863,46 @@ impl Drop for RemotePowerGuard {
 
 pub fn wake_remote_job(job: &Job, run_mode: RunMode) -> Result<()> {
     if run_mode.dry_run {
-        let Some((wake, _, host)) = wake_config(job) else {
+        let Some((remote, _, host)) = remote_config(job) else {
             return Err(TimevaultError::message(format!(
-                "job {} has no remote.wake configuration",
+                "job {} has no remote WOL configuration",
                 job.name
             )));
         };
+        if remote.wol != Some(true) {
+            return Err(TimevaultError::message(format!(
+                "job {} has remote.wol disabled",
+                job.name
+            )));
+        }
         println!(
             "dry-run: would send WOL for job {} to {} for {}",
             job.name,
-            wake_target_description(wake),
+            wake_target_description(remote),
             host
         );
-        let (ping_attempts, ping_backoff_seconds) = ping_probe_options(wake);
-        let (ssh_attempts, ssh_backoff_seconds) = ssh_probe_options(wake);
         println!(
-            "dry-run: would send WOL, then probe {} by ping up to {} times with incremental {}s backoff and SSH echo up to {} times with incremental {}s backoff",
-            host, ping_attempts, ping_backoff_seconds, ssh_attempts, ssh_backoff_seconds
+            "dry-run: would send WOL, then wait up to {} seconds for ping and SSH readiness",
+            remote
+                .probe_timeout_seconds
+                .unwrap_or(DEFAULT_REMOTE_PROBE_TIMEOUT_SECONDS)
         );
         return Ok(());
     }
 
-    let Some(context) = wake_context(job)? else {
+    let Some(context) = remote_context(job)? else {
         return Err(TimevaultError::message(format!(
-            "job {} has no remote.wake configuration",
+            "job {} has no remote WOL configuration",
             job.name
         )));
     };
+    if !context.wol {
+        return Err(TimevaultError::message(format!(
+            "job {} has remote.wol disabled",
+            job.name
+        )));
+    }
+    let deadline = Instant::now() + context.probe_timeout;
     if ping_once(&context.host, run_mode)? {
         if run_mode.verbose {
             println!(
@@ -912,53 +918,52 @@ pub fn wake_remote_job(job: &Job, run_mode: RunMode) -> Result<()> {
                 context.targets.len()
             );
         }
-        send_wake_packets(&context.mac, &context.targets)?;
-        wait_for_ping_after_wake(
-            &context.host,
-            context.ping_probe_attempts,
-            context.ping_probe_backoff_seconds,
-            run_mode,
+        send_wake_packets(
+            context.mac.as_deref().expect("validated WOL MAC"),
+            &context.targets,
         )?;
+        wait_for_ping_until(&context.host, deadline, run_mode)?;
     }
-    wait_for_ssh_after_ping(
-        &context.ssh_host,
-        context.ssh_probe_attempts,
-        context.ssh_probe_backoff_seconds,
-        run_mode,
-    )
+    wait_for_ssh_until(&context.ssh_host, deadline, run_mode)
 }
 
 fn start_remote_power_guard(job: &Job, run_mode: RunMode) -> Result<Option<RemotePowerGuard>> {
     if run_mode.dry_run {
-        let Some((wake, _, host)) = wake_config(job) else {
+        let Some((remote, _, host)) = remote_config(job) else {
             return Ok(None);
         };
         println!(
-            "dry-run: would check whether {} responds to ping before wake",
+            "dry-run: would probe {} by ping and SSH for up to {} seconds",
+            host,
+            remote
+                .probe_timeout_seconds
+                .unwrap_or(DEFAULT_REMOTE_PROBE_TIMEOUT_SECONDS)
+        );
+        if remote.wol == Some(true) {
+            println!(
+                "dry-run: would send WOL for job {} to {} if ping fails",
+                job.name,
+                wake_target_description(remote)
+            );
+        }
+        println!(
+            "dry-run: would skip the backup if {} is not ready before the timeout",
             host
         );
-        println!(
-            "dry-run: would send WOL for job {} to {} for {} if ping fails",
-            job.name,
-            wake_target_description(wake),
-            host
-        );
-        let (ping_attempts, ping_backoff_seconds) = ping_probe_options(wake);
-        let (ssh_attempts, ssh_backoff_seconds) = ssh_probe_options(wake);
-        println!(
-            "dry-run: would send WOL, then probe {} by ping up to {} times with incremental {}s backoff and SSH echo up to {} times with incremental {}s backoff",
-            host, ping_attempts, ping_backoff_seconds, ssh_attempts, ssh_backoff_seconds
-        );
-        if let Some(seconds) = wake.keepalive_seconds {
+        if remote.wol == Some(true) && remote.keepalive_seconds.is_some() {
+            let seconds = remote.keepalive_seconds.expect("checked above");
             println!(
                 "dry-run: would repeat WOL for job {} every {} seconds while backup runs if wake was needed",
                 job.name, seconds
             );
         }
-        if wake.suspend_after_backup == Some(true) || wake.shutdown_after_backup == Some(true) {
+        if let Some(after_backup) = remote
+            .after_backup
+            .filter(|value| *value != RemoteAfterBackup::None)
+        {
             println!(
-                "dry-run: would {} remote host after job {} if it was woken for the backup",
-                if wake.shutdown_after_backup == Some(true) {
+                "dry-run: would {} remote host after a successful job {}",
+                if after_backup == RemoteAfterBackup::Shutdown {
                     "power off"
                 } else {
                     "suspend"
@@ -969,9 +974,10 @@ fn start_remote_power_guard(job: &Job, run_mode: RunMode) -> Result<Option<Remot
         return Ok(None);
     }
 
-    let Some(context) = wake_context(job)? else {
+    let Some(context) = remote_context(job)? else {
         return Ok(None);
     };
+    let deadline = Instant::now() + context.probe_timeout;
     let was_woken = if ping_once(&context.host, run_mode)? {
         if run_mode.verbose {
             println!(
@@ -980,7 +986,7 @@ fn start_remote_power_guard(job: &Job, run_mode: RunMode) -> Result<Option<Remot
             );
         }
         false
-    } else {
+    } else if context.wol {
         if run_mode.verbose {
             println!(
                 "wake host {} did not respond; sending WOL to {} target(s)",
@@ -988,26 +994,22 @@ fn start_remote_power_guard(job: &Job, run_mode: RunMode) -> Result<Option<Remot
                 context.targets.len()
             );
         }
-        send_wake_packets(&context.mac, &context.targets)?;
-        wait_for_ping_after_wake(
-            &context.host,
-            context.ping_probe_attempts,
-            context.ping_probe_backoff_seconds,
-            run_mode,
+        send_wake_packets(
+            context.mac.as_deref().expect("validated WOL MAC"),
+            &context.targets,
         )?;
+        wait_for_ping_until(&context.host, deadline, run_mode)?;
         true
+    } else {
+        wait_for_ping_until(&context.host, deadline, run_mode)?;
+        false
     };
-    wait_for_ssh_after_ping(
-        &context.ssh_host,
-        context.ssh_probe_attempts,
-        context.ssh_probe_backoff_seconds,
-        run_mode,
-    )?;
+    wait_for_ssh_until(&context.ssh_host, deadline, run_mode)?;
 
     let keepalive = if was_woken {
         context.keepalive_seconds.map(|seconds| {
             let (stop, receiver) = mpsc::channel();
-            let mac = context.mac;
+            let mac = context.mac.expect("WOL keepalive requires MAC");
             let targets = context.targets;
             let handle = thread::spawn(move || loop {
                 match receiver.recv_timeout(StdDuration::from_secs(seconds)) {
@@ -1028,126 +1030,91 @@ fn start_remote_power_guard(job: &Job, run_mode: RunMode) -> Result<Option<Remot
 
     Ok(Some(RemotePowerGuard {
         keepalive,
-        suspend_after_backup: context.suspend_after_backup,
-        shutdown_after_backup: context.shutdown_after_backup,
+        after_backup: context.after_backup,
         backup_completed: false,
         remote_host: context.ssh_host,
         job_name: job.name.clone(),
     }))
 }
 
-fn wake_context(job: &Job) -> Result<Option<WakeContext>> {
-    let Some((wake, remote, host)) = wake_config(job) else {
+fn remote_context(job: &Job) -> Result<Option<WakeContext>> {
+    let Some((options, remote, host)) = remote_config(job) else {
         return Ok(None);
     };
-    let targets = wake_targets(wake, &host)?;
+    let wol = options.wol.unwrap_or(false);
+    let targets = if wol {
+        wake_targets(options, &host)?
+    } else {
+        Vec::new()
+    };
     Ok(Some(WakeContext {
         host: host.to_string(),
         ssh_host: remote.host,
         targets,
-        mac: wake.mac.clone(),
-        keepalive_seconds: wake.keepalive_seconds,
-        ping_probe_attempts: wake
-            .ping_probe_attempts
-            .unwrap_or(DEFAULT_REMOTE_PROBE_ATTEMPTS),
-        ping_probe_backoff_seconds: wake
-            .ping_probe_backoff_seconds
-            .unwrap_or(DEFAULT_REMOTE_PROBE_BACKOFF_SECONDS),
-        ssh_probe_attempts: wake
-            .ssh_probe_attempts
-            .unwrap_or(DEFAULT_REMOTE_PROBE_ATTEMPTS),
-        ssh_probe_backoff_seconds: wake
-            .ssh_probe_backoff_seconds
-            .unwrap_or(DEFAULT_REMOTE_PROBE_BACKOFF_SECONDS),
-        suspend_after_backup: wake.suspend_after_backup.unwrap_or(false),
-        shutdown_after_backup: wake.shutdown_after_backup.unwrap_or(false),
+        wol,
+        mac: options.mac.clone(),
+        keepalive_seconds: options.keepalive_seconds,
+        probe_timeout: StdDuration::from_secs(
+            options
+                .probe_timeout_seconds
+                .unwrap_or(DEFAULT_REMOTE_PROBE_TIMEOUT_SECONDS),
+        ),
+        after_backup: options.after_backup.unwrap_or(RemoteAfterBackup::None),
     }))
 }
 
-fn wake_offline_if_unreachable(job: &Job) -> bool {
-    wake_config(job)
-        .and_then(|(wake, _, _)| wake.offline_if_unreachable)
+fn remote_offline_if_unreachable(job: &Job) -> bool {
+    remote_config(job)
+        .and_then(|(remote, _, _)| remote.offline_if_unreachable)
         .unwrap_or(false)
 }
 
-fn wake_config<'a>(
-    job: &'a Job,
-) -> Option<(
-    &'a crate::config::model::RemoteWakeOptions,
-    RemoteSshSource,
-    String,
-)> {
+fn remote_config<'a>(job: &'a Job) -> Option<(&'a RemoteJobOptions, RemoteSshSource, String)> {
     let Some(remote_options) = &job.remote else {
-        return None;
-    };
-    let Some(wake) = &remote_options.wake else {
         return None;
     };
     let Some(remote) = remote_ssh_source(&job.source) else {
         return None;
     };
-    let host = wake_host(wake, &remote).to_string();
-    Some((wake, remote, host))
+    let host = remote_host(remote_options, &remote).to_string();
+    Some((remote_options, remote, host))
 }
 
-fn has_active_wake_config(job: &Job) -> bool {
-    wake_config(job).is_some()
+fn has_active_remote_config(job: &Job) -> bool {
+    remote_config(job).is_some()
 }
 
 fn has_remote_suspend_guard_config(job: &Job) -> bool {
     job.remote
         .as_ref()
         .is_some_and(|remote| remote.inhibit_suspend == Some(true))
-        && has_active_wake_config(job)
+        && has_active_remote_config(job)
 }
 
-fn wake_target_description(wake: &crate::config::model::RemoteWakeOptions) -> String {
-    match &wake.broadcast {
-        Some(broadcast) => format!("{}:{}", broadcast, wake.port.unwrap_or(9)),
+fn wake_target_description(remote: &RemoteJobOptions) -> String {
+    match &remote.broadcast {
+        Some(broadcast) => format!("{}:{}", broadcast, remote.port.unwrap_or(9)),
         None => format!(
             "DNS-inferred /24 broadcast or active interface broadcasts:{}",
-            wake.port.unwrap_or(9)
+            remote.port.unwrap_or(9)
         ),
     }
 }
 
-fn ping_probe_options(wake: &crate::config::model::RemoteWakeOptions) -> (usize, u64) {
-    (
-        wake.ping_probe_attempts
-            .unwrap_or(DEFAULT_REMOTE_PROBE_ATTEMPTS),
-        wake.ping_probe_backoff_seconds
-            .unwrap_or(DEFAULT_REMOTE_PROBE_BACKOFF_SECONDS),
-    )
-}
-
-fn ssh_probe_options(wake: &crate::config::model::RemoteWakeOptions) -> (usize, u64) {
-    (
-        wake.ssh_probe_attempts
-            .unwrap_or(DEFAULT_REMOTE_PROBE_ATTEMPTS),
-        wake.ssh_probe_backoff_seconds
-            .unwrap_or(DEFAULT_REMOTE_PROBE_BACKOFF_SECONDS),
-    )
-}
-
-fn wake_host<'a>(
-    wake: &'a crate::config::model::RemoteWakeOptions,
-    remote: &'a RemoteSshSource,
-) -> &'a str {
-    wake.host
+fn remote_host<'a>(remote_options: &'a RemoteJobOptions, remote: &'a RemoteSshSource) -> &'a str {
+    remote_options
+        .host
         .as_deref()
         .map(str::trim)
         .filter(|host| !host.is_empty())
         .unwrap_or_else(|| remote_dns_host(&remote.host))
 }
 
-fn wake_targets(
-    wake: &crate::config::model::RemoteWakeOptions,
-    dns_host: &str,
-) -> Result<Vec<SocketAddrV4>> {
-    let port = wake.port.unwrap_or(9);
-    if let Some(value) = &wake.broadcast {
+fn wake_targets(remote: &RemoteJobOptions, dns_host: &str) -> Result<Vec<SocketAddrV4>> {
+    let port = remote.port.unwrap_or(9);
+    if let Some(value) = &remote.broadcast {
         let broadcast = value.parse::<Ipv4Addr>().map_err(|err| {
-            TimevaultError::message(format!("remote.wake.broadcast {}: {}", value, err))
+            TimevaultError::message(format!("remote.broadcast {}: {}", value, err))
         })?;
         return Ok(vec![SocketAddrV4::new(broadcast, port)]);
     }
@@ -1155,7 +1122,7 @@ fn wake_targets(
     match inferred_broadcast_for_host(dns_host) {
         Ok(broadcast) => Ok(vec![SocketAddrV4::new(broadcast, port)]),
         Err(dns_err) => {
-            let targets = active_interface_broadcast_targets(wake.interface.as_deref(), port)?;
+            let targets = active_interface_broadcast_targets(remote.interface.as_deref(), port)?;
             if targets.is_empty() {
                 return Err(TimevaultError::message(format!(
                     "{}; no active IPv4 broadcast interfaces found",
@@ -1299,91 +1266,72 @@ fn parse_mac_address(value: &str) -> Option<[u8; 6]> {
     }
 }
 
-fn wait_for_ping_after_wake(
-    host: &str,
-    attempts: usize,
-    backoff_seconds: u64,
-    run_mode: RunMode,
-) -> Result<()> {
-    retry_remote_readiness_probe(host, "respond to ping", attempts, backoff_seconds, || {
+fn wait_for_ping_until(host: &str, deadline: Instant, run_mode: RunMode) -> Result<()> {
+    retry_remote_readiness_until(host, "respond to ping", deadline, || {
         if ping_once(host, run_mode)? {
             Ok(())
         } else {
             Err(TimevaultError::message(format!(
-                "wake host {} did not respond to ping",
+                "remote host {} did not respond to ping",
                 host
             )))
         }
     })
 }
 
-fn wait_for_ssh_after_ping(
-    ssh_host: &str,
-    attempts: usize,
-    backoff_seconds: u64,
-    run_mode: RunMode,
-) -> Result<()> {
-    retry_remote_readiness_probe(
-        ssh_host,
-        "accept SSH connections",
-        attempts,
-        backoff_seconds,
-        || {
-            let mut cmd = Command::new("ssh");
-            cmd.arg("-o")
-                .arg("BatchMode=yes")
-                .arg("-o")
-                .arg("ConnectTimeout=5")
-                .arg(ssh_host)
-                .arg("echo")
-                .stdin(Stdio::null())
-                .stdout(Stdio::null());
-            maybe_print_command(&cmd, run_mode);
-            let status = cmd.status().map_err(|err| {
-                TimevaultError::message(format!("SSH readiness probe for {}: {}", ssh_host, err))
-            })?;
-            if status.success() {
-                Ok(())
-            } else {
-                Err(TimevaultError::message(format!(
-                    "SSH readiness probe for {} exited with code {}",
-                    ssh_host,
-                    status.code().unwrap_or(1)
-                )))
-            }
-        },
-    )
+fn wait_for_ssh_until(ssh_host: &str, deadline: Instant, run_mode: RunMode) -> Result<()> {
+    retry_remote_readiness_until(ssh_host, "accept SSH connections", deadline, || {
+        let mut cmd = Command::new("ssh");
+        cmd.arg("-o")
+            .arg("BatchMode=yes")
+            .arg("-o")
+            .arg("ConnectTimeout=5")
+            .arg(ssh_host)
+            .arg("echo")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null());
+        maybe_print_command(&cmd, run_mode);
+        let status = cmd.status().map_err(|err| {
+            TimevaultError::message(format!("SSH readiness probe for {}: {}", ssh_host, err))
+        })?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(TimevaultError::message(format!(
+                "SSH readiness probe for {} exited with code {}",
+                ssh_host,
+                status.code().unwrap_or(1)
+            )))
+        }
+    })
 }
 
-fn retry_remote_readiness_probe<T, F>(
+fn retry_remote_readiness_until<T, F>(
     host: &str,
     probe: &str,
-    attempts: usize,
-    backoff_seconds: u64,
+    deadline: Instant,
     mut action: F,
 ) -> Result<T>
 where
     F: FnMut() -> Result<T>,
 {
-    for attempt in 1..=attempts {
+    loop {
         match action() {
             Ok(value) => return Ok(value),
-            Err(err) if attempt == attempts => return Err(err),
+            Err(err) if Instant::now() >= deadline => return Err(err),
             Err(_) => {
-                let delay_seconds = backoff_seconds.saturating_mul(attempt as u64);
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let delay = remaining.min(StdDuration::from_secs(2));
                 println!(
-                    "host {} did not {} yet; retrying ({}/{}) in {}s",
+                    "host {} did not {} yet; retrying in {}s",
                     host,
                     probe,
-                    attempt + 1,
-                    attempts,
-                    delay_seconds
+                    delay.as_secs()
                 );
-                thread::sleep(StdDuration::from_secs(delay_seconds));
+                thread::sleep(delay);
             }
         }
     }
-    unreachable!("at least one readiness probe attempt is required")
 }
 
 fn ping_once(host: &str, run_mode: RunMode) -> Result<bool> {
@@ -2038,25 +1986,16 @@ mod tests {
 
     #[test]
     fn wake_targets_uses_explicit_configured_broadcast() {
-        let wake = crate::config::model::RemoteWakeOptions {
-            mac: "aa:bb:cc:dd:ee:ff".to_string(),
-            host: None,
+        let remote = RemoteJobOptions {
+            wol: Some(true),
+            mac: Some("aa:bb:cc:dd:ee:ff".to_string()),
             broadcast: Some("192.0.2.255".to_string()),
             port: Some(7),
-            interface: None,
-            keepalive_seconds: None,
-            wait_seconds: None,
-            ping_probe_attempts: None,
-            ping_probe_backoff_seconds: None,
-            ssh_probe_attempts: None,
-            ssh_probe_backoff_seconds: None,
-            suspend_after_backup: None,
-            shutdown_after_backup: None,
-            offline_if_unreachable: None,
+            ..RemoteJobOptions::default()
         };
 
         assert_eq!(
-            wake_targets(&wake, "does-not-need-dns").expect("targets"),
+            wake_targets(&remote, "does-not-need-dns").expect("targets"),
             vec![SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 255), 7)]
         );
     }
@@ -2087,67 +2026,37 @@ mod tests {
             host: "root@ssh-alias".to_string(),
             source_path: "/".to_string(),
         };
-        let wake = crate::config::model::RemoteWakeOptions {
-            mac: "aa:bb:cc:dd:ee:ff".to_string(),
+        let options = RemoteJobOptions {
+            mac: Some("aa:bb:cc:dd:ee:ff".to_string()),
             host: Some("actual-host".to_string()),
-            broadcast: None,
-            port: None,
-            interface: None,
-            keepalive_seconds: None,
-            wait_seconds: None,
-            ping_probe_attempts: None,
-            ping_probe_backoff_seconds: None,
-            ssh_probe_attempts: None,
-            ssh_probe_backoff_seconds: None,
-            suspend_after_backup: None,
-            shutdown_after_backup: None,
-            offline_if_unreachable: None,
+            ..RemoteJobOptions::default()
         };
 
-        assert_eq!(wake_host(&wake, &remote), "actual-host");
+        assert_eq!(remote_host(&options, &remote), "actual-host");
     }
 
     #[test]
-    fn probe_options_default_and_override() {
+    fn probe_timeout_defaults_and_can_be_overridden() {
         let mut remote_job = job("root@example.com:/srv/data");
         remote_job.remote = Some(crate::config::model::RemoteJobOptions {
-            inhibit_suspend: Some(true),
-            wake: Some(crate::config::model::RemoteWakeOptions {
-                mac: "aa:bb:cc:dd:ee:ff".to_string(),
-                host: None,
-                broadcast: None,
-                port: None,
-                interface: None,
-                keepalive_seconds: None,
-                wait_seconds: None,
-                ping_probe_attempts: None,
-                ping_probe_backoff_seconds: None,
-                ssh_probe_attempts: None,
-                ssh_probe_backoff_seconds: None,
-                suspend_after_backup: None,
-                shutdown_after_backup: None,
-                offline_if_unreachable: None,
-            }),
+            wol: Some(false),
+            ..RemoteJobOptions::default()
         });
-        let wake = remote_job
-            .remote
-            .as_ref()
-            .and_then(|remote| remote.wake.as_ref())
-            .expect("wake options");
-        assert_eq!(ping_probe_options(wake), (6, 10));
-        assert_eq!(ssh_probe_options(wake), (6, 10));
-
-        let wake = remote_job
-            .remote
-            .as_mut()
-            .and_then(|remote| remote.wake.as_mut())
-            .expect("wake options");
-        wake.ping_probe_attempts = Some(5);
-        wake.ping_probe_backoff_seconds = Some(2);
-        wake.ssh_probe_attempts = Some(4);
-        wake.ssh_probe_backoff_seconds = Some(3);
-        assert_eq!(ping_probe_options(wake), (5, 2));
-        assert_eq!(ssh_probe_options(wake), (4, 3));
+        assert_eq!(
+            remote_context(&remote_job)
+                .expect("context")
+                .expect("remote")
+                .probe_timeout,
+            StdDuration::from_secs(DEFAULT_REMOTE_PROBE_TIMEOUT_SECONDS)
+        );
+        remote_job.remote.as_mut().unwrap().probe_timeout_seconds = Some(30);
+        assert_eq!(
+            remote_context(&remote_job)
+                .expect("context")
+                .expect("remote")
+                .probe_timeout,
+            StdDuration::from_secs(30)
+        );
     }
 
     #[test]
@@ -2155,38 +2064,23 @@ mod tests {
         let mut remote_job = job("root@example.com:/srv/data");
         remote_job.remote = Some(crate::config::model::RemoteJobOptions {
             inhibit_suspend: Some(true),
-            wake: Some(crate::config::model::RemoteWakeOptions {
-                mac: "aa:bb:cc:dd:ee:ff".to_string(),
-                host: Some("example.com".to_string()),
-                broadcast: Some("192.0.2.255".to_string()),
-                port: None,
-                interface: None,
-                keepalive_seconds: None,
-                wait_seconds: None,
-                ping_probe_attempts: None,
-                ping_probe_backoff_seconds: None,
-                ssh_probe_attempts: None,
-                ssh_probe_backoff_seconds: None,
-                suspend_after_backup: None,
-                shutdown_after_backup: None,
-                offline_if_unreachable: None,
-            }),
+            wol: Some(true),
+            mac: Some("aa:bb:cc:dd:ee:ff".to_string()),
+            host: Some("example.com".to_string()),
+            broadcast: Some("192.0.2.255".to_string()),
+            ..RemoteJobOptions::default()
         });
 
-        assert!(has_active_wake_config(&remote_job));
+        assert!(has_active_remote_config(&remote_job));
         assert!(has_remote_suspend_guard_config(&remote_job));
 
         let mut cascade_job = remote_job.clone();
         cascade_job.source = "/mnt/primary/test/current".to_string();
-        assert!(!has_active_wake_config(&cascade_job));
+        assert!(!has_active_remote_config(&cascade_job));
         assert!(!has_remote_suspend_guard_config(&cascade_job));
 
-        let mut no_wake_job = job("root@example.com:/srv/data");
-        no_wake_job.remote = Some(crate::config::model::RemoteJobOptions {
-            inhibit_suspend: Some(true),
-            wake: None,
-        });
-        assert!(!has_active_wake_config(&no_wake_job));
+        let no_wake_job = job("root@example.com:/srv/data");
+        assert!(!has_active_remote_config(&no_wake_job));
         assert!(!has_remote_suspend_guard_config(&no_wake_job));
 
         let mut wake_without_inhibit_job = remote_job.clone();
@@ -2195,7 +2089,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .inhibit_suspend = None;
-        assert!(has_active_wake_config(&wake_without_inhibit_job));
+        assert!(has_active_remote_config(&wake_without_inhibit_job));
         assert!(!has_remote_suspend_guard_config(&wake_without_inhibit_job));
     }
 

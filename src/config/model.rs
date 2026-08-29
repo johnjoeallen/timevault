@@ -65,6 +65,7 @@ pub struct JobConfig {
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RemoteJobOptions {
     #[serde(
         default,
@@ -73,12 +74,9 @@ pub struct RemoteJobOptions {
     )]
     pub inhibit_suspend: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub wake: Option<RemoteWakeOptions>,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
-pub struct RemoteWakeOptions {
-    pub mac: String,
+    pub wol: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mac: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -95,54 +93,31 @@ pub struct RemoteWakeOptions {
     pub keepalive_seconds: Option<u64>,
     #[serde(
         default,
-        rename = "waitSeconds",
+        rename = "probeTimeoutSeconds",
         skip_serializing_if = "Option::is_none"
     )]
-    pub wait_seconds: Option<u64>,
+    pub probe_timeout_seconds: Option<u64>,
     #[serde(
         default,
-        rename = "pingProbeAttempts",
+        rename = "afterBackup",
         skip_serializing_if = "Option::is_none"
     )]
-    pub ping_probe_attempts: Option<usize>,
-    #[serde(
-        default,
-        rename = "pingProbeBackoffSeconds",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub ping_probe_backoff_seconds: Option<u64>,
-    #[serde(
-        default,
-        rename = "sshProbeAttempts",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub ssh_probe_attempts: Option<usize>,
-    #[serde(
-        default,
-        rename = "sshProbeBackoffSeconds",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub ssh_probe_backoff_seconds: Option<u64>,
-    #[serde(
-        default,
-        rename = "suspendAfterBackup",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub suspend_after_backup: Option<bool>,
-    /// Power off the remote host after a successful backup when it had to be woken.
-    #[serde(
-        default,
-        rename = "shutdownAfterBackup",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub shutdown_after_backup: Option<bool>,
-    /// Treat a host that does not answer after WOL as offline and skip its backup.
+    pub after_backup: Option<RemoteAfterBackup>,
+    /// Treat a host that does not answer readiness probes as offline and skip its backup.
     #[serde(
         default,
         rename = "offlineIfUnreachable",
         skip_serializing_if = "Option::is_none"
     )]
     pub offline_if_unreachable: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RemoteAfterBackup {
+    None,
+    Suspend,
+    Shutdown,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

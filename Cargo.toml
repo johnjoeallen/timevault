@@ -1,6 +1,6 @@
 [package]
 name = "timevault"
-version = "1.4.1"
+version = "1.5.0"
 edition = "2021"
 description = "Safe rsync-based backup tool with mount validation and snapshot rotation"
 license = "GPL-3.0-or-later"
