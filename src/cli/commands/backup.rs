@@ -59,6 +59,15 @@ pub fn run_backup_command(
     let selected_set: std::collections::HashSet<String> = selected_jobs.iter().cloned().collect();
     let mut jobs_to_run = Vec::new();
     if selected_set.is_empty() {
+        return Err(TimevaultError::message(
+            "backup requires --job <name> or --job all".to_string(),
+        ));
+    } else if selected_set.contains("all") {
+        if selected_set.len() != 1 {
+            return Err(TimevaultError::message(
+                "--job all cannot be combined with other job names".to_string(),
+            ));
+        }
         for job in &jobs {
             if job.run_policy == crate::types::RunPolicy::Auto {
                 jobs_to_run.push(job.clone());
@@ -87,11 +96,7 @@ pub fn run_backup_command(
     }
 
     if jobs_to_run.is_empty() {
-        if selected_set.is_empty() {
-            println!("no jobs matched (no auto jobs enabled); aborting");
-        } else {
-            println!("no jobs matched selection; aborting");
-        }
+        println!("no jobs matched selection; aborting");
         std::process::exit(2);
     }
 

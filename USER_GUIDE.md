@@ -207,7 +207,7 @@ jobs:
 ## Command-line options
 Global options:
 - `--config <path>`: Use a specific config file.
-- `--job <name>`: Run only selected job(s). Repeat for multiple jobs.
+- `--job <name>`: Run one named job. `--job all` runs every job with `run: auto`; `all` is reserved and cannot be a job name. Repeat named jobs to select more than one.
 - `--dry-run`: No writes or mounts; prints actions.
 - `--safe`: Do not delete files; rsync without delete flags.
 - `--verbose`: More detailed logging.
@@ -229,8 +229,9 @@ By default Timevault uses `/usr/sbin/sendmail -t`; set `options.report.sendmail`
 ## Commands
 
 ### Backup (default)
-- `timevault` or `timevault backup`
-- Runs all jobs with `run: auto` unless `--job` is specified.
+- `timevault --job <name>` or `timevault backup --job <name>`
+- `timevault --job all` runs all jobs with `run: auto`.
+- Running TimeVault without options displays help; backups always require `--job`.
 - Uses the first connected disk unless `--disk-id` is set to a disk id or filesystem UUID.
 - With `--cascade`, uses the primary disk’s `current` as the source for other disks.
 

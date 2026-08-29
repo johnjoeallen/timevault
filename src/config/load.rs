@@ -132,6 +132,12 @@ fn parse_runtime(cfg: Config) -> Result<RuntimeConfig> {
         if job.name.trim().is_empty() {
             return Err(ConfigError::Invalid("job name is required".to_string()).into());
         }
+        if job.name == "all" {
+            return Err(ConfigError::Invalid(
+                "job name all is reserved; use --job all to run all auto-enabled jobs".to_string(),
+            )
+            .into());
+        }
         if !is_safe_name(&job.name) {
             return Err(ConfigError::Invalid(format!(
                 "job {} name must use only letters, digits, '.', '-', '_'",
@@ -345,6 +351,23 @@ jobs:
         assert!(err
             .to_string()
             .contains("remote.mac is required when remote.wol is true"));
+    }
+
+    #[test]
+    fn job_name_all_is_reserved() {
+        let mut file = NamedTempFile::new().expect("tempfile");
+        let yaml = r#"
+backupDisks:
+  - diskId: "primary"
+    fsUuid: "uuid-1"
+jobs:
+  - name: "all"
+    source: "/"
+    copies: 2
+"#;
+        file.write_all(yaml.as_bytes()).expect("write");
+        let err = load_config(file.path().to_string_lossy().as_ref()).expect_err("invalid config");
+        assert!(err.to_string().contains("job name all is reserved"));
     }
 
     #[test]

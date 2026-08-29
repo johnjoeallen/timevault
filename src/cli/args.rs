@@ -220,6 +220,13 @@ mod tests {
     }
 
     #[test]
+    fn parses_all_backup_job_selector() {
+        let cli = Cli::parse_from(["timevault", "--job", "all"]);
+        assert!(cli.command.is_none());
+        assert_eq!(cli.job, vec!["all"]);
+    }
+
+    #[test]
     fn parses_disk_ls_target() {
         let cli = Cli::parse_from(["timevault", "disk", "ls", "primary:/snapshots"]);
         let Some(Command::Disk {

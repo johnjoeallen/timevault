@@ -15,7 +15,7 @@ use crate::types::RunMode;
 
 const CONFIG_FILE: &str = "/etc/timevault.yaml";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-pub(crate) const BUILD_NUMBER: u32 = 2;
+pub(crate) const BUILD_NUMBER: u32 = 0;
 const LICENSE_NAME: &str = "GNU GPL v3 or later";
 const COPYRIGHT: &str = "Copyright (C) 2026 John Allen (john.joe.allen@gmail.com)";
 const PROJECT_URL: &str = "https://github.com/johnjoeallen/timevault";
@@ -37,6 +37,10 @@ pub fn run() -> Result<()> {
         print_copyright();
         println!("Project: {}", PROJECT_URL);
         println!("License: {}", LICENSE_NAME);
+        return Ok(());
+    }
+    if needs_backup_selection_help(cli.command.as_ref(), &cli.job) {
+        print_help();
         return Ok(());
     }
 
@@ -217,7 +221,8 @@ fn print_copyright() {
 
 fn print_help() {
     println!("Usage:");
-    println!("  timevault [backup] [options]");
+    println!("  timevault --job <name|all> [options]");
+    println!("  timevault backup --job <name|all> [options]");
     println!("  timevault wake <job> [options]");
     println!("  timevault disk ls [--short | --columns] [<disk>:/path]");
     println!("  timevault disk register <id> [--fs-uuid <uuid> | --device <path>] [--label <label>] [--mount-options <opts>] [--force]");
@@ -251,7 +256,7 @@ fn print_help() {
     println!();
     println!("Options:");
     println!("  --config <path>        Config file path");
-    println!("  --job <name>           Run only selected job(s)");
+    println!("  --job <name|all>       Run one job, or all auto-enabled jobs; `all` is reserved");
     println!("  wake <job>             Send configured WOL packet and wait for ping");
     println!("  --dry-run              Do not write data");
     println!("  --safe                 Do not delete files");
@@ -287,6 +292,28 @@ fn print_help() {
     println!("  rotate-out             Exclude the disk from automatic backup rotation");
 }
 
+fn needs_backup_selection_help(command: Option<&Command>, jobs: &[String]) -> bool {
+    jobs.is_empty() && matches!(command, None | Some(Command::Backup))
+}
+
 fn init_tracing() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backup_without_a_job_selector_displays_help() {
+        assert!(needs_backup_selection_help(None, &[]));
+        assert!(needs_backup_selection_help(Some(&Command::Backup), &[]));
+        assert!(!needs_backup_selection_help(None, &["all".to_string()]));
+        assert!(!needs_backup_selection_help(
+            Some(&Command::Wake(crate::cli::args::WakeArgs {
+                job: "spitfire".to_string(),
+            })),
+            &[]
+        ));
+    }
 }
