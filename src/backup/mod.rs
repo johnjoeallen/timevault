@@ -210,7 +210,7 @@ fn run_backup_job(
             _power_guard,
         }) => {
             let reason = format!(
-                "host was started by Wake-on-LAN, has only {}s uptime, and has no journal activity in the prior daily window",
+                "host was started by Wake-on-LAN, has only {}s uptime, and has no interactive session in the prior daily window",
                 uptime_seconds
             );
             println!("job {} skipped: {}", job.name, reason);
@@ -999,7 +999,7 @@ fn start_remote_power_guard(job: &Job, run_mode: RunMode) -> Result<RemotePowerS
                 wake_target_description(remote)
             );
             println!(
-                "dry-run: would check uptime after WOL; below {} seconds, it would inspect the remote persistent journal for activity during the prior daily window",
+                "dry-run: would check uptime after WOL; below {} seconds, it would inspect the remote persistent journal for interactive sessions during the prior daily window",
                 remote
                     .minimum_uptime_seconds
                     .unwrap_or(DEFAULT_REMOTE_MINIMUM_UPTIME_SECONDS)
@@ -1076,8 +1076,12 @@ fn start_remote_power_guard(job: &Job, run_mode: RunMode) -> Result<RemotePowerS
         if uptime_seconds < context.minimum_uptime_seconds {
             let boot_start = Utc::now().timestamp() - uptime_seconds as i64;
             let (window_start, window_end) = remote_activity_window(boot_start);
-            if !remote_journal_has_activity(&context.ssh_host, window_start, window_end, run_mode)?
-            {
+            if !remote_journal_has_interactive_session(
+                &context.ssh_host,
+                window_start,
+                window_end,
+                run_mode,
+            )? {
                 return Ok(RemotePowerStart::InactiveColdBoot {
                     uptime_seconds,
                     _power_guard: Some(RemotePowerGuard {
@@ -1468,7 +1472,7 @@ fn remote_activity_window(boot_start: i64) -> (i64, i64) {
     )
 }
 
-fn remote_journal_has_activity(
+fn remote_journal_has_interactive_session(
     ssh_host: &str,
     window_start: i64,
     window_end: i64,
@@ -1481,7 +1485,7 @@ fn remote_journal_has_activity(
         .arg("ConnectTimeout=5")
         .arg(ssh_host)
         .arg(format!(
-            "journalctl --quiet --no-pager --output=cat --since @{} --until @{}",
+            "journalctl --quiet --no-pager --output=cat --since @{} --until @{} SYSLOG_IDENTIFIER=systemd-logind --grep='New session'",
             window_start, window_end
         ))
         .stdin(Stdio::null());

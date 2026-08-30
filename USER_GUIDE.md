@@ -77,7 +77,7 @@ Remote power options are available for SSH-style sources:
 - `remote.host`: Optional host name to ping. Defaults to the SSH host from `source`.
 - `remote.broadcast`, `remote.port`, `remote.interface`, `remote.keepaliveSeconds`: Optional WOL delivery and keepalive settings; used only when `remote.wol` is `true`.
 - `remote.probeTimeoutSeconds`: Total readiness budget for ping followed by an SSH `echo` probe. Default: `180`.
-- `remote.minimumUptimeSeconds`: Uptime below this value after WOL is treated as a cold boot. Default: `600`. For a cold boot, Timevault checks recent persistent journal activity before deciding whether a backup is needed.
+- `remote.minimumUptimeSeconds`: Uptime below this value after WOL is treated as a cold boot. Default: `600`. For a cold boot, Timevault checks recent persistent `systemd-logind` interactive-session records before deciding whether a backup is needed.
 - `remote.afterBackup`: Action after a successful backup: `none` (default), `suspend`, or `shutdown`.
 - Ping- and SSH-readiness failures are always reported as `offline` and skipped. `remote.offlineIfUnreachable: true` also reports other remote-startup failures as `offline`. Default: `false`.
 
@@ -85,7 +85,7 @@ Remote power options are available for SSH-style sources:
 
 Suspend ownership rule:
 
-For each SSH-style backup job with `remote` options, Timevault probes the backup source host with ping and then SSH. If `remote.wol` is enabled, it sends WOL only when the initial ping fails. Both probes must succeed within `probeTimeoutSeconds` before the backup starts. After WOL, Timevault reads `/proc/uptime`. A low uptime is a cold boot, so it queries the remote persistent system journal for activity from 24 hours before that boot, excluding a 10-minute buffer at both ends. Journal activity means the host was on during the daily interval and the backup proceeds; no activity means Timevault skips the backup and powers the host off. The remote journal must be persisted across reboots.
+For each SSH-style backup job with `remote` options, Timevault probes the backup source host with ping and then SSH. If `remote.wol` is enabled, it sends WOL only when the initial ping fails. Both probes must succeed within `probeTimeoutSeconds` before the backup starts. After WOL, Timevault reads `/proc/uptime`. A low uptime is a cold boot, so it queries the remote persistent system journal for `systemd-logind` `New session` records from 24 hours before that boot, excluding a 10-minute buffer at both ends. A matching interactive session means the host was used during the daily interval and the backup proceeds; no matching session means Timevault skips the backup and powers the host off. The remote journal must be persisted across reboots.
 Cascade jobs copied from a remote job ignore wake and suspend handling after their source is rewritten to the primary disk's local snapshot path.
 
 It runs on the backup source host:
