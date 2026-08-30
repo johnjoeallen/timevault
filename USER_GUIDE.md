@@ -71,22 +71,21 @@ Remote hooks receive the same environment plus `TIMEVAULT_JOB_REMOTE_SOURCE`, co
 Remote hooks are best-effort discovered by SSH command execution; missing hook files are treated as success.
 
 Remote power options are available for SSH-style sources:
-- `remote.inhibitSuspend`: If `true`, Timevault prevents suspend on the source host during the job, then restores its prior state.
+- `remote.inhibitSuspend`: Legacy compatibility option. For configured SSH remote jobs, Timevault always prevents suspend while backup work runs and restores the prior state during cleanup.
 - `remote.wol`: If `true`, send Wake-on-LAN only when the initial ping fails. Default: `false`.
 - `remote.mac`: MAC address required when `remote.wol` is `true`.
 - `remote.host`: Optional host name to ping. Defaults to the SSH host from `source`.
 - `remote.broadcast`, `remote.port`, `remote.interface`, `remote.keepaliveSeconds`: Optional WOL delivery and keepalive settings; used only when `remote.wol` is `true`.
 - `remote.probeTimeoutSeconds`: Total readiness budget for ping followed by an SSH `echo` probe. Default: `180`.
-- `remote.minimumUptimeSeconds`: After TimeVault sends WOL, skip the backup when the host uptime is below this many seconds, because the WOL caused a cold boot. Default: `300`. A host that was already running or resumed from suspend has significant uptime and proceeds normally.
+- `remote.minimumUptimeSeconds`: Uptime below this value after WOL is treated as a cold boot. Default: `600`. For a cold boot, Timevault checks recent persistent journal activity before deciding whether a backup is needed.
 - `remote.afterBackup`: Action after a successful backup: `none` (default), `suspend`, or `shutdown`.
-- `remote.offlineIfUnreachable`: If `true`, a host that fails readiness is reported as `offline` and skipped rather than reported as a failed backup. Default: `false`.
+- Ping- and SSH-readiness failures are always reported as `offline` and skipped. `remote.offlineIfUnreachable: true` also reports other remote-startup failures as `offline`. Default: `false`.
 
-`remote.inhibitSuspend` only unmasks suspend targets when Timevault masked them for that job.
-`remote.afterBackup: suspend` uses a separate remote `systemctl suspend` call; `remote.afterBackup: shutdown` uses `systemctl poweroff` instead. When WOL caused a cold boot and TimeVault skips the backup, it powers the host off by default (and also when `afterBackup: shutdown` is configured).
+`remote.afterBackup: suspend` uses a separate remote `systemctl suspend` call; `remote.afterBackup: shutdown` uses `systemctl poweroff` instead. A cold boot with no qualifying prior activity skips the backup and powers the host off.
 
 Suspend ownership rule:
 
-For each SSH-style backup job with `remote` options, Timevault probes the backup source host with ping and then SSH. If `remote.wol` is enabled, it sends WOL only when the initial ping fails. Both probes must succeed within `probeTimeoutSeconds` before the backup starts. When TimeVault sent WOL, it then reads `/proc/uptime`; an uptime below `minimumUptimeSeconds` skips that job to avoid backing up a newly cold-booted host.
+For each SSH-style backup job with `remote` options, Timevault probes the backup source host with ping and then SSH. If `remote.wol` is enabled, it sends WOL only when the initial ping fails. Both probes must succeed within `probeTimeoutSeconds` before the backup starts. After WOL, Timevault reads `/proc/uptime`. A low uptime is a cold boot, so it queries the remote persistent system journal for activity from 24 hours before that boot, excluding a 10-minute buffer at both ends. Journal activity means the host was on during the daily interval and the backup proceeds; no activity means Timevault skips the backup and powers the host off. The remote journal must be persisted across reboots.
 Cascade jobs copied from a remote job ignore wake and suspend handling after their source is rewritten to the primary disk's local snapshot path.
 
 It runs on the backup source host:
@@ -101,14 +100,12 @@ Interpretation:
 - `static` is normal for these targets and is treated as allowed/enabled.
 
 Behaviour:
-- If suspend is currently allowed/enabled on the backup source host, Timevault disables suspend on that host by masking the targets, records that it changed suspend state for that job, and unmasks the targets during that job's cleanup.
-- If suspend is already disabled/masked on the backup source host, Timevault does not call `systemctl mask` again, records that it did not change suspend state, and does not call `systemctl unmask` during cleanup.
-- When suspend was already disabled on the backup source host before the backup, Timevault logs that it will leave suspend disabled.
-- The job order is: readiness probe (and WOL if enabled), check suspend status, disable suspend if necessary, run the backup, then re-enable suspend only if Timevault disabled it.
+- Immediately before backup work starts, Timevault checks suspend state and masks the targets if they are currently allowed.
+- Cleanup always restores the prior suspend state: it unmasks only targets that Timevault masked for this job, and leaves pre-existing disabled state untouched.
+- After a successful backup and suspend cleanup, `afterBackup` is the only post-backup policy: `none` does nothing, `suspend` suspends the host, and `shutdown` powers it off.
 
 Acceptance criteria:
-- If suspend was enabled on the backup source host before a job, Timevault masks the targets during that job and unmasks them afterwards.
-- If suspend was already disabled on the backup source host before a job, Timevault does not mask or unmask the targets.
+- Suspend is disabled before each configured SSH remote backup and restored during cleanup, including error paths.
 - Timevault never re-enables suspend unless it disabled suspend itself during that job.
 - `remote.afterBackup` runs only after a successful backup.
 
@@ -191,7 +188,6 @@ jobs:
     copies: 30
     run: "auto"
     remote:
-      inhibitSuspend: true
       wol: true
       mac: "aa:bb:cc:dd:ee:ff"
       host: "example.com"
@@ -199,7 +195,7 @@ jobs:
       port: 9
       keepaliveSeconds: 60
       probeTimeoutSeconds: 180
-      minimumUptimeSeconds: 300
+      minimumUptimeSeconds: 600
       afterBackup: suspend
     excludes: []
 ```

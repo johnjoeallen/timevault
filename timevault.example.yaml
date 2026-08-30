@@ -72,7 +72,6 @@ jobs:
     # /etc/timevault/scripts/remote-primary.pre and .post.
     # Optional remote power handling:
     # remote:
-    #   inhibitSuspend: true
     #   wol: true
     #   mac: "aa:bb:cc:dd:ee:ff"
     #   host: "example.com"
@@ -81,7 +80,7 @@ jobs:
     #   port: 9
     #   keepaliveSeconds: 60
     #   probeTimeoutSeconds: 180
-    #   minimumUptimeSeconds: 300 # skip when WOL caused a cold boot
+    #   minimumUptimeSeconds: 600 # cold-boot threshold; checks the prior daily journal window
     #   afterBackup: shutdown # allowed: none, suspend, shutdown
     #   offlineIfUnreachable: true # report offline instead of failing when readiness times out
     excludes: []

@@ -11,7 +11,7 @@ use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration as StdDuration, Instant};
 
-use chrono::{Duration, Local};
+use chrono::{Duration, Local, Utc};
 use walkdir::WalkDir;
 
 use crate::backup::pristine::{build_pristine_excludes_for_source, PristineSource};
@@ -37,7 +37,9 @@ const SUSPEND_TARGETS: [&str; 4] = [
 ];
 const PING_ATTEMPT_TIMEOUT: StdDuration = StdDuration::from_secs(2);
 const DEFAULT_REMOTE_PROBE_TIMEOUT_SECONDS: u64 = 180;
-const DEFAULT_REMOTE_MINIMUM_UPTIME_SECONDS: u64 = 300;
+const DEFAULT_REMOTE_MINIMUM_UPTIME_SECONDS: u64 = 600;
+const REMOTE_ACTIVITY_WINDOW_SECONDS: i64 = 24 * 60 * 60;
+const REMOTE_ACTIVITY_BUFFER_SECONDS: i64 = 10 * 60;
 
 #[derive(Debug, Clone, Copy)]
 pub struct BackupOptions {
@@ -56,17 +58,17 @@ impl Drop for LockGuard {
 }
 
 struct SuspendGuard {
-    changed_suspend_state: bool,
+    masked_targets: Vec<&'static str>,
     remote_host: Option<String>,
 }
 
 impl Drop for SuspendGuard {
     fn drop(&mut self) {
-        if self.changed_suspend_state {
+        if !self.masked_targets.is_empty() {
             let Some(remote_host) = self.remote_host.as_deref() else {
                 return;
             };
-            let mut cmd = remote_systemctl_command(remote_host, "unmask");
+            let mut cmd = remote_systemctl_command(remote_host, "unmask", &self.masked_targets);
             match cmd.status() {
                 Ok(status) if status.success() => {}
                 Ok(status) => eprintln!(
@@ -203,18 +205,18 @@ fn run_backup_job(
 
     let mut remote_power_guard = match start_remote_power_guard(job, run_mode) {
         Ok(RemotePowerStart::Ready(guard)) => guard,
-        Ok(RemotePowerStart::FreshBoot {
+        Ok(RemotePowerStart::InactiveColdBoot {
             uptime_seconds,
             _power_guard,
         }) => {
             let reason = format!(
-                "host was started by Wake-on-LAN and has only {}s uptime",
+                "host was started by Wake-on-LAN, has only {}s uptime, and has no journal activity in the prior daily window",
                 uptime_seconds
             );
             println!("job {} skipped: {}", job.name, reason);
             return Ok(skipped_job_report(job, disk_mount, backup_day, reason));
         }
-        Err(err) if remote_offline_if_unreachable(job) => {
+        Err(err) if remote_readiness_failed(&err) || remote_offline_if_unreachable(job) => {
             println!("job {} offline: {}", job.name, err);
             return Ok(offline_job_report(
                 job,
@@ -568,13 +570,13 @@ fn script_failure_reason(kind: &str, exit_code: i32, stderr: &str) -> String {
 fn start_suspend_guard(job: &Job, run_mode: RunMode) -> Result<SuspendGuard> {
     if !has_remote_suspend_guard_config(job) {
         return Ok(SuspendGuard {
-            changed_suspend_state: false,
+            masked_targets: Vec::new(),
             remote_host: None,
         });
     }
     let Some(remote) = remote_ssh_source(&job.source) else {
         return Ok(SuspendGuard {
-            changed_suspend_state: false,
+            masked_targets: Vec::new(),
             remote_host: None,
         });
     };
@@ -586,13 +588,14 @@ fn start_suspend_guard(job: &Job, run_mode: RunMode) -> Result<SuspendGuard> {
             SUSPEND_TARGETS.join(" ")
         );
         return Ok(SuspendGuard {
-            changed_suspend_state: false,
+            masked_targets: Vec::new(),
             remote_host: None,
         });
     }
 
-    if suspend_is_allowed(&remote.host, run_mode)? {
-        let mut cmd = remote_systemctl_command(&remote.host, "mask");
+    let targets_to_mask = suspend_targets_to_mask(&remote.host, run_mode)?;
+    if !targets_to_mask.is_empty() {
+        let mut cmd = remote_systemctl_command(&remote.host, "mask", &targets_to_mask);
         maybe_print_command(&cmd, run_mode);
         let status = cmd.status().map_err(|err| {
             TimevaultError::message(format!(
@@ -608,7 +611,7 @@ fn start_suspend_guard(job: &Job, run_mode: RunMode) -> Result<SuspendGuard> {
             )));
         }
         Ok(SuspendGuard {
-            changed_suspend_state: true,
+            masked_targets: targets_to_mask,
             remote_host: Some(remote.host),
         })
     } else {
@@ -617,14 +620,14 @@ fn start_suspend_guard(job: &Job, run_mode: RunMode) -> Result<SuspendGuard> {
             remote.host
         );
         Ok(SuspendGuard {
-            changed_suspend_state: false,
+            masked_targets: Vec::new(),
             remote_host: None,
         })
     }
 }
 
-fn suspend_is_allowed(remote_host: &str, run_mode: RunMode) -> Result<bool> {
-    let mut cmd = remote_systemctl_command(remote_host, "is-enabled");
+fn suspend_targets_to_mask(remote_host: &str, run_mode: RunMode) -> Result<Vec<&'static str>> {
+    let mut cmd = remote_systemctl_command(remote_host, "is-enabled", &SUSPEND_TARGETS);
     maybe_print_command(&cmd, run_mode);
     let output = cmd.output().map_err(|err| {
         TimevaultError::message(format!(
@@ -636,7 +639,7 @@ fn suspend_is_allowed(remote_host: &str, run_mode: RunMode) -> Result<bool> {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let combined = format!("{}\n{}", stdout, stderr);
     if output.status.success() || output.status.code() != Some(255) && !combined.trim().is_empty() {
-        Ok(suspend_is_allowed_from_systemctl_output(&combined))
+        Ok(suspend_targets_to_mask_from_systemctl_output(&combined))
     } else {
         Err(TimevaultError::message(format!(
             "failed to detect suspend state on backup source host {}: ssh exited with code {}",
@@ -646,16 +649,20 @@ fn suspend_is_allowed(remote_host: &str, run_mode: RunMode) -> Result<bool> {
     }
 }
 
-fn suspend_is_allowed_from_systemctl_output(output: &str) -> bool {
-    !output.lines().any(|line| line.trim() == "masked")
+fn suspend_targets_to_mask_from_systemctl_output(output: &str) -> Vec<&'static str> {
+    SUSPEND_TARGETS
+        .iter()
+        .zip(output.lines())
+        .filter_map(|(target, state)| (state.trim() != "masked").then_some(*target))
+        .collect()
 }
 
-fn remote_systemctl_command(remote_host: &str, action: &str) -> Command {
+fn remote_systemctl_command(remote_host: &str, action: &str, targets: &[&str]) -> Command {
     let mut cmd = Command::new("ssh");
     cmd.arg(remote_host)
         .arg("systemctl")
         .arg(action)
-        .args(SUSPEND_TARGETS);
+        .args(targets);
     cmd
 }
 
@@ -847,7 +854,7 @@ struct RemotePowerGuard {
 
 enum RemotePowerStart {
     Ready(Option<RemotePowerGuard>),
-    FreshBoot {
+    InactiveColdBoot {
         uptime_seconds: u64,
         _power_guard: Option<RemotePowerGuard>,
     },
@@ -962,7 +969,13 @@ pub fn wake_remote_job(job: &Job, run_mode: RunMode) -> Result<()> {
             context.mac.as_deref().expect("validated WOL MAC"),
             &context.targets,
         )?;
-        wait_for_ping_until(&context.host, deadline, run_mode)?;
+        wait_for_ping_after_wake(
+            &context.host,
+            deadline,
+            context.mac.as_deref().expect("validated WOL MAC"),
+            &context.targets,
+            run_mode,
+        )?;
     }
     wait_for_ssh_until(&context.ssh_host, deadline, run_mode)
 }
@@ -986,7 +999,7 @@ fn start_remote_power_guard(job: &Job, run_mode: RunMode) -> Result<RemotePowerS
                 wake_target_description(remote)
             );
             println!(
-                "dry-run: would check uptime after WOL and skip the backup below {} seconds",
+                "dry-run: would check uptime after WOL; below {} seconds, it would inspect the remote persistent journal for activity during the prior daily window",
                 remote
                     .minimum_uptime_seconds
                     .unwrap_or(DEFAULT_REMOTE_MINIMUM_UPTIME_SECONDS)
@@ -1044,7 +1057,13 @@ fn start_remote_power_guard(job: &Job, run_mode: RunMode) -> Result<RemotePowerS
             context.mac.as_deref().expect("validated WOL MAC"),
             &context.targets,
         )?;
-        wait_for_ping_until(&context.host, deadline, run_mode)?;
+        wait_for_ping_after_wake(
+            &context.host,
+            deadline,
+            context.mac.as_deref().expect("validated WOL MAC"),
+            &context.targets,
+            run_mode,
+        )?;
         true
     } else {
         wait_for_ping_until(&context.host, deadline, run_mode)?;
@@ -1055,17 +1074,21 @@ fn start_remote_power_guard(job: &Job, run_mode: RunMode) -> Result<RemotePowerS
     if was_woken {
         let uptime_seconds = remote_uptime_seconds(&context.ssh_host, run_mode)?;
         if uptime_seconds < context.minimum_uptime_seconds {
-            let power_off_after_cold_boot = should_power_off_after_cold_boot(context.after_backup);
-            return Ok(RemotePowerStart::FreshBoot {
-                uptime_seconds,
-                _power_guard: power_off_after_cold_boot.then(|| RemotePowerGuard {
-                    keepalive: None,
-                    after_backup: RemoteAfterBackup::Shutdown,
-                    backup_completed: true,
-                    remote_host: context.ssh_host,
-                    job_name: job.name.clone(),
-                }),
-            });
+            let boot_start = Utc::now().timestamp() - uptime_seconds as i64;
+            let (window_start, window_end) = remote_activity_window(boot_start);
+            if !remote_journal_has_activity(&context.ssh_host, window_start, window_end, run_mode)?
+            {
+                return Ok(RemotePowerStart::InactiveColdBoot {
+                    uptime_seconds,
+                    _power_guard: Some(RemotePowerGuard {
+                        keepalive: None,
+                        after_backup: RemoteAfterBackup::Shutdown,
+                        backup_completed: true,
+                        remote_host: context.ssh_host,
+                        job_name: job.name.clone(),
+                    }),
+                });
+            }
         }
     }
 
@@ -1135,6 +1158,11 @@ fn remote_offline_if_unreachable(job: &Job) -> bool {
         .unwrap_or(false)
 }
 
+fn remote_readiness_failed(error: &TimevaultError) -> bool {
+    let message = error.to_string();
+    message.contains("did not respond to ping") || message.contains("SSH readiness probe")
+}
+
 fn remote_config<'a>(job: &'a Job) -> Option<(&'a RemoteJobOptions, RemoteSshSource, String)> {
     let Some(remote_options) = &job.remote else {
         return None;
@@ -1151,10 +1179,7 @@ fn has_active_remote_config(job: &Job) -> bool {
 }
 
 fn has_remote_suspend_guard_config(job: &Job) -> bool {
-    job.remote
-        .as_ref()
-        .is_some_and(|remote| remote.inhibit_suspend == Some(true))
-        && has_active_remote_config(job)
+    has_active_remote_config(job)
 }
 
 fn wake_target_description(remote: &RemoteJobOptions) -> String {
@@ -1345,6 +1370,38 @@ fn wait_for_ping_until(host: &str, deadline: Instant, run_mode: RunMode) -> Resu
     })
 }
 
+fn wait_for_ping_after_wake(
+    host: &str,
+    deadline: Instant,
+    mac: &str,
+    targets: &[SocketAddrV4],
+    run_mode: RunMode,
+) -> Result<()> {
+    loop {
+        if ping_once(host, run_mode)? {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(TimevaultError::message(format!(
+                "remote host {} did not respond to ping",
+                host
+            )));
+        }
+        if run_mode.verbose {
+            println!(
+                "wake host {} is not reachable yet; sending another WOL packet to {} target(s)",
+                host,
+                targets.len()
+            );
+        }
+        send_wake_packets(mac, targets)?;
+        let delay = deadline
+            .saturating_duration_since(Instant::now())
+            .min(StdDuration::from_secs(2));
+        thread::sleep(delay);
+    }
+}
+
 fn wait_for_ssh_until(ssh_host: &str, deadline: Instant, run_mode: RunMode) -> Result<()> {
     retry_remote_readiness_until(ssh_host, "accept SSH connections", deadline, || {
         let mut cmd = Command::new("ssh");
@@ -1404,8 +1461,45 @@ fn parse_uptime_seconds(output: &str) -> Option<u64> {
     output.trim().split('.').next()?.parse().ok()
 }
 
-fn should_power_off_after_cold_boot(after_backup: Option<RemoteAfterBackup>) -> bool {
-    matches!(after_backup, None | Some(RemoteAfterBackup::Shutdown))
+fn remote_activity_window(boot_start: i64) -> (i64, i64) {
+    (
+        boot_start - REMOTE_ACTIVITY_WINDOW_SECONDS + REMOTE_ACTIVITY_BUFFER_SECONDS,
+        boot_start - REMOTE_ACTIVITY_BUFFER_SECONDS,
+    )
+}
+
+fn remote_journal_has_activity(
+    ssh_host: &str,
+    window_start: i64,
+    window_end: i64,
+    run_mode: RunMode,
+) -> Result<bool> {
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ConnectTimeout=5")
+        .arg(ssh_host)
+        .arg(format!(
+            "journalctl --quiet --no-pager --output=cat --since @{} --until @{}",
+            window_start, window_end
+        ))
+        .stdin(Stdio::null());
+    maybe_print_command(&cmd, run_mode);
+    let output = cmd.output().map_err(|err| {
+        TimevaultError::message(format!(
+            "read remote system journal from {}: {}",
+            ssh_host, err
+        ))
+    })?;
+    if !output.status.success() {
+        return Err(TimevaultError::message(format!(
+            "read remote system journal from {}: ssh exited with code {}",
+            ssh_host,
+            output.status.code().unwrap_or(1)
+        )));
+    }
+    Ok(!output.stdout.is_empty())
 }
 
 fn retry_remote_readiness_until<T, F>(
@@ -2170,6 +2264,7 @@ mod tests {
             broadcast: Some("192.0.2.255".to_string()),
             ..RemoteJobOptions::default()
         });
+        assert_eq!(DEFAULT_REMOTE_MINIMUM_UPTIME_SECONDS, 600);
         assert_eq!(
             remote_context(&remote_job)
                 .expect("context")
@@ -2194,16 +2289,24 @@ mod tests {
     }
 
     #[test]
-    fn cold_boots_power_off_by_default_or_when_configured_to_shutdown() {
-        assert!(should_power_off_after_cold_boot(None));
-        assert!(should_power_off_after_cold_boot(Some(
-            RemoteAfterBackup::Shutdown
+    fn remote_activity_window_excludes_ten_minutes_at_each_boundary() {
+        let boot_start = 1_000_000;
+        assert_eq!(
+            remote_activity_window(boot_start),
+            (boot_start - 24 * 60 * 60 + 10 * 60, boot_start - 10 * 60)
+        );
+    }
+
+    #[test]
+    fn readiness_failures_are_reported_as_offline() {
+        assert!(remote_readiness_failed(&TimevaultError::message(
+            "remote host example did not respond to ping"
         )));
-        assert!(!should_power_off_after_cold_boot(Some(
-            RemoteAfterBackup::None
+        assert!(remote_readiness_failed(&TimevaultError::message(
+            "SSH readiness probe for example exited with code 255"
         )));
-        assert!(!should_power_off_after_cold_boot(Some(
-            RemoteAfterBackup::Suspend
+        assert!(!remote_readiness_failed(&TimevaultError::message(
+            "read remote system journal from example: ssh exited with code 1"
         )));
     }
 
@@ -2238,7 +2341,7 @@ mod tests {
             .unwrap()
             .inhibit_suspend = None;
         assert!(has_active_remote_config(&wake_without_inhibit_job));
-        assert!(!has_remote_suspend_guard_config(&wake_without_inhibit_job));
+        assert!(has_remote_suspend_guard_config(&wake_without_inhibit_job));
     }
 
     #[test]
@@ -2273,24 +2376,33 @@ mod tests {
     }
 
     #[test]
-    fn suspend_static_targets_are_allowed() {
+    fn suspend_static_targets_are_masked_for_backup() {
         let output = "static\nstatic\nstatic\nstatic\n";
 
-        assert!(suspend_is_allowed_from_systemctl_output(output));
+        assert_eq!(
+            suspend_targets_to_mask_from_systemctl_output(output),
+            SUSPEND_TARGETS
+        );
     }
 
     #[test]
-    fn suspend_masked_target_means_already_disabled() {
+    fn suspend_masked_targets_are_preserved() {
         let output = "static\nmasked\nstatic\nstatic\n";
 
-        assert!(!suspend_is_allowed_from_systemctl_output(output));
+        assert_eq!(
+            suspend_targets_to_mask_from_systemctl_output(output),
+            vec!["sleep.target", "hibernate.target", "hybrid-sleep.target"]
+        );
     }
 
     #[test]
-    fn suspend_disabled_but_unmasked_targets_are_allowed() {
+    fn unmasked_states_are_masked_for_backup() {
         let output = "disabled\nstatic\nenabled\nindirect\n";
 
-        assert!(suspend_is_allowed_from_systemctl_output(output));
+        assert_eq!(
+            suspend_targets_to_mask_from_systemctl_output(output),
+            SUSPEND_TARGETS
+        );
     }
 
     #[test]
