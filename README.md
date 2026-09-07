@@ -15,7 +15,7 @@ Timevault is a safe, rsync-based backup tool built for people who want dependabl
 - Snapshot rotation with date-stamped directories and a stable `current` symlink.
 - Safe, dry-run, and print-order modes for validation before writing.
 - Optional pristine package excludes with separate local and remote-host caches.
-- Manual runs: target jobs with `--job`, select disks positionally or with `--disk-id`, or cascade with `--cascade`.
+- Manual runs: `timevault backup --job <name|all>`, select disks positionally or with `--disk-id`, or cascade with `--cascade`.
 - Disk commands for registration, listing, mounting, checking, space reporting, rename, enable/disable, rotation control, inspect, and unregister.
 - Optional HTML backup reports sent through `sendmail`.
 - Systemd service + timer support for unattended schedules.

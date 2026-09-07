@@ -211,7 +211,7 @@ jobs:
 ## Command-line options
 Global options:
 - `--config <path>`: Use a specific config file.
-- `--job <name>`: Run one named job. `--job all` runs every job with `run: auto`; `all` is reserved and cannot be a job name. Repeat named jobs to select more than one.
+- `--job <name>`: Run one named job. `--job all`, or omitting `--job` from a `backup` run, runs every job with `run: auto`; `all` is reserved and cannot be a job name. Repeat named jobs to select more than one.
 - `--dry-run`: No writes or mounts; prints actions.
 - `--safe`: Do not delete files; rsync without delete flags.
 - `--verbose`: More detailed logging.
@@ -232,10 +232,11 @@ By default Timevault uses `/usr/sbin/sendmail -t`; set `options.report.sendmail`
 
 ## Commands
 
-### Backup (default)
-- `timevault --job <name>` or `timevault backup --job <name>`
-- `timevault --job all` runs all jobs with `run: auto`.
-- Running TimeVault without options displays help; backups always require `--job`.
+### Backup
+- `timevault backup --job <name>` (or `timevault --job <name>`).
+- `timevault backup --job all` runs all jobs with `run: auto`.
+- `timevault backup` with no `--job` is the same as `timevault backup --job all`.
+- Running Timevault with no command and no `--job` displays help, the same as `--help`.
 - Uses the first connected disk unless `--disk-id` is set to a disk id or filesystem UUID.
 - With `--cascade`, uses the primary disk’s `current` as the source for other disks.
 
@@ -346,7 +347,7 @@ sudo timevault disk register primary --fs-uuid <uuid>
 ```
 5) Run a dry-run with the test config:
 ```bash
-sudo timevault --config ~/timevault.test.yaml --dry-run --verbose
+sudo timevault backup --job all --config ~/timevault.test.yaml --dry-run --verbose
 ```
 6) If the output looks correct, move the config into place:
 ```bash
@@ -354,12 +355,12 @@ sudo install -m 644 ~/timevault.test.yaml /etc/timevault.yaml
 ```
 7) Run a real backup:
 ```bash
-sudo timevault --verbose
+sudo timevault backup --job all --verbose
 ```
 
 ## Systemd service and timer
 Timevault ships with a systemd service and timer:
-- `timevault.service`: Runs `timevault` (default backup).
+- `timevault.service`: Runs `timevault backup --job all`.
 - `timevault.timer`: Runs daily (default: 2am).
 
 Enable and start:
@@ -387,7 +388,7 @@ In the editor, add an override that replaces `ExecStart`:
 ```ini
 [Service]
 ExecStart=
-ExecStart=/usr/bin/timevault --config /etc/timevault.yaml --safe
+ExecStart=/usr/bin/timevault backup --job all --config /etc/timevault.yaml --safe
 ```
 Then reload systemd and restart the service:
 ```bash

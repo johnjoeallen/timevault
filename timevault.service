@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/timevault --job all
+ExecStart=/usr/bin/timevault backup --job all
 
 [Install]
 WantedBy=multi-user.target

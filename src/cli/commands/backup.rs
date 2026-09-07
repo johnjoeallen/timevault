@@ -58,12 +58,8 @@ pub fn run_backup_command(
 
     let selected_set: std::collections::HashSet<String> = selected_jobs.iter().cloned().collect();
     let mut jobs_to_run = Vec::new();
-    if selected_set.is_empty() {
-        return Err(TimevaultError::message(
-            "backup requires --job <name> or --job all".to_string(),
-        ));
-    } else if selected_set.contains("all") {
-        if selected_set.len() != 1 {
+    if selected_set.is_empty() || selected_set.contains("all") {
+        if selected_set.len() > 1 {
             return Err(TimevaultError::message(
                 "--job all cannot be combined with other job names".to_string(),
             ));

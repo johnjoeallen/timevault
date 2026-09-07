@@ -221,8 +221,8 @@ fn print_copyright() {
 
 fn print_help() {
     println!("Usage:");
+    println!("  timevault backup [--job <name|all>] [options]  (no --job runs all auto jobs)");
     println!("  timevault --job <name|all> [options]");
-    println!("  timevault backup --job <name|all> [options]");
     println!("  timevault wake <job> [options]");
     println!("  timevault disk ls [--short | --columns] [<disk>:/path]");
     println!("  timevault disk register <id> [--fs-uuid <uuid> | --device <path>] [--label <label>] [--mount-options <opts>] [--force]");
@@ -293,7 +293,7 @@ fn print_help() {
 }
 
 fn needs_backup_selection_help(command: Option<&Command>, jobs: &[String]) -> bool {
-    jobs.is_empty() && matches!(command, None | Some(Command::Backup))
+    command.is_none() && jobs.is_empty()
 }
 
 fn init_tracing() {
@@ -305,9 +305,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn backup_without_a_job_selector_displays_help() {
+    fn bare_invocation_displays_help() {
+        // No command and no job selector: same as `--help`.
         assert!(needs_backup_selection_help(None, &[]));
-        assert!(needs_backup_selection_help(Some(&Command::Backup), &[]));
+        // `timevault backup` with no job runs all auto jobs, so no help.
+        assert!(!needs_backup_selection_help(Some(&Command::Backup), &[]));
+        // A job selector without a subcommand still runs a backup.
         assert!(!needs_backup_selection_help(None, &["all".to_string()]));
         assert!(!needs_backup_selection_help(
             Some(&Command::Wake(crate::cli::args::WakeArgs {
