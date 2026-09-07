@@ -289,7 +289,8 @@ jobs:
       keepaliveSeconds: 60
       probeTimeoutSeconds: 120
       minimumUptimeSeconds: 600
-      afterBackup: shutdown
+      minimumSessionSeconds: 120
+      afterBackup: return
       offlineIfUnreachable: true
 "#;
         file.write_all(yaml.as_bytes()).expect("write");
@@ -304,9 +305,10 @@ jobs:
         assert_eq!(remote.keepalive_seconds, Some(60));
         assert_eq!(remote.probe_timeout_seconds, Some(120));
         assert_eq!(remote.minimum_uptime_seconds, Some(600));
+        assert_eq!(remote.minimum_session_seconds, Some(120));
         assert_eq!(
             remote.after_backup,
-            Some(crate::config::model::RemoteAfterBackup::Shutdown)
+            Some(crate::config::model::RemoteAfterBackup::Return)
         );
         assert_eq!(remote.offline_if_unreachable, Some(true));
     }

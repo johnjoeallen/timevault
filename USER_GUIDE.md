@@ -78,14 +78,21 @@ Remote power options are available for SSH-style sources:
 - `remote.broadcast`, `remote.port`, `remote.interface`, `remote.keepaliveSeconds`: Optional WOL delivery and keepalive settings; used only when `remote.wol` is `true`.
 - `remote.probeTimeoutSeconds`: Total readiness budget for ping followed by an SSH `echo` probe. Default: `180`.
 - `remote.minimumUptimeSeconds`: Uptime below this value after WOL is treated as a cold boot. Default: `600`. For a cold boot, Timevault checks recent persistent `systemd-logind` interactive-session records before deciding whether a backup is needed.
-- `remote.afterBackup`: Action after a successful backup: `none` (default), `suspend`, or `shutdown`.
+- `remote.minimumSessionSeconds`: Shortest `systemd-logind` session, in seconds, that counts as real use when deciding whether a cold boot should back up. Default: `300`. A session that starts in the prior daily window and stays open at least this long qualifies; a session still open at reboot is measured up to that boot. Briefly logging in to power the host off therefore does not keep it in service.
+- `remote.afterBackup`: Action after a successful backup: `return` (default), `none`, `suspend`, or `shutdown`.
 - Ping- and SSH-readiness failures are always reported as `offline` and skipped. `remote.offlineIfUnreachable: true` also reports other remote-startup failures as `offline`. Default: `false`.
 
-`remote.afterBackup: suspend` uses a separate remote `systemctl suspend` call; `remote.afterBackup: shutdown` uses `systemctl poweroff` instead. A cold boot with no qualifying prior activity skips the backup and powers the host off.
+`remote.afterBackup` values:
+- `return` (default): put the host back in the power state Timevault found it in — left running if it answered without Wake-on-LAN, suspended (`systemctl suspend`) if WOL resumed it from suspend, powered off (`systemctl poweroff`) if WOL cold-booted it. So Timevault never leaves a host more awake than it found it.
+- `none`: take no action; leave the host running.
+- `suspend`: always `systemctl suspend`.
+- `shutdown`: always `systemctl poweroff`.
+
+A cold boot with no qualifying prior activity skips the backup and powers the host off regardless of `afterBackup`.
 
 Suspend ownership rule:
 
-For each SSH-style backup job with `remote` options, Timevault probes the backup source host with ping and then SSH. If `remote.wol` is enabled, it sends WOL only when the initial ping fails. Both probes must succeed within `probeTimeoutSeconds` before the backup starts. After WOL, Timevault reads `/proc/uptime`. A low uptime is a cold boot, so it queries the remote persistent system journal for `systemd-logind` `New session` records from 24 hours before that boot, excluding a 10-minute buffer at both ends. A matching interactive session means the host was used during the daily interval and the backup proceeds; no matching session means Timevault skips the backup and powers the host off. The remote journal must be persisted across reboots.
+For each SSH-style backup job with `remote` options, Timevault probes the backup source host with ping and then SSH. If `remote.wol` is enabled, it sends WOL only when the initial ping fails. Both probes must succeed within `probeTimeoutSeconds` before the backup starts. After WOL, Timevault reads `/proc/uptime`. A low uptime is a cold boot, so it queries the remote persistent system journal for `systemd-logind` `New session`/`Removed session` records from 24 hours before that boot, excluding a 10-minute buffer at both ends. A session that starts in that window and lasts at least `minimumSessionSeconds` (an unclosed session is measured up to the boot) means the host was used during the daily interval and the backup proceeds; no qualifying session means Timevault skips the backup and powers the host off. The remote journal must be persisted across reboots.
 Cascade jobs copied from a remote job ignore wake and suspend handling after their source is rewritten to the primary disk's local snapshot path.
 
 It runs on the backup source host:
@@ -102,7 +109,7 @@ Interpretation:
 Behaviour:
 - Immediately before backup work starts, Timevault checks suspend state and masks the targets if they are currently allowed.
 - Cleanup always restores the prior suspend state: it unmasks only targets that Timevault masked for this job, and leaves pre-existing disabled state untouched.
-- After a successful backup and suspend cleanup, `afterBackup` is the only post-backup policy: `none` does nothing, `suspend` suspends the host, and `shutdown` powers it off.
+- After a successful backup and suspend cleanup, `afterBackup` is the only post-backup policy: `return` (default) restores the found power state, `none` does nothing, `suspend` suspends the host, and `shutdown` powers it off.
 
 Acceptance criteria:
 - Suspend is disabled before each configured SSH remote backup and restored during cleanup, including error paths.
@@ -196,7 +203,8 @@ jobs:
       keepaliveSeconds: 60
       probeTimeoutSeconds: 180
       minimumUptimeSeconds: 600
-      afterBackup: suspend
+      minimumSessionSeconds: 300
+      afterBackup: return
     excludes: []
 ```
 

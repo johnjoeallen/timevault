@@ -81,6 +81,7 @@ jobs:
     #   keepaliveSeconds: 60
     #   probeTimeoutSeconds: 180
     #   minimumUptimeSeconds: 600 # cold-boot threshold; checks the prior daily journal window
-    #   afterBackup: shutdown # allowed: none, suspend, shutdown
+    #   minimumSessionSeconds: 300 # cold boot proceeds only if a prior-window login lasted this long
+    #   afterBackup: return # default: return; also none, suspend, shutdown. return = restore the power state the host was found in
     #   offlineIfUnreachable: true # report offline instead of failing when readiness times out
     excludes: []

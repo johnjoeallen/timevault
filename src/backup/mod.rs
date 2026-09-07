@@ -38,6 +38,7 @@ const SUSPEND_TARGETS: [&str; 4] = [
 const PING_ATTEMPT_TIMEOUT: StdDuration = StdDuration::from_secs(2);
 const DEFAULT_REMOTE_PROBE_TIMEOUT_SECONDS: u64 = 180;
 const DEFAULT_REMOTE_MINIMUM_UPTIME_SECONDS: u64 = 600;
+const DEFAULT_REMOTE_MINIMUM_SESSION_SECONDS: u64 = 300;
 const REMOTE_ACTIVITY_WINDOW_SECONDS: i64 = 24 * 60 * 60;
 const REMOTE_ACTIVITY_BUFFER_SECONDS: i64 = 10 * 60;
 
@@ -207,11 +208,12 @@ fn run_backup_job(
         Ok(RemotePowerStart::Ready(guard)) => guard,
         Ok(RemotePowerStart::InactiveColdBoot {
             uptime_seconds,
+            minimum_session_seconds,
             _power_guard,
         }) => {
             let reason = format!(
-                "host was started by Wake-on-LAN, has only {}s uptime, and has no interactive session in the prior daily window",
-                uptime_seconds
+                "host was started by Wake-on-LAN, has only {}s uptime, and had no interactive session lasting at least {}s in the prior daily window",
+                uptime_seconds, minimum_session_seconds
             );
             println!("job {} skipped: {}", job.name, reason);
             return Ok(skipped_job_report(job, disk_mount, backup_day, reason));
@@ -827,6 +829,7 @@ struct WakeContext {
     keepalive_seconds: Option<u64>,
     probe_timeout: StdDuration,
     minimum_uptime_seconds: u64,
+    minimum_session_seconds: u64,
     after_backup: Option<RemoteAfterBackup>,
 }
 
@@ -844,9 +847,45 @@ impl Drop for WakeKeepalive {
     }
 }
 
+/// The power state a backup source host was in when Timevault reached it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FoundPowerState {
+    /// Already up: answered readiness probes without needing Wake-on-LAN.
+    Running,
+    /// Resumed from suspend by Wake-on-LAN (woken, but with real uptime).
+    Suspended,
+    /// Cold-booted by Wake-on-LAN (woken, with near-zero uptime).
+    PoweredOff,
+}
+
+/// The concrete action to take once the backup finishes, after resolving
+/// `afterBackup: return` against the host's [`FoundPowerState`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PowerAction {
+    Leave,
+    Suspend,
+    PowerOff,
+}
+
+fn resolve_after_backup(
+    configured: Option<RemoteAfterBackup>,
+    found: FoundPowerState,
+) -> PowerAction {
+    match configured {
+        Some(RemoteAfterBackup::None) => PowerAction::Leave,
+        Some(RemoteAfterBackup::Suspend) => PowerAction::Suspend,
+        Some(RemoteAfterBackup::Shutdown) => PowerAction::PowerOff,
+        None | Some(RemoteAfterBackup::Return) => match found {
+            FoundPowerState::Running => PowerAction::Leave,
+            FoundPowerState::Suspended => PowerAction::Suspend,
+            FoundPowerState::PoweredOff => PowerAction::PowerOff,
+        },
+    }
+}
+
 struct RemotePowerGuard {
     keepalive: Option<WakeKeepalive>,
-    after_backup: RemoteAfterBackup,
+    action: PowerAction,
     backup_completed: bool,
     remote_host: String,
     job_name: String,
@@ -856,6 +895,7 @@ enum RemotePowerStart {
     Ready(Option<RemotePowerGuard>),
     InactiveColdBoot {
         uptime_seconds: u64,
+        minimum_session_seconds: u64,
         _power_guard: Option<RemotePowerGuard>,
     },
 }
@@ -863,20 +903,21 @@ enum RemotePowerStart {
 impl Drop for RemotePowerGuard {
     fn drop(&mut self) {
         drop(self.keepalive.take());
-        if !self.backup_completed || self.after_backup == RemoteAfterBackup::None {
+        if !self.backup_completed || self.action == PowerAction::Leave {
             return;
         }
+        let (remote_command, verb) = match self.action {
+            PowerAction::PowerOff => ("systemctl poweroff", "power off"),
+            PowerAction::Suspend => ("systemctl suspend", "suspend"),
+            PowerAction::Leave => return,
+        };
         let mut cmd = Command::new("ssh");
         cmd.arg("-o")
             .arg("BatchMode=yes")
             .arg("-o")
             .arg("ConnectTimeout=5")
             .arg(&self.remote_host)
-            .arg(match self.after_backup {
-                RemoteAfterBackup::Shutdown => "systemctl poweroff",
-                RemoteAfterBackup::Suspend => "systemctl suspend",
-                RemoteAfterBackup::None => return,
-            })
+            .arg(remote_command)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -884,25 +925,14 @@ impl Drop for RemotePowerGuard {
             Ok(status) if status.success() => {}
             Ok(status) => eprintln!(
                 "failed to {} remote host {} after job {}: ssh exited with code {}",
-                if self.after_backup == RemoteAfterBackup::Shutdown {
-                    "power off"
-                } else {
-                    "suspend"
-                },
+                verb,
                 self.remote_host,
                 self.job_name,
                 status.code().unwrap_or(1)
             ),
             Err(err) => eprintln!(
                 "failed to {} remote host {} after job {}: {}",
-                if self.after_backup == RemoteAfterBackup::Shutdown {
-                    "power off"
-                } else {
-                    "suspend"
-                },
-                self.remote_host,
-                self.job_name,
-                err
+                verb, self.remote_host, self.job_name, err
             ),
         }
     }
@@ -999,10 +1029,13 @@ fn start_remote_power_guard(job: &Job, run_mode: RunMode) -> Result<RemotePowerS
                 wake_target_description(remote)
             );
             println!(
-                "dry-run: would check uptime after WOL; below {} seconds, it would inspect the remote persistent journal for interactive sessions during the prior daily window",
+                "dry-run: would check uptime after WOL; below {} seconds, it would inspect the remote persistent journal for an interactive session lasting at least {} seconds during the prior daily window",
                 remote
                     .minimum_uptime_seconds
-                    .unwrap_or(DEFAULT_REMOTE_MINIMUM_UPTIME_SECONDS)
+                    .unwrap_or(DEFAULT_REMOTE_MINIMUM_UPTIME_SECONDS),
+                remote
+                    .minimum_session_seconds
+                    .unwrap_or(DEFAULT_REMOTE_MINIMUM_SESSION_SECONDS)
             );
         }
         println!(
@@ -1016,19 +1049,20 @@ fn start_remote_power_guard(job: &Job, run_mode: RunMode) -> Result<RemotePowerS
                 job.name, seconds
             );
         }
-        if let Some(after_backup) = remote
-            .after_backup
-            .filter(|value| *value != RemoteAfterBackup::None)
-        {
-            println!(
-                "dry-run: would {} remote host after a successful job {}",
-                if after_backup == RemoteAfterBackup::Shutdown {
-                    "power off"
-                } else {
-                    "suspend"
-                },
+        match remote.after_backup.unwrap_or(RemoteAfterBackup::Return) {
+            RemoteAfterBackup::None => {}
+            RemoteAfterBackup::Suspend => println!(
+                "dry-run: would suspend remote host after a successful job {}",
                 job.name
-            );
+            ),
+            RemoteAfterBackup::Shutdown => println!(
+                "dry-run: would power off remote host after a successful job {}",
+                job.name
+            ),
+            RemoteAfterBackup::Return => println!(
+                "dry-run: would return remote host to its pre-backup power state (leave running, suspend, or power off) after a successful job {}",
+                job.name
+            ),
         }
         return Ok(RemotePowerStart::Ready(None));
     }
@@ -1071,30 +1105,38 @@ fn start_remote_power_guard(job: &Job, run_mode: RunMode) -> Result<RemotePowerS
     };
     wait_for_ssh_until(&context.ssh_host, deadline, run_mode)?;
 
-    if was_woken {
+    let found_state = if !was_woken {
+        FoundPowerState::Running
+    } else {
         let uptime_seconds = remote_uptime_seconds(&context.ssh_host, run_mode)?;
         if uptime_seconds < context.minimum_uptime_seconds {
             let boot_start = Utc::now().timestamp() - uptime_seconds as i64;
             let (window_start, window_end) = remote_activity_window(boot_start);
-            if !remote_journal_has_interactive_session(
+            if !remote_journal_has_qualifying_session(
                 &context.ssh_host,
                 window_start,
                 window_end,
+                boot_start,
+                context.minimum_session_seconds,
                 run_mode,
             )? {
                 return Ok(RemotePowerStart::InactiveColdBoot {
                     uptime_seconds,
+                    minimum_session_seconds: context.minimum_session_seconds,
                     _power_guard: Some(RemotePowerGuard {
                         keepalive: None,
-                        after_backup: RemoteAfterBackup::Shutdown,
+                        action: PowerAction::PowerOff,
                         backup_completed: true,
                         remote_host: context.ssh_host,
                         job_name: job.name.clone(),
                     }),
                 });
             }
+            FoundPowerState::PoweredOff
+        } else {
+            FoundPowerState::Suspended
         }
-    }
+    };
 
     let keepalive = if was_woken {
         context.keepalive_seconds.map(|seconds| {
@@ -1120,7 +1162,7 @@ fn start_remote_power_guard(job: &Job, run_mode: RunMode) -> Result<RemotePowerS
 
     Ok(RemotePowerStart::Ready(Some(RemotePowerGuard {
         keepalive,
-        after_backup: context.after_backup.unwrap_or(RemoteAfterBackup::None),
+        action: resolve_after_backup(context.after_backup, found_state),
         backup_completed: false,
         remote_host: context.ssh_host,
         job_name: job.name.clone(),
@@ -1152,6 +1194,9 @@ fn remote_context(job: &Job) -> Result<Option<WakeContext>> {
         minimum_uptime_seconds: options
             .minimum_uptime_seconds
             .unwrap_or(DEFAULT_REMOTE_MINIMUM_UPTIME_SECONDS),
+        minimum_session_seconds: options
+            .minimum_session_seconds
+            .unwrap_or(DEFAULT_REMOTE_MINIMUM_SESSION_SECONDS),
         after_backup: options.after_backup,
     }))
 }
@@ -1472,12 +1517,18 @@ fn remote_activity_window(boot_start: i64) -> (i64, i64) {
     )
 }
 
-fn remote_journal_has_interactive_session(
+fn remote_journal_has_qualifying_session(
     ssh_host: &str,
     window_start: i64,
     window_end: i64,
+    boot_start: i64,
+    minimum_session_seconds: u64,
     run_mode: RunMode,
 ) -> Result<bool> {
+    // Read from the start of the activity window through to the boot we just
+    // woke: a session that starts inside the window can only be logged out
+    // (or cut short by the reboot) after `window_end`, so the `Removed
+    // session` line lands in the [window_end, boot_start] tail.
     let mut cmd = Command::new("ssh");
     cmd.arg("-o")
         .arg("BatchMode=yes")
@@ -1485,8 +1536,8 @@ fn remote_journal_has_interactive_session(
         .arg("ConnectTimeout=5")
         .arg(ssh_host)
         .arg(format!(
-            "journalctl --quiet --no-pager --output=cat --since @{} --until @{} SYSLOG_IDENTIFIER=systemd-logind --grep='New session'",
-            window_start, window_end
+            "journalctl --quiet --no-pager --output=short-unix --since @{} --until @{} SYSLOG_IDENTIFIER=systemd-logind --grep='session'",
+            window_start, boot_start
         ))
         .stdin(Stdio::null());
     maybe_print_command(&cmd, run_mode);
@@ -1503,7 +1554,69 @@ fn remote_journal_has_interactive_session(
             output.status.code().unwrap_or(1)
         )));
     }
-    Ok(!output.stdout.is_empty())
+    Ok(journal_has_qualifying_session(
+        &String::from_utf8_lossy(&output.stdout),
+        window_start,
+        window_end,
+        boot_start,
+        minimum_session_seconds as i64,
+    ))
+}
+
+/// A session counts when it *starts* inside the activity window and stays open
+/// for at least `minimum_session_seconds`. An unclosed session is measured up
+/// to `boot_start` (nothing outlives the reboot that woke us).
+fn journal_has_qualifying_session(
+    journal: &str,
+    window_start: i64,
+    window_end: i64,
+    boot_start: i64,
+    minimum_session_seconds: i64,
+) -> bool {
+    use std::collections::HashMap;
+
+    let mut starts: HashMap<String, i64> = HashMap::new();
+    let mut ends: HashMap<String, i64> = HashMap::new();
+
+    for line in journal.lines() {
+        let mut tokens = line.split_whitespace();
+        let Some(timestamp) = tokens
+            .next()
+            .and_then(|token| token.split('.').next())
+            .and_then(|seconds| seconds.parse::<i64>().ok())
+        else {
+            continue;
+        };
+        let rest: Vec<&str> = tokens.collect();
+        let Some(marker) = rest.iter().position(|token| *token == "session") else {
+            continue;
+        };
+        let Some(id) = rest
+            .get(marker + 1)
+            .map(|token| token.trim_end_matches('.'))
+        else {
+            continue;
+        };
+        let preceding = &rest[..marker];
+        if preceding.contains(&"New") {
+            starts
+                .entry(id.to_string())
+                .and_modify(|first| *first = (*first).min(timestamp))
+                .or_insert(timestamp);
+        } else if preceding.contains(&"Removed") {
+            ends.entry(id.to_string())
+                .and_modify(|last| *last = (*last).max(timestamp))
+                .or_insert(timestamp);
+        }
+    }
+
+    starts.iter().any(|(id, &start)| {
+        if start < window_start || start > window_end {
+            return false;
+        }
+        let end = ends.get(id).copied().unwrap_or(boot_start).min(boot_start);
+        end - start >= minimum_session_seconds
+    })
 }
 
 fn retry_remote_readiness_until<T, F>(
@@ -2287,9 +2400,141 @@ mod tests {
     }
 
     #[test]
+    fn minimum_session_defaults_and_can_be_overridden() {
+        let mut remote_job = job("root@example.com:/srv/data");
+        remote_job.remote = Some(RemoteJobOptions {
+            wol: Some(true),
+            mac: Some("aa:bb:cc:dd:ee:ff".to_string()),
+            broadcast: Some("192.0.2.255".to_string()),
+            ..RemoteJobOptions::default()
+        });
+        assert_eq!(DEFAULT_REMOTE_MINIMUM_SESSION_SECONDS, 300);
+        assert_eq!(
+            remote_context(&remote_job)
+                .expect("context")
+                .expect("remote")
+                .minimum_session_seconds,
+            DEFAULT_REMOTE_MINIMUM_SESSION_SECONDS
+        );
+        remote_job.remote.as_mut().unwrap().minimum_session_seconds = Some(120);
+        assert_eq!(
+            remote_context(&remote_job)
+                .expect("context")
+                .expect("remote")
+                .minimum_session_seconds,
+            120
+        );
+    }
+
+    #[test]
     fn parses_remote_uptime_seconds() {
         assert_eq!(parse_uptime_seconds("123.45\\n"), Some(123));
         assert_eq!(parse_uptime_seconds("not-a-number"), None);
+    }
+
+    #[test]
+    fn qualifying_session_needs_minimum_duration_inside_window() {
+        // window: [1000, 2000], reboot at 3000, threshold 300s.
+        let journal = "\
+1100.000000 host systemd-logind[80]: New session 5 of user alex.
+1180.000000 host systemd-logind[80]: Removed session 5.
+1300.000000 host systemd-logind[80]: New session 6 of user alex.
+1900.000000 host systemd-logind[80]: Removed session 6.
+";
+        // session 5 lasts 80s (too short); session 6 lasts 600s (qualifies).
+        assert!(journal_has_qualifying_session(
+            journal, 1000, 2000, 3000, 300
+        ));
+    }
+
+    #[test]
+    fn short_session_does_not_qualify() {
+        let journal = "\
+1100.000000 host systemd-logind[80]: New session 5 of user alex.
+1180.000000 host systemd-logind[80]: Removed session 5.
+";
+        assert!(!journal_has_qualifying_session(
+            journal, 1000, 2000, 3000, 300
+        ));
+    }
+
+    #[test]
+    fn session_started_before_window_does_not_qualify() {
+        let journal = "\
+500.000000 host systemd-logind[80]: New session 5 of user alex.
+2500.000000 host systemd-logind[80]: Removed session 5.
+";
+        assert!(!journal_has_qualifying_session(
+            journal, 1000, 2000, 3000, 300
+        ));
+    }
+
+    #[test]
+    fn unclosed_session_is_measured_to_boot_start() {
+        // New session with no Removed line: it ran until the reboot at 3000.
+        let journal = "1200.000000 host systemd-logind[80]: New session 7 of user alex.\n";
+        assert!(journal_has_qualifying_session(
+            journal, 1000, 2000, 3000, 300
+        ));
+        // ...but not long enough if the reboot came quickly.
+        assert!(!journal_has_qualifying_session(
+            journal, 1000, 2000, 1300, 300
+        ));
+    }
+
+    #[test]
+    fn empty_journal_has_no_qualifying_session() {
+        assert!(!journal_has_qualifying_session("", 1000, 2000, 3000, 300));
+    }
+
+    #[test]
+    fn unset_after_backup_returns_host_to_found_state() {
+        assert_eq!(
+            resolve_after_backup(None, FoundPowerState::Running),
+            PowerAction::Leave
+        );
+        assert_eq!(
+            resolve_after_backup(None, FoundPowerState::Suspended),
+            PowerAction::Suspend
+        );
+        assert_eq!(
+            resolve_after_backup(None, FoundPowerState::PoweredOff),
+            PowerAction::PowerOff
+        );
+    }
+
+    #[test]
+    fn return_after_backup_matches_found_state() {
+        assert_eq!(
+            resolve_after_backup(Some(RemoteAfterBackup::Return), FoundPowerState::Suspended),
+            PowerAction::Suspend
+        );
+        assert_eq!(
+            resolve_after_backup(Some(RemoteAfterBackup::Return), FoundPowerState::PoweredOff),
+            PowerAction::PowerOff
+        );
+    }
+
+    #[test]
+    fn explicit_after_backup_ignores_found_state() {
+        for found in [
+            FoundPowerState::Running,
+            FoundPowerState::Suspended,
+            FoundPowerState::PoweredOff,
+        ] {
+            assert_eq!(
+                resolve_after_backup(Some(RemoteAfterBackup::None), found),
+                PowerAction::Leave
+            );
+            assert_eq!(
+                resolve_after_backup(Some(RemoteAfterBackup::Suspend), found),
+                PowerAction::Suspend
+            );
+            assert_eq!(
+                resolve_after_backup(Some(RemoteAfterBackup::Shutdown), found),
+                PowerAction::PowerOff
+            );
+        }
     }
 
     #[test]

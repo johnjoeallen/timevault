@@ -105,6 +105,12 @@ pub struct RemoteJobOptions {
     pub minimum_uptime_seconds: Option<u64>,
     #[serde(
         default,
+        rename = "minimumSessionSeconds",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub minimum_session_seconds: Option<u64>,
+    #[serde(
+        default,
         rename = "afterBackup",
         skip_serializing_if = "Option::is_none"
     )]
@@ -121,9 +127,17 @@ pub struct RemoteJobOptions {
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum RemoteAfterBackup {
+    /// Take no action; leave the host running.
     None,
+    /// Suspend the host.
     Suspend,
+    /// Power the host off.
     Shutdown,
+    /// Return the host to the power state it was in when Timevault found it:
+    /// left running if it was already up, suspended if it was resumed from
+    /// suspend, powered off if it was cold-booted by Wake-on-LAN. This is the
+    /// default when `afterBackup` is unset.
+    Return,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
