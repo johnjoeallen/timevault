@@ -12,6 +12,7 @@ pub mod wake;
 use crate::error::{DiskError, TimevaultError};
 
 pub fn exit_for_disk_error(err: &DiskError) -> ! {
+    crate::progress::shutdown();
     let code = match err {
         DiskError::NoDiskConnected => 10,
         DiskError::MultipleDisksConnected => 11,
@@ -28,6 +29,7 @@ pub fn exit_for_error(err: &TimevaultError) -> ! {
     match err {
         TimevaultError::Disk(disk) => exit_for_disk_error(disk),
         _ => {
+            crate::progress::shutdown();
             println!("{}", err);
             std::process::exit(2);
         }

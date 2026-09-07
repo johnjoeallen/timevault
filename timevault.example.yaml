@@ -44,6 +44,7 @@ options:
   exclude-pristine: false
   verbose: false
   safe: false
+  # progress: true   # npm-style spinner + live rsync % (TTY only; ignored with verbose/dry-run)
   # Optional HTML backup report email, sent from "Timevault".
   # report:
   #   emailTo: "admin@example.com"

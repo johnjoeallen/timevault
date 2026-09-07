@@ -68,6 +68,7 @@ pub fn run() -> Result<()> {
             &rsync_extra,
             options,
             cli.send_report,
+            cli.progress,
         )?,
         Command::Wake(args) => {
             if let Err(err) = wake::run_wake(&config_path, args, run_mode) {
@@ -262,6 +263,7 @@ fn print_help() {
     println!("  --dry-run              Do not write data");
     println!("  --safe                 Do not delete files");
     println!("  --verbose              Verbose logging");
+    println!("  --progress             Single-line spinner with live rsync progress (TTY only)");
     println!("  --exclude-pristine     Exclude pristine package-managed files");
     println!("  --exclude-pristine-only  Generate pristine excludes and exit");
     println!("  --print-order          Print resolved job order and exit");

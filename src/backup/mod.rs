@@ -100,12 +100,12 @@ impl Drop for SuspendGuard {
             let mut cmd = remote_systemctl_command(remote_host, "unmask", &self.masked_targets);
             match cmd.status() {
                 Ok(status) if status.success() => {}
-                Ok(status) => eprintln!(
+                Ok(status) => crate::pnote!(
                     "failed to re-enable suspend on backup source host {} after backup: ssh exited with code {}",
                     remote_host,
                     status.code().unwrap_or(1)
                 ),
-                Err(err) => eprintln!(
+                Err(err) => crate::pnote!(
                     "failed to re-enable suspend on backup source host {} after backup: {}",
                     remote_host, err
                 ),
@@ -124,16 +124,16 @@ pub fn print_job_details(job: &Job) {
         Some(ids) if !ids.is_empty() => ids.join(", "),
         _ => "<any>".to_string(),
     };
-    println!("job: {}", job.name);
+    crate::pnote!("job: {}", job.name);
     if let Some(description) = &job.description {
-        println!("  description: {}", description);
+        crate::pnote!("  description: {}", description);
     }
-    println!("  source: {}", job.source);
-    println!("  backup dir: {}", job.name);
-    println!("  copies: {}", job.copies);
-    println!("  run: {}", job.run_policy.as_str());
-    println!("  excludes: {}", excludes);
-    println!("  disks: {}", disk_ids);
+    crate::pnote!("  source: {}", job.source);
+    crate::pnote!("  backup dir: {}", job.name);
+    crate::pnote!("  copies: {}", job.copies);
+    crate::pnote!("  run: {}", job.run_policy.as_str());
+    crate::pnote!("  excludes: {}", excludes);
+    crate::pnote!("  disks: {}", disk_ids);
 }
 
 pub fn run_backup(
@@ -156,7 +156,9 @@ pub fn run_backup(
         jobs: Vec::new(),
     };
     let mut pristine_excludes = PristineExcludes::default();
-    for job in jobs {
+    let total = jobs.len();
+    for (index, job) in jobs.into_iter().enumerate() {
+        crate::pstatus!("job {}/{}: {}", index + 1, total, job.name);
         let backup_day = (Local::now() - Duration::days(1))
             .format("%Y%m%d")
             .to_string();
@@ -171,7 +173,7 @@ pub fn run_backup(
         ) {
             Ok(job_report) => report.jobs.push(job_report),
             Err(err) => {
-                println!("job {} failed: {}", job.name, err);
+                crate::pnote!("job {} failed: {}", job.name, err);
                 report.jobs.push(failed_job_report(
                     &job,
                     disk_mount,
@@ -201,7 +203,7 @@ fn run_backup_job(
 
     if options.exclude_pristine_only {
         if run_mode.verbose {
-            println!(
+            crate::pnote!(
                 "pristine: exclude-only mode enabled; skipping backup for job {}",
                 job.name
             );
@@ -220,16 +222,16 @@ fn run_backup_job(
     }
 
     if run_mode.verbose {
-        println!("  backup day: {}", backup_day);
+        crate::pnote!("  backup day: {}", backup_day);
     }
 
     if run_mode.verbose {
-        println!("job: {}", job.name);
-        println!("  run: {}", job.run_policy.as_str());
-        println!("  source: {}", job.source);
-        println!("  backup dir: {}", dest.display());
-        println!("  copies: {}", job.copies);
-        println!("  excludes: {}", job.excludes.len());
+        crate::pnote!("job: {}", job.name);
+        crate::pnote!("  run: {}", job.run_policy.as_str());
+        crate::pnote!("  source: {}", job.source);
+        crate::pnote!("  backup dir: {}", dest.display());
+        crate::pnote!("  copies: {}", job.copies);
+        crate::pnote!("  excludes: {}", job.excludes.len());
     }
 
     let mut remote_power_guard = match start_remote_power_guard(job, run_mode, options) {
@@ -243,11 +245,11 @@ fn run_backup_job(
                 "host was started by Wake-on-LAN, has only {}s uptime, and had no interactive session lasting at least {}s in the prior daily window",
                 uptime_seconds, minimum_session_seconds
             );
-            println!("job {} skipped: {}", job.name, reason);
+            crate::pnote!("job {} skipped: {}", job.name, reason);
             return Ok(skipped_job_report(job, disk_mount, backup_day, reason));
         }
         Err(err) if remote_readiness_failed(&err) || remote_offline_if_unreachable(job) => {
-            println!("job {} offline: {}", job.name, err);
+            crate::pnote!("job {} offline: {}", job.name, err);
             return Ok(offline_job_report(
                 job,
                 disk_mount,
@@ -270,9 +272,10 @@ fn run_backup_job(
             run_mode,
         )?;
         if script_result.exit_code != 0 {
-            println!(
+            crate::pnote!(
                 "pre script failed for job {} with exit code {}; skipping backup",
-                job.name, script_result.exit_code
+                job.name,
+                script_result.exit_code
             );
             return Ok(BackupJobReport {
                 name: job.name.clone(),
@@ -300,9 +303,10 @@ fn run_backup_job(
         run_mode,
     )? {
         if script_result.exit_code != 0 {
-            println!(
+            crate::pnote!(
                 "remote pre script failed for job {} with exit code {}; skipping backup",
-                job.name, script_result.exit_code
+                job.name,
+                script_result.exit_code
             );
             return Ok(BackupJobReport {
                 name: job.name.clone(),
@@ -338,7 +342,7 @@ fn run_backup_job(
     let excludes_file = job_excludes_path(&tmp_dir, &job.name);
     let excludes = build_exclude_list(job, pristine_excludes)?;
     if run_mode.dry_run {
-        println!(
+        crate::pnote!(
             "dry-run: would write excludes file {}",
             excludes_file.display()
         );
@@ -348,12 +352,13 @@ fn run_backup_job(
 
     if !dest.exists() {
         if run_mode.dry_run {
-            println!("dry-run: mkdir -p {}", dest.display());
+            crate::pnote!("dry-run: mkdir -p {}", dest.display());
         } else {
             fs::create_dir_all(&dest)?;
         }
     }
 
+    crate::pstatus!("{}: pruning old snapshots", job.name);
     expire_old_backups(job, &dest, run_mode)?;
 
     let current = dest.join("current");
@@ -361,7 +366,7 @@ fn run_backup_job(
 
     if current.exists() && !backup_dir.exists() {
         if run_mode.dry_run {
-            println!("dry-run: mkdir -p {}", backup_dir.display());
+            crate::pnote!("dry-run: mkdir -p {}", backup_dir.display());
         } else {
             fs::create_dir_all(&backup_dir)?;
         }
@@ -373,12 +378,18 @@ fn run_backup_job(
     let mut rsync_stderr = String::new();
     for attempt in 1..=3 {
         attempts = attempt;
+        crate::progress::status(if attempt == 1 {
+            format!("{}: syncing", job.name)
+        } else {
+            format!("{}: syncing (attempt {}/3)", job.name, attempt)
+        });
         let rsync_result = run_rsync(
             &job.source,
             &backup_dir,
             &excludes_file,
             rsync_extra,
             run_mode,
+            &job.name,
         )?;
         rc = rsync_result.exit_code;
         rsync_stderr = rsync_result.stderr;
@@ -386,11 +397,11 @@ fn run_backup_job(
             break;
         }
         if attempt < 3 {
-            println!(
+            crate::progress::note(format!(
                 "rsync failed with exit code {}; retrying ({}/3)",
                 rc,
                 attempt + 1
-            );
+            ));
         }
     }
     let rsync_ok = rc == 0 || rc == 24;
@@ -400,7 +411,10 @@ fn run_backup_job(
         Some(rsync_failure_reason(rc, &rsync_stderr))
     };
     if !rsync_ok {
-        println!("rsync failed with exit code {}; current not updated", rc);
+        crate::progress::note(format!(
+            "rsync failed with exit code {}; current not updated",
+            rc
+        ));
     }
 
     if rsync_ok && backup_dir.exists() {
@@ -409,9 +423,9 @@ fn run_backup_job(
             if meta.file_type().is_symlink() || meta.is_file() {
                 if run_mode.safe_mode || run_mode.dry_run {
                     if run_mode.dry_run {
-                        println!("dry-run: rm -f {}", current_link.display());
+                        crate::pnote!("dry-run: rm -f {}", current_link.display());
                     } else {
-                        println!("skip remove (safe-mode): {}", current_link.display());
+                        crate::pnote!("skip remove (safe-mode): {}", current_link.display());
                     }
                 } else {
                     fs::remove_file(&current_link).map_err(|err| {
@@ -423,7 +437,7 @@ fn run_backup_job(
                     })?;
                 }
             } else if meta.is_dir() {
-                println!(
+                crate::pnote!(
                     "skip updating current (directory exists): {}",
                     current_link.display()
                 );
@@ -431,7 +445,7 @@ fn run_backup_job(
         }
         if !current_link.exists() {
             if run_mode.dry_run {
-                println!("dry-run: ln -s {} {}", backup_day, current_link.display());
+                crate::pnote!("dry-run: ln -s {} {}", backup_day, current_link.display());
             } else {
                 symlink(backup_day, &current_link).map_err(|err| {
                     TimevaultError::message(format!(
@@ -453,9 +467,10 @@ fn run_backup_job(
         run_mode,
     )? {
         if script_result.exit_code != 0 {
-            println!(
+            crate::pnote!(
                 "remote post script failed for job {} with exit code {}",
-                job.name, script_result.exit_code
+                job.name,
+                script_result.exit_code
             );
             status = BackupJobStatus::Failed;
             failure_reason = Some(script_failure_reason(
@@ -476,9 +491,10 @@ fn run_backup_job(
             run_mode,
         )?;
         if script_result.exit_code != 0 {
-            println!(
+            crate::pnote!(
                 "post script failed for job {} with exit code {}",
-                job.name, script_result.exit_code
+                job.name,
+                script_result.exit_code
             );
             status = BackupJobStatus::Failed;
             failure_reason = Some(script_failure_reason(
@@ -612,7 +628,7 @@ fn start_suspend_guard(job: &Job, run_mode: RunMode) -> Result<SuspendGuard> {
     };
 
     if run_mode.dry_run {
-        println!(
+        crate::pnote!(
             "dry-run: would check suspend state on backup source host {}: systemctl is-enabled {}",
             remote.host,
             SUSPEND_TARGETS.join(" ")
@@ -645,7 +661,7 @@ fn start_suspend_guard(job: &Job, run_mode: RunMode) -> Result<SuspendGuard> {
             remote_host: Some(remote.host),
         })
     } else {
-        println!(
+        crate::pnote!(
             "suspend on backup source host {} was already disabled before backup; leaving it disabled",
             remote.host
         );
@@ -698,7 +714,7 @@ fn remote_systemctl_command(remote_host: &str, action: &str, targets: &[&str]) -
 
 pub fn run_pristine_only(jobs: Vec<Job>, run_mode: RunMode, options: BackupOptions) -> Result<()> {
     if run_mode.verbose {
-        println!("pristine: exclude-only mode enabled; skipping backup");
+        crate::pnote!("pristine: exclude-only mode enabled; skipping backup");
     }
     let pristine_excludes =
         build_pristine_excludes_for_jobs(&jobs, options, run_mode.verbose, run_mode.dry_run)?;
@@ -712,7 +728,7 @@ pub fn run_pristine_only(jobs: Vec<Job>, run_mode: RunMode, options: BackupOptio
         let excludes_file = job_excludes_path(&tmp_dir, &job.name);
         let excludes = build_exclude_list(&job, &pristine_excludes)?;
         if run_mode.dry_run {
-            println!(
+            crate::pnote!(
                 "dry-run: would write excludes file {}",
                 excludes_file.display()
             );
@@ -758,7 +774,7 @@ fn run_job_script(
         cmd.env("TIMEVAULT_RSYNC_CODE", code.to_string());
     }
     if run_mode.dry_run {
-        println!(
+        crate::pnote!(
             "dry-run: would run {} script for job {}: {}",
             phase.as_str(),
             job.name,
@@ -805,7 +821,7 @@ fn run_remote_job_script(
     };
     let script = remote_job_script_path(&job.name, phase);
     if run_mode.dry_run {
-        println!(
+        crate::pnote!(
             "dry-run: would run remote {} script for job {} if present: {}:{}",
             phase.as_str(),
             job.name,
@@ -952,16 +968,19 @@ impl Drop for RemotePowerGuard {
             .stderr(Stdio::null());
         match cmd.status() {
             Ok(status) if status.success() => {}
-            Ok(status) => eprintln!(
+            Ok(status) => crate::pnote!(
                 "failed to {} remote host {} after job {}: ssh exited with code {}",
                 verb,
                 self.remote_host,
                 self.job_name,
                 status.code().unwrap_or(1)
             ),
-            Err(err) => eprintln!(
+            Err(err) => crate::pnote!(
                 "failed to {} remote host {} after job {}: {}",
-                verb, self.remote_host, self.job_name, err
+                verb,
+                self.remote_host,
+                self.job_name,
+                err
             ),
         }
     }
@@ -981,13 +1000,13 @@ pub fn wake_remote_job(job: &Job, run_mode: RunMode) -> Result<()> {
                 job.name
             )));
         }
-        println!(
+        crate::pnote!(
             "dry-run: would send WOL for job {} to {} for {}",
             job.name,
             wake_target_description(remote),
             host
         );
-        println!(
+        crate::pnote!(
             "dry-run: would send WOL, then wait up to {} seconds for ping and SSH readiness",
             remote
                 .probe_timeout_seconds
@@ -1011,14 +1030,14 @@ pub fn wake_remote_job(job: &Job, run_mode: RunMode) -> Result<()> {
     let deadline = Instant::now() + context.probe_timeout;
     if ping_once(&context.host, run_mode)? {
         if run_mode.verbose {
-            println!(
+            crate::pnote!(
                 "wake host {} already responds to ping; skipping WOL",
                 context.host
             );
         }
     } else {
         if run_mode.verbose {
-            println!(
+            crate::pnote!(
                 "wake host {} did not respond; sending WOL to {} target(s)",
                 context.host,
                 context.targets.len()
@@ -1048,7 +1067,7 @@ fn start_remote_power_guard(
         let Some((remote, _, host)) = remote_config(job) else {
             return Ok(RemotePowerStart::Ready(None));
         };
-        println!(
+        crate::pnote!(
             "dry-run: would probe {} by ping and SSH for up to {} seconds",
             host,
             remote
@@ -1056,7 +1075,7 @@ fn start_remote_power_guard(
                 .unwrap_or(DEFAULT_REMOTE_PROBE_TIMEOUT_SECONDS)
         );
         if remote.wol == Some(true) {
-            println!(
+            crate::pnote!(
                 "dry-run: would send WOL for job {} to {} if ping fails",
                 job.name,
                 wake_target_description(remote)
@@ -1066,7 +1085,7 @@ fn start_remote_power_guard(
                     .minimum_session_seconds
                     .unwrap_or(DEFAULT_REMOTE_MINIMUM_SESSION_SECONDS)
             });
-            println!(
+            crate::pnote!(
                 "dry-run: would check uptime after WOL; below {} seconds, it would inspect the remote persistent journal for a session tied to a non-Timevault SSH login and lasting at least {} seconds{} during the prior daily window (greeter, manager, cron and Timevault's own sessions do not count; sessions are keyed by boot id)",
                 remote
                     .minimum_uptime_seconds
@@ -1079,28 +1098,28 @@ fn start_remote_power_guard(
                 }
             );
         }
-        println!(
+        crate::pnote!(
             "dry-run: would skip the backup if {} is not ready before the timeout",
             host
         );
         if remote.wol == Some(true) && remote.keepalive_seconds.is_some() {
             let seconds = remote.keepalive_seconds.expect("checked above");
-            println!(
+            crate::pnote!(
                 "dry-run: would repeat WOL for job {} every {} seconds while backup runs if wake was needed",
                 job.name, seconds
             );
         }
         match remote.after_backup.unwrap_or(RemoteAfterBackup::Return) {
             RemoteAfterBackup::None => {}
-            RemoteAfterBackup::Suspend => println!(
+            RemoteAfterBackup::Suspend => crate::pnote!(
                 "dry-run: would suspend remote host after a successful job {}",
                 job.name
             ),
-            RemoteAfterBackup::Shutdown => println!(
+            RemoteAfterBackup::Shutdown => crate::pnote!(
                 "dry-run: would power off remote host after a successful job {}",
                 job.name
             ),
-            RemoteAfterBackup::Return => println!(
+            RemoteAfterBackup::Return => crate::pnote!(
                 "dry-run: would return remote host to its pre-backup power state (leave running, suspend, or power off) after a successful job {}",
                 job.name
             ),
@@ -1113,17 +1132,20 @@ fn start_remote_power_guard(
     };
     if let Some(seconds) = options.session_seconds_override {
         if seconds != context.minimum_session_seconds {
-            println!(
+            crate::pnote!(
                 "  --min-session-seconds: cold-boot minimum session length {}s -> {}s for job {}",
-                context.minimum_session_seconds, seconds, job.name
+                context.minimum_session_seconds,
+                seconds,
+                job.name
             );
         }
         context.minimum_session_seconds = seconds;
     }
     let deadline = Instant::now() + context.probe_timeout;
+    crate::pstatus!("{}: reaching {}", job.name, context.host);
     let was_woken = if ping_once(&context.host, run_mode)? {
         if run_mode.verbose {
-            println!(
+            crate::pnote!(
                 "wake host {} already responds to ping; skipping WOL",
                 context.host
             );
@@ -1131,12 +1153,13 @@ fn start_remote_power_guard(
         false
     } else if context.wol {
         if run_mode.verbose {
-            println!(
+            crate::pnote!(
                 "wake host {} did not respond; sending WOL to {} target(s)",
                 context.host,
                 context.targets.len()
             );
         }
+        crate::pstatus!("{}: sending Wake-on-LAN to {}", job.name, context.host);
         send_wake_packets(
             context.mac.as_deref().expect("validated WOL MAC"),
             &context.targets,
@@ -1164,9 +1187,11 @@ fn start_remote_power_guard(
         FoundPowerState::Running
     } else {
         if run_mode.verbose {
-            println!(
+            crate::pnote!(
                 "  remote {} uptime {}s (cold-boot threshold {}s)",
-                context.ssh_host, uptime_seconds, context.minimum_uptime_seconds
+                context.ssh_host,
+                uptime_seconds,
+                context.minimum_uptime_seconds
             );
         }
         if uptime_seconds < context.minimum_uptime_seconds {
@@ -1175,8 +1200,9 @@ fn start_remote_power_guard(
             // longer slides the window or backdates boot-time sessions into it.
             let boot_start = remote_now - uptime_seconds as i64;
             let (window_start, window_end) = remote_activity_window(boot_start);
+            crate::pstatus!("{}: cold-boot check", job.name);
             if run_mode.verbose {
-                println!(
+                crate::pnote!(
                     "  {} looks cold-booted; inspecting the prior daily journal window for real use",
                     context.ssh_host
                 );
@@ -1205,7 +1231,7 @@ fn start_remote_power_guard(
             FoundPowerState::PoweredOff
         } else {
             if run_mode.verbose {
-                println!(
+                crate::pnote!(
                     "  remote {} uptime is above the cold-boot threshold; treating it as resumed from suspend",
                     context.ssh_host
                 );
@@ -1519,7 +1545,7 @@ fn wait_for_ping_after_wake(
             )));
         }
         if run_mode.verbose {
-            println!(
+            crate::pnote!(
                 "wake host {} is not reachable yet; sending another WOL packet to {} target(s)",
                 host,
                 targets.len()
@@ -1606,13 +1632,13 @@ fn parse_now_and_uptime(output: &str) -> Option<(i64, u64)> {
 /// otherwise only under `--verbose`.
 fn report_clock_drift(ssh_host: &str, offset_seconds: i64, run_mode: RunMode) {
     if offset_seconds.abs() >= REMOTE_CLOCK_DRIFT_WARN_SECONDS {
-        println!(
+        crate::pnote!(
             "warning: backup source {} clock is {} — check NTP on that host",
             ssh_host,
             describe_clock_offset(offset_seconds)
         );
     } else if run_mode.verbose {
-        println!(
+        crate::pnote!(
             "  backup source {} clock is {}",
             ssh_host,
             describe_clock_offset(offset_seconds)
@@ -1666,7 +1692,7 @@ fn remote_journal_has_qualifying_session(
     if sessions.is_empty()
         && !remote_journal_covers_window(ssh_host, window_start, boot_start, run_mode)?
     {
-        println!(
+        crate::pnote!(
             "warning: the journal on {} has no records for the prior-day window (not persisted across reboots?). Backing up without the cold-boot usage check.",
             ssh_host
         );
@@ -1719,12 +1745,15 @@ fn remote_journal_has_qualifying_session(
     // The skip case is explained at the call site; the per-session breakdown is
     // only for `--verbose`.
     if run_mode.verbose {
-        println!(
+        crate::pnote!(
             "  cold-boot session check: prior-window @{}..@{} (boot @{}), minimum {}s",
-            window_start, window_end, boot_start, minimum_session_seconds
+            window_start,
+            window_end,
+            boot_start,
+            minimum_session_seconds
         );
         match origin_client.as_deref() {
-            Some(client) => println!(
+            Some(client) => crate::pnote!(
                 "    Timevault reaches {} from {}; {} SSH login(s) in window ({} by a person, {} by Timevault)",
                 ssh_host,
                 client,
@@ -1732,23 +1761,23 @@ fn remote_journal_has_qualifying_session(
                 interactive_keys.len(),
                 timevault_keys.len(),
             ),
-            None => println!(
+            None => crate::pnote!(
                 "    could not read $SSH_CONNECTION from {}; falling back to session length alone",
                 ssh_host
             ),
         }
         if !ignored_users.is_empty() {
-            println!(
+            crate::pnote!(
                 "    ignoring sessions owned by: {}",
                 ignored_users.join(", ")
             );
         }
         if sessions.is_empty() {
-            println!("    no logind sessions recorded in the window");
+            crate::pnote!("    no logind sessions recorded in the window");
         }
         for session in &sessions {
             let (verdict, duration) = classify_session(session, &filter);
-            println!(
+            crate::pnote!(
                 "    session {} (boot {}) user {} for {} -> {}",
                 session.id,
                 short_boot_id(&session.boot_id),
@@ -1761,7 +1790,7 @@ fn remote_journal_has_qualifying_session(
                 verdict.as_str(),
             );
         }
-        println!(
+        crate::pnote!(
             "    -> {}",
             if qualifies {
                 "a person used the host in the prior day; backup proceeds"
@@ -2196,7 +2225,7 @@ where
             Err(_) => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 let delay = remaining.min(StdDuration::from_secs(2));
-                println!(
+                crate::pnote!(
                     "host {} did not {} yet; retrying in {}s",
                     host,
                     probe,
@@ -2217,7 +2246,7 @@ fn ping_once_with_timeout(host: &str, timeout: StdDuration, run_mode: RunMode) -
     let addresses = resolve_host_ipv4_with_timeout(host, timeout, run_mode)?;
     if addresses.is_empty() {
         if run_mode.verbose {
-            println!("wake host {} did not resolve to an IPv4 address", host);
+            crate::pnote!("wake host {} did not resolve to an IPv4 address", host);
         }
         return Ok(false);
     }
@@ -2227,15 +2256,16 @@ fn ping_once_with_timeout(host: &str, timeout: StdDuration, run_mode: RunMode) -
             return Ok(false);
         }
         if run_mode.verbose {
-            println!("checking wake host {} at {}", host, address);
+            crate::pnote!("checking wake host {} at {}", host, address);
         }
         if ping_ipv4_once_with_timeout(address, remaining)? {
             return Ok(true);
         }
         if run_mode.verbose {
-            println!(
+            crate::pnote!(
                 "wake host {} resolved to {}, but ping failed",
-                host, address
+                host,
+                address
             );
         }
     }
@@ -2249,13 +2279,13 @@ fn resolve_host_ipv4_with_timeout(
 ) -> Result<Vec<Ipv4Addr>> {
     if let Ok(address) = host.parse::<Ipv4Addr>() {
         if run_mode.verbose {
-            println!("wake host {} is already an IPv4 address", host);
+            crate::pnote!("wake host {} is already an IPv4 address", host);
         }
         return Ok(vec![address]);
     }
 
     if run_mode.verbose {
-        println!(
+        crate::pnote!(
             "resolving wake host {} with a {} second timeout",
             host,
             timeout.as_secs()
@@ -2292,7 +2322,7 @@ fn resolve_host_ipv4_with_timeout(
                 )));
             }
             if run_mode.verbose {
-                println!(
+                crate::pnote!(
                     "wake host {} resolved to {}",
                     host,
                     addresses
@@ -2442,7 +2472,7 @@ fn ensure_pristine_excludes_for_job(
     }
     if dry_run {
         if verbose {
-            println!("pristine: dry-run; skip package analysis");
+            crate::pnote!("pristine: dry-run; skip package analysis");
         }
         return Ok(());
     }
@@ -2459,7 +2489,7 @@ fn ensure_pristine_excludes_for_job(
             excludes.remote.insert(host, host_excludes);
         }
         None if verbose => {
-            println!(
+            crate::pnote!(
                 "pristine: skip package analysis; job {} source is not supported for pristine analysis",
                 job.name
             );
@@ -2488,7 +2518,7 @@ fn build_pristine_excludes_for_jobs(
     }
     if dry_run {
         if verbose {
-            println!("pristine: dry-run; skip package analysis");
+            crate::pnote!("pristine: dry-run; skip package analysis");
         }
         return Ok(PristineExcludes::default());
     }
@@ -2517,7 +2547,7 @@ fn build_pristine_excludes_for_jobs(
         excludes.remote.insert(host, host_excludes);
     }
     if verbose && excludes.local.is_none() && excludes.remote.is_empty() {
-        println!(
+        crate::pnote!(
             "pristine: skip package analysis; selected job sources are not supported for pristine analysis"
         );
     }
@@ -2604,22 +2634,22 @@ fn expire_old_backups(job: &Job, dest: &Path, run_mode: RunMode) -> io::Result<(
         let target = dest.join(name);
         let meta = fs::symlink_metadata(&target)?;
         if meta.file_type().is_symlink() {
-            println!("skip symlink delete: {}", target.display());
+            crate::pnote!("skip symlink delete: {}", target.display());
             continue;
         }
         if meta.is_dir() {
             if run_mode.safe_mode || run_mode.dry_run {
                 if run_mode.dry_run {
-                    println!("dry-run: rm -rf {}", target.display());
+                    crate::pnote!("dry-run: rm -rf {}", target.display());
                 } else {
-                    println!("skip delete (safe-mode): {}", target.display());
+                    crate::pnote!("skip delete (safe-mode): {}", target.display());
                 }
             } else {
-                println!("delete: {}", target.display());
+                crate::pnote!("delete: {}", target.display());
                 fs::remove_dir_all(&target)?;
             }
         } else {
-            println!("skip non-dir delete: {}", target.display());
+            crate::pnote!("skip non-dir delete: {}", target.display());
         }
     }
 
@@ -2638,13 +2668,13 @@ fn copy_snapshot_without_symlinks(source: &Path, dest: &Path, run_mode: RunMode)
         let ft = entry.file_type();
         if ft.is_symlink() {
             if run_mode.dry_run {
-                println!("dry-run: skip symlink {}", src_path.display());
+                crate::pnote!("dry-run: skip symlink {}", src_path.display());
             }
             continue;
         }
         if ft.is_dir() {
             if run_mode.dry_run {
-                println!("dry-run: mkdir -p {}", target.display());
+                crate::pnote!("dry-run: mkdir -p {}", target.display());
             } else {
                 fs::create_dir_all(&target)?;
             }
@@ -2652,7 +2682,7 @@ fn copy_snapshot_without_symlinks(source: &Path, dest: &Path, run_mode: RunMode)
         }
         if ft.is_file() {
             if run_mode.dry_run {
-                println!("dry-run: ln {} {}", src_path.display(), target.display());
+                crate::pnote!("dry-run: ln {} {}", src_path.display(), target.display());
             } else {
                 hard_link_if_missing(src_path, &target)?;
             }

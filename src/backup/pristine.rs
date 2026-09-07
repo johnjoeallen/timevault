@@ -77,17 +77,17 @@ pub fn build_pristine_excludes_for_source(
     verbose: bool,
 ) -> Result<Vec<String>> {
     if verbose {
-        println!("pristine: detect operating system");
+        crate::pnote!("pristine: detect operating system");
     }
     let os = detect_os_for_source(source)?;
     if verbose {
-        println!("pristine: os {}", format_os_info(&os));
+        crate::pnote!("pristine: os {}", format_os_info(&os));
     }
     let manager = detect_package_manager(&os);
     if verbose {
         match manager {
-            Some(pm) => println!("pristine: package manager {}", format_package_manager(pm)),
-            None => println!("pristine: package manager unknown"),
+            Some(pm) => crate::pnote!("pristine: package manager {}", format_package_manager(pm)),
+            None => crate::pnote!("pristine: package manager unknown"),
         }
     }
     let Some(manager) = manager else {
@@ -95,7 +95,7 @@ pub fn build_pristine_excludes_for_source(
     };
     let cache_path = pristine_cache_path_for_source(source);
     if verbose {
-        println!("pristine: cache {}", cache_path.display());
+        crate::pnote!("pristine: cache {}", cache_path.display());
     }
     let mut cache = load_cache(&cache_path, verbose);
     let stats = match source {
@@ -105,9 +105,12 @@ pub fn build_pristine_excludes_for_source(
     cache.entries = stats.entries;
     save_cache(&cache_path, &cache, verbose)?;
     if verbose {
-        println!(
+        crate::pnote!(
             "pristine: cache stats reused={} hashed={} pristine={} dirty={}",
-            stats.reused, stats.hashed, stats.pristine, stats.dirty
+            stats.reused,
+            stats.hashed,
+            stats.pristine,
+            stats.dirty
         );
     }
     let mut excludes = cache
@@ -289,7 +292,7 @@ fn parse_helper_output(
         let state = parts.next().unwrap_or("");
         if state == "C" {
             if verbose {
-                println!(
+                crate::pnote!(
                     "pristine: {} files {}",
                     source_label,
                     parts.next().unwrap_or("0")
@@ -338,7 +341,7 @@ fn parse_helper_output(
             .insert(path, CacheEntry { mtime, hash, dirty });
     }
     if verbose {
-        println!(
+        crate::pnote!(
             "pristine: {} file states {}",
             source_label,
             stats.entries.len()
@@ -360,7 +363,7 @@ fn execute_local_helper(
     let mut cache_input = NamedTempFile::new()?;
     cache_input.write_all(cache_input_tsv(cache).as_bytes())?;
     if verbose {
-        println!("pristine: execute local helper");
+        crate::pnote!("pristine: execute local helper");
     }
     let mut child = Command::new("sh")
         .arg("-s")
@@ -379,9 +382,10 @@ fn execute_local_helper(
 
 fn upload_remote_helper(host: &str, script: &str, verbose: bool) -> Result<()> {
     if verbose {
-        println!(
+        crate::pnote!(
             "pristine: upload remote helper {}:{}",
-            host, REMOTE_HELPER_PATH
+            host,
+            REMOTE_HELPER_PATH
         );
     }
     let mut child = Command::new("ssh")
@@ -404,9 +408,10 @@ fn upload_remote_helper(host: &str, script: &str, verbose: bool) -> Result<()> {
 fn upload_remote_cache_input(host: &str, cache: &CacheFile, verbose: bool) -> Result<()> {
     let input = cache_input_tsv(cache);
     if verbose {
-        println!(
+        crate::pnote!(
             "pristine: upload remote cache input {}:{}",
-            host, REMOTE_CACHE_INPUT_PATH
+            host,
+            REMOTE_CACHE_INPUT_PATH
         );
     }
     let mut child = Command::new("ssh")
@@ -445,9 +450,10 @@ fn cache_input_tsv(cache: &CacheFile) -> String {
 
 fn execute_remote_helper(host: &str, manager: PackageManager, verbose: bool) -> Result<String> {
     if verbose {
-        println!(
+        crate::pnote!(
             "pristine: execute remote helper {}:{}",
-            host, REMOTE_HELPER_PATH
+            host,
+            REMOTE_HELPER_PATH
         );
     }
     let child = Command::new("ssh")
@@ -527,7 +533,7 @@ fn load_cache(path: &Path, verbose: bool) -> CacheFile {
         }
         Err(err) => {
             if verbose {
-                println!("pristine: cache read failed ({})", err);
+                crate::pnote!("pristine: cache read failed ({})", err);
             }
             CacheFile {
                 version: 1,
@@ -545,7 +551,7 @@ fn save_cache(path: &Path, cache: &CacheFile, verbose: bool) -> Result<()> {
         .map_err(|err| crate::error::TimevaultError::message(err.to_string()))?;
     fs::write(path, data)?;
     if verbose {
-        println!("pristine: cache updated");
+        crate::pnote!("pristine: cache updated");
     }
     Ok(())
 }

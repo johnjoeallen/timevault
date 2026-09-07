@@ -61,6 +61,7 @@ pub fn untrack_mount(mountpoint: &PathBuf) {
 }
 
 fn cleanup_active_mounts() {
+    crate::progress::clear();
     let mounts = {
         let mut mounts = active_mounts()
             .lock()

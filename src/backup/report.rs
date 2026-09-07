@@ -243,8 +243,8 @@ pub fn email_html_report(options: &ReportOptions, html: &str) -> Result<()> {
             .as_deref()
             .unwrap_or("timevault@localhost"),
     );
-    println!("sending backup report to {}", to);
-    println!("sendmail command: {} -t", sendmail);
+    crate::pnote!("sending backup report to {}", to);
+    crate::pnote!("sendmail command: {} -t", sendmail);
 
     let mut child = Command::new(sendmail)
         .arg("-t")

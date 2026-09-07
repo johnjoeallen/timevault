@@ -29,6 +29,10 @@ pub struct Cli {
     pub exclude_pristine: bool,
     #[arg(long, global = true)]
     pub exclude_pristine_only: bool,
+    /// npm-style single-line spinner with live rsync progress. Ignored on a
+    /// non-TTY and with --verbose / --dry-run.
+    #[arg(long, global = true)]
+    pub progress: bool,
     /// Override remote.minimumSessionSeconds for the cold-boot check this run
     /// (testing aid).
     #[arg(long, global = true, value_name = "SECONDS")]

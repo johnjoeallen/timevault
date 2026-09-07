@@ -217,6 +217,7 @@ Global options:
 - `--dry-run`: No writes or mounts; prints actions.
 - `--safe`: Do not delete files; rsync without delete flags.
 - `--verbose`: More detailed logging.
+- `--progress`: `npm install`-style output for a `backup` run — one spinner line on stderr showing the current activity and rsync's live `%` / throughput, with milestones (job started/finished, skips, failures, the rsync summary) printed as normal lines that stay. Ignored when stderr is not a TTY (e.g. under systemd/cron) and when combined with `--verbose` or `--dry-run`. Also settable as `options.progress: true`.
 - `--print-order`: Print resolved job order and exit.
 - `--exclude-pristine`: Exclude pristine package-managed files.
 - `--exclude-pristine-only`: Generate pristine excludes and exit (no backup).

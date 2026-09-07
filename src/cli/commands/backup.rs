@@ -1,6 +1,10 @@
+use std::collections::HashMap;
+use std::io::IsTerminal;
 use std::process::Command;
 
 use chrono::Local;
+
+use crate::progress;
 
 use crate::backup::report::{email_html_report, render_html, BackupJobStatus, BackupRunReport};
 use crate::backup::{print_job_details, run_backup, run_pristine_only, BackupOptions};
@@ -17,7 +21,6 @@ use crate::error::{DiskError, Result, TimevaultError};
 use crate::mount::guard::MountGuard;
 use crate::types::RunMode;
 use crate::util::command::run_command;
-use std::collections::HashMap;
 
 pub fn run_backup_command(
     config_path: &std::path::Path,
@@ -29,9 +32,8 @@ pub fn run_backup_command(
     rsync_extra_cli: &[String],
     options: BackupOptions,
     send_report: bool,
+    progress: bool,
 ) -> Result<()> {
-    println!("{}", Local::now().format("%d-%m-%Y %H:%M"));
-
     let cfg = load_config(config_path.to_string_lossy().as_ref())?;
     let jobs = cfg.jobs.clone();
     let backup_disks = cfg.backup_disks.clone();
@@ -50,6 +52,16 @@ pub fn run_backup_command(
         session_seconds_override: options.session_seconds_override,
     };
     let report_options = cfg.options.report.clone();
+
+    let want_progress = progress || cfg.options.progress.unwrap_or(false);
+    if want_progress && (run_mode.verbose || run_mode.dry_run) {
+        eprintln!("--progress ignored with --verbose / --dry-run");
+    }
+    progress::init(
+        want_progress && !run_mode.verbose && !run_mode.dry_run && std::io::stderr().is_terminal(),
+    );
+
+    progress::note(Local::now().format("%d-%m-%Y %H:%M"));
 
     if !run_mode.dry_run {
         sweep_stale_run_mounts(&mount_base);
@@ -78,8 +90,9 @@ pub fn run_backup_command(
         for job in &jobs {
             if selected_set.contains(&job.name) {
                 if job.run_policy == crate::types::RunPolicy::Off {
-                    println!("job disabled (off): {}", job.name);
-                    println!("requested job(s) are disabled; aborting");
+                    crate::pnote!("job disabled (off): {}", job.name);
+                    crate::pnote!("requested job(s) are disabled; aborting");
+                    progress::shutdown();
                     std::process::exit(2);
                 }
                 jobs_to_run.push(job.clone());
@@ -88,16 +101,18 @@ pub fn run_backup_command(
         if jobs_to_run.len() != selected_set.len() {
             for name in &selected_set {
                 if !jobs.iter().any(|job| &job.name == name) {
-                    println!("job not found: {}", name);
+                    crate::pnote!("job not found: {}", name);
                 }
             }
-            println!("no such job(s) found; aborting");
+            crate::pnote!("no such job(s) found; aborting");
+            progress::shutdown();
             std::process::exit(2);
         }
     }
 
     if jobs_to_run.is_empty() {
-        println!("no jobs matched selection; aborting");
+        crate::pnote!("no jobs matched selection; aborting");
+        progress::shutdown();
         std::process::exit(2);
     }
 
@@ -105,7 +120,8 @@ pub fn run_backup_command(
     if let Some(ref disk_filter) = disk_filter {
         jobs_to_run.retain(|job| job_requires_disk(job, disk_filter));
         if jobs_to_run.is_empty() {
-            println!("no jobs matched disk selection; aborting");
+            crate::pnote!("no jobs matched disk selection; aborting");
+            progress::shutdown();
             std::process::exit(2);
         }
     }
@@ -114,11 +130,12 @@ pub fn run_backup_command(
         for job in &jobs_to_run {
             print_job_details(job);
         }
+        progress::shutdown();
         std::process::exit(0);
     }
 
     if run_mode.verbose {
-        println!(
+        crate::pnote!(
             "loaded config {} with {} job(s)",
             config_path.display(),
             jobs_to_run.len()
@@ -141,15 +158,17 @@ pub fn run_backup_command(
             Err(err) => return Err(err),
         };
         if primary_disk.disabled {
-            println!(
+            crate::pnote!(
                 "disk {} is disabled for backups; aborting",
                 primary_disk.disk_id
             );
+            progress::shutdown();
             std::process::exit(2);
         }
         jobs_to_run.retain(|job| job_requires_disk(job, disk_id));
         if jobs_to_run.is_empty() {
-            println!("no jobs matched disk selection; aborting");
+            crate::pnote!("no jobs matched disk selection; aborting");
+            progress::shutdown();
             std::process::exit(2);
         }
         let mut reports = Vec::new();
@@ -165,7 +184,8 @@ pub fn run_backup_command(
             &mut reports,
         )? {
             send_reports(&report_options, &reports, run_mode, send_report)?;
-            println!("{}", message);
+            progress::note(&message);
+            progress::shutdown();
             std::process::exit(code);
         }
         send_reports(&report_options, &reports, run_mode, send_report)?;
@@ -176,7 +196,8 @@ pub fn run_backup_command(
             .cloned()
             .collect();
         if eligible_connected.is_empty() {
-            println!("no eligible backup disks connected; aborting");
+            crate::pnote!("no eligible backup disks connected; aborting");
+            progress::shutdown();
             std::process::exit(2);
         }
 
@@ -184,7 +205,8 @@ pub fn run_backup_command(
         for job in jobs_to_run {
             let allowed = allowed_disks_for_job(&job, &eligible_connected);
             if allowed.is_empty() {
-                println!("job {} has no connected disks; aborting", job.name);
+                crate::pnote!("job {} has no connected disks; aborting", job.name);
+                progress::shutdown();
                 std::process::exit(2);
             }
             let primary = allowed[0].clone();
@@ -208,7 +230,8 @@ pub fn run_backup_command(
                 &mut reports,
             )? {
                 send_reports(&report_options, &reports, run_mode, send_report)?;
-                println!("{}", message);
+                progress::note(&message);
+                progress::shutdown();
                 std::process::exit(code);
             }
         }
@@ -216,10 +239,12 @@ pub fn run_backup_command(
     }
 
     if !run_mode.dry_run {
+        progress::status("sync");
         let mut sync_cmd = Command::new("sync");
         let _ = run_command(&mut sync_cmd, run_mode);
     }
-    println!("{}", Local::now().format("%d-%m-%Y %H:%M"));
+    progress::note(Local::now().format("%d-%m-%Y %H:%M"));
+    progress::shutdown();
 
     Ok(())
 }
@@ -238,7 +263,7 @@ fn send_reports(
     }
     if run_mode.dry_run && !force_send {
         if run_mode.verbose {
-            println!("dry-run: skip backup report email");
+            crate::pnote!("dry-run: skip backup report email");
         }
         return Ok(());
     }
@@ -338,7 +363,7 @@ fn run_jobs_for_primary(
                 match primary_statuses.get(&job.name).copied() {
                     Some(status) if status.produced_snapshot() => {}
                     other => {
-                        println!(
+                        crate::pnote!(
                             "cascade skipped for job {} on disk {}: primary backup {}",
                             job.name,
                             disk.disk_id,
@@ -362,7 +387,7 @@ fn run_jobs_for_primary(
                     )));
                 }
                 if run_mode.dry_run && !source.exists() {
-                    println!("dry-run: skip cascade (missing {})", source.display());
+                    crate::pnote!("dry-run: skip cascade (missing {})", source.display());
                     continue;
                 }
                 job_override.source = source.to_string_lossy().to_string();
@@ -372,6 +397,7 @@ fn run_jobs_for_primary(
                 drop(guard);
                 continue;
             }
+            crate::pstatus!("cascading to disk {}", disk.disk_id);
             if let Some((code, message)) = run_backup_checked(
                 disk.disk_id.clone(),
                 cascaded_jobs,
@@ -533,6 +559,7 @@ fn mount_and_verify(
     run_mode: RunMode,
 ) -> Result<(Option<MountGuard>, std::path::PathBuf)> {
     let options = mount_options_for_backup(disk);
+    crate::pstatus!("mounting disk {}", disk.disk_id);
     let (disk_guard, mountpoint) = if run_mode.dry_run {
         (None, mount_base.join(&disk.fs_uuid))
     } else {

@@ -31,6 +31,8 @@ pub struct ConfigOptions {
     pub verbose: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub safe: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress: Option<bool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rsync: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
