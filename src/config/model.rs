@@ -109,6 +109,16 @@ pub struct RemoteJobOptions {
         skip_serializing_if = "Option::is_none"
     )]
     pub minimum_session_seconds: Option<u64>,
+    /// `systemd-logind` session owners that never count as a person using the
+    /// host during the cold-boot check, chiefly display-manager greeter accounts
+    /// sitting at the login screen. Unset uses a built-in list of common display
+    /// managers; an explicit list (including `[]`) replaces that default.
+    #[serde(
+        default,
+        rename = "ignoredSessionUsers",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub ignored_session_users: Option<Vec<String>>,
     #[serde(
         default,
         rename = "afterBackup",

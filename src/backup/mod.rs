@@ -41,11 +41,39 @@ const DEFAULT_REMOTE_MINIMUM_UPTIME_SECONDS: u64 = 600;
 const DEFAULT_REMOTE_MINIMUM_SESSION_SECONDS: u64 = 300;
 const REMOTE_ACTIVITY_WINDOW_SECONDS: i64 = 24 * 60 * 60;
 const REMOTE_ACTIVITY_BUFFER_SECONDS: i64 = 10 * 60;
+/// How far apart an sshd `Accepted` line and a `systemd-logind` `New session`
+/// line may be while still counting as the same login.
+const SESSION_CORRELATION_SECONDS: i64 = 10;
+/// `MESSAGE_ID` of systemd-logind's "session created" / "session removed" journal
+/// entries. Matching these (rather than grepping the message text) also gives us
+/// the structured `SESSION_ID`, `USER_ID` and `_BOOT_ID` fields.
+const LOGIND_SESSION_NEW_MESSAGE_ID: &str = "8d45620c1a4348dbb17410da57c60c66";
+const LOGIND_SESSION_REMOVED_MESSAGE_ID: &str = "3354939424b4456d9802ca8333ed424a";
+/// Absolute remote-vs-local clock offset, in seconds, at or above which Timevault
+/// warns about a drifting backup-source clock on every run.
+const REMOTE_CLOCK_DRIFT_WARN_SECONDS: i64 = 5;
+/// Session owners that never count as a person using the host during the
+/// cold-boot check: display-manager greeter accounts sitting at the login
+/// screen. Overridable per job with `remote.ignoredSessionUsers`.
+const DEFAULT_IGNORED_SESSION_USERS: [&str; 9] = [
+    "gdm",
+    "gdm3",
+    "Debian-gdm",
+    "sddm",
+    "lightdm",
+    "lxdm",
+    "xdm",
+    "kdm",
+    "slim",
+];
 
 #[derive(Debug, Clone, Copy)]
 pub struct BackupOptions {
     pub exclude_pristine: bool,
     pub exclude_pristine_only: bool,
+    /// CLI override for `remote.minimumSessionSeconds` on every job this run
+    /// (`--min-session-seconds`); handy when testing the cold-boot gate.
+    pub session_seconds_override: Option<u64>,
 }
 
 struct LockGuard {
@@ -204,7 +232,7 @@ fn run_backup_job(
         println!("  excludes: {}", job.excludes.len());
     }
 
-    let mut remote_power_guard = match start_remote_power_guard(job, run_mode) {
+    let mut remote_power_guard = match start_remote_power_guard(job, run_mode, options) {
         Ok(RemotePowerStart::Ready(guard)) => guard,
         Ok(RemotePowerStart::InactiveColdBoot {
             uptime_seconds,
@@ -830,6 +858,7 @@ struct WakeContext {
     probe_timeout: StdDuration,
     minimum_uptime_seconds: u64,
     minimum_session_seconds: u64,
+    ignored_session_users: Vec<String>,
     after_backup: Option<RemoteAfterBackup>,
 }
 
@@ -1010,7 +1039,11 @@ pub fn wake_remote_job(job: &Job, run_mode: RunMode) -> Result<()> {
     wait_for_ssh_until(&context.ssh_host, deadline, run_mode)
 }
 
-fn start_remote_power_guard(job: &Job, run_mode: RunMode) -> Result<RemotePowerStart> {
+fn start_remote_power_guard(
+    job: &Job,
+    run_mode: RunMode,
+    options: BackupOptions,
+) -> Result<RemotePowerStart> {
     if run_mode.dry_run {
         let Some((remote, _, host)) = remote_config(job) else {
             return Ok(RemotePowerStart::Ready(None));
@@ -1028,14 +1061,22 @@ fn start_remote_power_guard(job: &Job, run_mode: RunMode) -> Result<RemotePowerS
                 job.name,
                 wake_target_description(remote)
             );
-            println!(
-                "dry-run: would check uptime after WOL; below {} seconds, it would inspect the remote persistent journal for an interactive session lasting at least {} seconds during the prior daily window",
-                remote
-                    .minimum_uptime_seconds
-                    .unwrap_or(DEFAULT_REMOTE_MINIMUM_UPTIME_SECONDS),
+            let effective_min_session = options.session_seconds_override.unwrap_or_else(|| {
                 remote
                     .minimum_session_seconds
                     .unwrap_or(DEFAULT_REMOTE_MINIMUM_SESSION_SECONDS)
+            });
+            println!(
+                "dry-run: would check uptime after WOL; below {} seconds, it would inspect the remote persistent journal for a session tied to a non-Timevault SSH login and lasting at least {} seconds{} during the prior daily window (greeter, manager, cron and Timevault's own sessions do not count; sessions are keyed by boot id)",
+                remote
+                    .minimum_uptime_seconds
+                    .unwrap_or(DEFAULT_REMOTE_MINIMUM_UPTIME_SECONDS),
+                effective_min_session,
+                if options.session_seconds_override.is_some() {
+                    " (--min-session-seconds override)"
+                } else {
+                    ""
+                }
             );
         }
         println!(
@@ -1067,9 +1108,18 @@ fn start_remote_power_guard(job: &Job, run_mode: RunMode) -> Result<RemotePowerS
         return Ok(RemotePowerStart::Ready(None));
     }
 
-    let Some(context) = remote_context(job)? else {
+    let Some(mut context) = remote_context(job)? else {
         return Ok(RemotePowerStart::Ready(None));
     };
+    if let Some(seconds) = options.session_seconds_override {
+        if seconds != context.minimum_session_seconds {
+            println!(
+                "  --min-session-seconds: cold-boot minimum session length {}s -> {}s for job {}",
+                context.minimum_session_seconds, seconds, job.name
+            );
+        }
+        context.minimum_session_seconds = seconds;
+    }
     let deadline = Instant::now() + context.probe_timeout;
     let was_woken = if ping_once(&context.host, run_mode)? {
         if run_mode.verbose {
@@ -1105,19 +1155,39 @@ fn start_remote_power_guard(job: &Job, run_mode: RunMode) -> Result<RemotePowerS
     };
     wait_for_ssh_until(&context.ssh_host, deadline, run_mode)?;
 
+    let local_now = Utc::now().timestamp();
+    let (remote_now, uptime_seconds) = remote_now_and_uptime(&context.ssh_host, run_mode)?;
+    let clock_offset = remote_now - local_now;
+    report_clock_drift(&context.ssh_host, clock_offset, run_mode);
+
     let found_state = if !was_woken {
         FoundPowerState::Running
     } else {
-        let uptime_seconds = remote_uptime_seconds(&context.ssh_host, run_mode)?;
+        if run_mode.verbose {
+            println!(
+                "  remote {} uptime {}s (cold-boot threshold {}s)",
+                context.ssh_host, uptime_seconds, context.minimum_uptime_seconds
+            );
+        }
         if uptime_seconds < context.minimum_uptime_seconds {
-            let boot_start = Utc::now().timestamp() - uptime_seconds as i64;
+            // Everything from here is in the remote's clock frame: `remote_now`
+            // and the journal timestamps share it, so a skewed remote clock no
+            // longer slides the window or backdates boot-time sessions into it.
+            let boot_start = remote_now - uptime_seconds as i64;
             let (window_start, window_end) = remote_activity_window(boot_start);
+            if run_mode.verbose {
+                println!(
+                    "  {} looks cold-booted; inspecting the prior daily journal window for real use",
+                    context.ssh_host
+                );
+            }
             if !remote_journal_has_qualifying_session(
                 &context.ssh_host,
                 window_start,
                 window_end,
                 boot_start,
                 context.minimum_session_seconds,
+                &context.ignored_session_users,
                 run_mode,
             )? {
                 return Ok(RemotePowerStart::InactiveColdBoot {
@@ -1134,6 +1204,12 @@ fn start_remote_power_guard(job: &Job, run_mode: RunMode) -> Result<RemotePowerS
             }
             FoundPowerState::PoweredOff
         } else {
+            if run_mode.verbose {
+                println!(
+                    "  remote {} uptime is above the cold-boot threshold; treating it as resumed from suspend",
+                    context.ssh_host
+                );
+            }
             FoundPowerState::Suspended
         }
     };
@@ -1197,6 +1273,12 @@ fn remote_context(job: &Job) -> Result<Option<WakeContext>> {
         minimum_session_seconds: options
             .minimum_session_seconds
             .unwrap_or(DEFAULT_REMOTE_MINIMUM_SESSION_SECONDS),
+        ignored_session_users: options.ignored_session_users.clone().unwrap_or_else(|| {
+            DEFAULT_IGNORED_SESSION_USERS
+                .iter()
+                .map(|user| user.to_string())
+                .collect()
+        }),
         after_backup: options.after_backup,
     }))
 }
@@ -1478,36 +1560,84 @@ fn wait_for_ssh_until(ssh_host: &str, deadline: Instant, run_mode: RunMode) -> R
     })
 }
 
-fn remote_uptime_seconds(ssh_host: &str, run_mode: RunMode) -> Result<u64> {
+/// Read the remote's wall-clock time and its uptime in one round trip. Both come
+/// from the same clock, so `now - uptime` is the boot instant *in the remote's
+/// own time frame* — the frame its journal timestamps use — even when the remote
+/// clock disagrees with ours (a dead RTC, or NTP not yet resynced after a WOL
+/// cold boot). Deriving `boot_start` from our clock instead would slide the whole
+/// activity window by the offset.
+fn remote_now_and_uptime(ssh_host: &str, run_mode: RunMode) -> Result<(i64, u64)> {
     let mut cmd = Command::new("ssh");
     cmd.arg("-o")
         .arg("BatchMode=yes")
         .arg("-o")
         .arg("ConnectTimeout=5")
         .arg(ssh_host)
-        .arg("cut -d. -f1 /proc/uptime")
+        .arg("date +%s; cut -d. -f1 /proc/uptime")
         .stdin(Stdio::null());
     maybe_print_command(&cmd, run_mode);
     let output = cmd.output().map_err(|err| {
-        TimevaultError::message(format!("read remote uptime from {}: {}", ssh_host, err))
+        TimevaultError::message(format!("read remote clock from {}: {}", ssh_host, err))
     })?;
     if !output.status.success() {
         return Err(TimevaultError::message(format!(
-            "read remote uptime from {}: ssh exited with code {}",
+            "read remote clock from {}: ssh exited with code {}",
             ssh_host,
             output.status.code().unwrap_or(1)
         )));
     }
-    parse_uptime_seconds(&String::from_utf8_lossy(&output.stdout)).ok_or_else(|| {
+    parse_now_and_uptime(&String::from_utf8_lossy(&output.stdout)).ok_or_else(|| {
         TimevaultError::message(format!(
-            "read remote uptime from {}: invalid /proc/uptime output",
+            "read remote clock from {}: unexpected `date`/`/proc/uptime` output",
             ssh_host
         ))
     })
 }
 
-fn parse_uptime_seconds(output: &str) -> Option<u64> {
-    output.trim().split('.').next()?.parse().ok()
+fn parse_now_and_uptime(output: &str) -> Option<(i64, u64)> {
+    let mut fields = output.split_whitespace();
+    let now = fields.next()?.parse::<i64>().ok()?;
+    let uptime = fields.next()?.split('.').next()?.parse::<u64>().ok()?;
+    Some((now, uptime))
+}
+
+/// Surface a drifting backup-source clock. Always prints when the offset is past
+/// the warning threshold (it distorts rsync mtimes and the cold-boot window);
+/// otherwise only under `--verbose`.
+fn report_clock_drift(ssh_host: &str, offset_seconds: i64, run_mode: RunMode) {
+    if offset_seconds.abs() >= REMOTE_CLOCK_DRIFT_WARN_SECONDS {
+        println!(
+            "warning: backup source {} clock is {} — check NTP on that host",
+            ssh_host,
+            describe_clock_offset(offset_seconds)
+        );
+    } else if run_mode.verbose {
+        println!(
+            "  backup source {} clock is {}",
+            ssh_host,
+            describe_clock_offset(offset_seconds)
+        );
+    }
+}
+
+/// Human-readable summary of how far the remote clock sits from ours.
+fn describe_clock_offset(offset_seconds: i64) -> String {
+    if offset_seconds.abs() <= 2 {
+        return "in sync with this host".to_string();
+    }
+    let magnitude = offset_seconds.unsigned_abs();
+    let (minutes, seconds) = (magnitude / 60, magnitude % 60);
+    let amount = if minutes > 0 {
+        format!("{}m {}s", minutes, seconds)
+    } else {
+        format!("{}s", seconds)
+    };
+    let direction = if offset_seconds > 0 {
+        "ahead of"
+    } else {
+        "behind"
+    };
+    format!("{} {} this host", amount, direction)
 }
 
 fn remote_activity_window(boot_start: i64) -> (i64, i64) {
@@ -1523,100 +1653,543 @@ fn remote_journal_has_qualifying_session(
     window_end: i64,
     boot_start: i64,
     minimum_session_seconds: u64,
+    ignored_users: &[String],
     run_mode: RunMode,
 ) -> Result<bool> {
-    // Read from the start of the activity window through to the boot we just
-    // woke: a session that starts inside the window can only be logged out
-    // (or cut short by the reboot) after `window_end`, so the `Removed
-    // session` line lands in the [window_end, boot_start] tail.
+    let logind_journal = remote_logind_journal(ssh_host, window_start, boot_start, run_mode)?;
+    let sessions = parse_logind_sessions(&logind_journal);
+
+    // An empty result is ambiguous: nobody used the host, or the journal simply
+    // has no data for that window (not persisted across reboots, freshly rotated,
+    // …). Only the first should power the host off, so when it looks empty, check
+    // whether the journal holds *any* record in the window before deciding.
+    if sessions.is_empty()
+        && !remote_journal_covers_window(ssh_host, window_start, boot_start, run_mode)?
+    {
+        println!(
+            "warning: the journal on {} has no records for the prior-day window (not persisted across reboots?). Backing up without the cold-boot usage check.",
+            ssh_host
+        );
+        return Ok(true);
+    }
+
+    // The only way a person uses a headless backup source is over SSH, so a
+    // session counts only if it lines up with an `Accepted` SSH login from an
+    // address that is *not* Timevault's own. That also drops greeter, manager,
+    // cron/`@reboot` and Timevault's own rsync sessions in one move. We need the
+    // address the remote sees us on ($SSH_CONNECTION) to tell the two apart; if
+    // we cannot get it, fall back to session length alone.
+    let origin_client = remote_ssh_client(ssh_host, run_mode)?;
+    let ssh_journal = if origin_client.is_some() {
+        remote_sshd_journal(ssh_host, window_start, boot_start, run_mode)?
+    } else {
+        String::new()
+    };
+
+    let logins = parse_ssh_logins(&ssh_journal);
+    // A login is Timevault's own when it comes from Timevault's address *as the
+    // user Timevault connects as* (root). A different user from that same host is
+    // a person working via the backup box, and still counts.
+    let timevault_user = ssh_user_of(ssh_host);
+    let (timevault_keys, interactive_keys) = match origin_client.as_deref() {
+        Some(origin) => {
+            let is_timevault = |login: &SshLogin| {
+                login.client == origin && timevault_user.is_none_or(|user| login.user == user)
+            };
+            (
+                correlated_session_keys(&sessions, &logins, is_timevault),
+                correlated_session_keys(&sessions, &logins, |login| !is_timevault(login)),
+            )
+        }
+        None => (HashSet::new(), HashSet::new()),
+    };
+    let filter = SessionFilter {
+        window_start,
+        window_end,
+        boot_start,
+        minimum_session_seconds: minimum_session_seconds as i64,
+        timevault_keys: &timevault_keys,
+        interactive_keys: &interactive_keys,
+        ignored_users,
+        require_interactive: origin_client.is_some(),
+    };
+
+    if run_mode.verbose {
+        println!(
+            "  cold-boot session check: prior-window @{}..@{} (boot @{}), minimum {}s",
+            window_start, window_end, boot_start, minimum_session_seconds
+        );
+        match origin_client.as_deref() {
+            Some(client) => println!(
+                "    Timevault reaches {} from {}; {} SSH login(s) in window ({} by a person, {} by Timevault)",
+                ssh_host,
+                client,
+                logins.len(),
+                interactive_keys.len(),
+                timevault_keys.len(),
+            ),
+            None => println!(
+                "    could not read $SSH_CONNECTION from {}; falling back to session length alone",
+                ssh_host
+            ),
+        }
+        if !ignored_users.is_empty() {
+            println!(
+                "    ignoring sessions owned by: {}",
+                ignored_users.join(", ")
+            );
+        }
+    }
+
+    // The per-session verdicts are always shown: this is what decides whether a
+    // WoL'd host gets backed up or powered straight off, and it runs at most once
+    // a day per host.
+    if sessions.is_empty() {
+        println!(
+            "  cold-boot check on {}: no logind sessions in the prior-day window",
+            ssh_host
+        );
+    } else {
+        println!(
+            "  cold-boot check on {}: {} logind session(s) in the prior-day window (need one \u{2265} {}s tied to a non-Timevault SSH login):",
+            ssh_host,
+            sessions.len(),
+            minimum_session_seconds
+        );
+    }
+    for session in &sessions {
+        let (verdict, duration) = classify_session(session, &filter);
+        println!(
+            "    session {} (boot {}) user {} for {} -> {}",
+            session.id,
+            short_boot_id(&session.boot_id),
+            if session.user.is_empty() {
+                "?"
+            } else {
+                session.user.as_str()
+            },
+            format_session_duration(duration),
+            verdict.as_str(),
+        );
+    }
+
+    let qualifies = any_session_counts(&sessions, &filter);
+    println!(
+        "  -> {}",
+        if qualifies {
+            "a person used the host in the prior day; backup proceeds"
+        } else {
+            "no qualifying session; skipping backup and powering the host off"
+        }
+    );
+
+    Ok(qualifies)
+}
+
+fn format_session_duration(seconds: i64) -> String {
+    let s = seconds.max(0);
+    if s >= 3600 {
+        format!("{}h {:02}m {:02}s", s / 3600, (s % 3600) / 60, s % 60)
+    } else if s >= 60 {
+        format!("{}m {:02}s", s / 60, s % 60)
+    } else {
+        format!("{}s", s)
+    }
+}
+
+/// Does the remote journal hold any record inside `[window_start, boot_start]`?
+/// If not, the cold-boot check has nothing to reason about (the journal is not
+/// kept across reboots, or was rotated) and must not conclude the host was idle.
+fn remote_journal_covers_window(
+    ssh_host: &str,
+    window_start: i64,
+    boot_start: i64,
+    run_mode: RunMode,
+) -> Result<bool> {
+    let output = remote_journalctl(
+        ssh_host,
+        &format!(
+            "journalctl --quiet --no-pager -n 1 --output=cat --since @{} --until @{}",
+            window_start, boot_start
+        ),
+        "probe remote journal coverage",
+        run_mode,
+    )?;
+    Ok(!output.trim().is_empty())
+}
+
+/// Fetch systemd-logind's session create/remove events for the activity window
+/// as JSON (one object per line). Read from the start of the window through to
+/// the boot we just woke: a session that starts inside the window can only be
+/// logged out (or cut short by the reboot) after `window_end`, so the removal
+/// lands in the [window_end, boot_start] tail. JSON carries `_BOOT_ID`, so a
+/// session id reused across reboots is not mistaken for one long session.
+fn remote_logind_journal(
+    ssh_host: &str,
+    window_start: i64,
+    boot_start: i64,
+    run_mode: RunMode,
+) -> Result<String> {
+    remote_journalctl(
+        ssh_host,
+        &format!(
+            "journalctl --quiet --no-pager --output=json --since @{} --until @{} MESSAGE_ID={} + MESSAGE_ID={}",
+            window_start, boot_start, LOGIND_SESSION_NEW_MESSAGE_ID, LOGIND_SESSION_REMOVED_MESSAGE_ID
+        ),
+        "read remote system journal",
+        run_mode,
+    )
+}
+
+/// Fetch sshd `Accepted` login lines for the activity window as JSON, so a
+/// logind session can be tied to the address (and boot) it was opened from.
+fn remote_sshd_journal(
+    ssh_host: &str,
+    window_start: i64,
+    boot_start: i64,
+    run_mode: RunMode,
+) -> Result<String> {
+    remote_journalctl(
+        ssh_host,
+        &format!(
+            "journalctl --quiet --no-pager --output=json --since @{} --until @{} SYSLOG_IDENTIFIER=sshd + SYSLOG_IDENTIFIER=sshd-session --grep='Accepted '",
+            window_start, boot_start
+        ),
+        "read remote SSH journal",
+        run_mode,
+    )
+}
+
+fn remote_journalctl(
+    ssh_host: &str,
+    remote_command: &str,
+    context: &str,
+    run_mode: RunMode,
+) -> Result<String> {
     let mut cmd = Command::new("ssh");
     cmd.arg("-o")
         .arg("BatchMode=yes")
         .arg("-o")
         .arg("ConnectTimeout=5")
         .arg(ssh_host)
-        .arg(format!(
-            "journalctl --quiet --no-pager --output=short-unix --since @{} --until @{} SYSLOG_IDENTIFIER=systemd-logind --grep='session'",
-            window_start, boot_start
-        ))
+        .arg(remote_command)
         .stdin(Stdio::null());
     maybe_print_command(&cmd, run_mode);
     let output = cmd.output().map_err(|err| {
-        TimevaultError::message(format!(
-            "read remote system journal from {}: {}",
-            ssh_host, err
-        ))
+        TimevaultError::message(format!("{} from {}: {}", context, ssh_host, err))
     })?;
     if !output.status.success() {
         return Err(TimevaultError::message(format!(
-            "read remote system journal from {}: ssh exited with code {}",
+            "{} from {}: ssh exited with code {}",
+            context,
             ssh_host,
             output.status.code().unwrap_or(1)
         )));
     }
-    Ok(journal_has_qualifying_session(
-        &String::from_utf8_lossy(&output.stdout),
-        window_start,
-        window_end,
-        boot_start,
-        minimum_session_seconds as i64,
-    ))
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// A session counts when it *starts* inside the activity window and stays open
-/// for at least `minimum_session_seconds`. An unclosed session is measured up
-/// to `boot_start` (nothing outlives the reboot that woke us).
-fn journal_has_qualifying_session(
-    journal: &str,
+/// Ask the remote which client address it sees this SSH connection coming from
+/// (the first field of `$SSH_CONNECTION`). rsync, hooks and probes all reach the
+/// host the same way, so this is the address Timevault's own sessions carry.
+fn remote_ssh_client(ssh_host: &str, run_mode: RunMode) -> Result<Option<String>> {
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ConnectTimeout=5")
+        .arg(ssh_host)
+        .arg("printf '%s' \"${SSH_CONNECTION:-}\"")
+        .stdin(Stdio::null());
+    maybe_print_command(&cmd, run_mode);
+    let output = cmd.output().map_err(|err| {
+        TimevaultError::message(format!("read $SSH_CONNECTION from {}: {}", ssh_host, err))
+    })?;
+    if !output.status.success() {
+        return Err(TimevaultError::message(format!(
+            "read $SSH_CONNECTION from {}: ssh exited with code {}",
+            ssh_host,
+            output.status.code().unwrap_or(1)
+        )));
+    }
+    Ok(parse_ssh_connection_client(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+fn parse_ssh_connection_client(value: &str) -> Option<String> {
+    value
+        .split_whitespace()
+        .next()
+        .map(|client| client.to_string())
+}
+
+/// The user part of an ssh target (`root@host` -> `root`); `None` for a bare host
+/// or an ssh-config alias.
+fn ssh_user_of(ssh_host: &str) -> Option<&str> {
+    ssh_host
+        .rsplit_once('@')
+        .map(|(user, _)| user)
+        .filter(|user| !user.is_empty())
+}
+
+/// A `systemd-logind` session reconstructed from its create/remove journal
+/// entries. `boot_id` keeps sessions from different boots apart even though
+/// logind restarts session numbers on every boot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LogindSession {
+    boot_id: String,
+    id: String,
+    user: String,
+    start: i64,
+    /// `None` when no removal entry appeared in range.
+    end: Option<i64>,
+}
+
+/// An `Accepted` SSH login, kept only for matching against logind sessions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SshLogin {
+    boot_id: String,
+    timestamp: i64,
+    user: String,
+    client: String,
+}
+
+/// Stable key for a session across the two journal streams: same boot, same id.
+fn session_key(boot_id: &str, id: &str) -> String {
+    format!("{}#{}", boot_id, id)
+}
+
+fn short_boot_id(boot_id: &str) -> &str {
+    boot_id.get(..8).unwrap_or(boot_id)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionVerdict {
+    /// Counts as a person using the host.
+    Counted,
+    /// Started in the window but did not stay open long enough.
+    TooShort,
+    /// Started before the 24h activity window.
+    BeforeWindow,
+    /// Started after `window_end`, i.e. created around this boot rather than
+    /// during the prior day (linger/manager sessions, `@reboot` jobs, …).
+    NearBoot,
+    /// Not tied to an SSH login by a person (greeter, manager, cron, console).
+    NotInteractive,
+    /// Opened by Timevault's own SSH access.
+    TimevaultBackup,
+    /// Owned by an ignored account, e.g. a display-manager greeter.
+    IgnoredUser,
+}
+
+impl SessionVerdict {
+    fn as_str(self) -> &'static str {
+        match self {
+            SessionVerdict::Counted => "counted",
+            SessionVerdict::TooShort => "too short",
+            SessionVerdict::BeforeWindow => "before window",
+            SessionVerdict::NearBoot => "started at/after boot",
+            SessionVerdict::NotInteractive => "no SSH login by a person",
+            SessionVerdict::TimevaultBackup => "ignored (Timevault backup)",
+            SessionVerdict::IgnoredUser => "ignored (display-manager / listed account)",
+        }
+    }
+}
+
+/// The inputs the cold-boot check weighs each `systemd-logind` session against.
+struct SessionFilter<'a> {
     window_start: i64,
     window_end: i64,
     boot_start: i64,
     minimum_session_seconds: i64,
-) -> bool {
-    use std::collections::HashMap;
+    /// Session keys opened by Timevault's own SSH activity.
+    timevault_keys: &'a HashSet<String>,
+    /// Session keys tied to an `Accepted` SSH login from a non-Timevault address.
+    interactive_keys: &'a HashSet<String>,
+    /// Session owners that never count as use (display-manager greeters, …).
+    ignored_users: &'a [String],
+    /// Require a session to be in `interactive_keys` to count. False only when
+    /// Timevault could not learn its own client address and falls back to
+    /// session length alone.
+    require_interactive: bool,
+}
 
-    let mut starts: HashMap<String, i64> = HashMap::new();
+impl SessionFilter<'_> {
+    fn user_is_ignored(&self, user: &str) -> bool {
+        self.ignored_users.iter().any(|ignored| ignored == user)
+    }
+}
+
+fn token_after<'a>(tokens: &[&'a str], key: &str) -> Option<&'a str> {
+    tokens
+        .iter()
+        .position(|token| *token == key)
+        .and_then(|idx| tokens.get(idx + 1))
+        .map(|token| token.trim_end_matches('.'))
+}
+
+fn json_str<'a>(entry: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    entry.get(key).and_then(serde_json::Value::as_str)
+}
+
+/// `__REALTIME_TIMESTAMP` (microseconds since the epoch, as a string) in whole
+/// seconds. This is the remote's own clock, matching `boot_start`.
+fn journal_realtime_seconds(entry: &serde_json::Value) -> Option<i64> {
+    json_str(entry, "__REALTIME_TIMESTAMP")?
+        .parse::<i64>()
+        .ok()
+        .map(|micros| micros / 1_000_000)
+}
+
+/// Parse `journalctl -o json` lines for logind's session create/remove events.
+fn parse_logind_sessions(journal: &str) -> Vec<LogindSession> {
+    // key -> (start, user, boot_id, id)
+    let mut starts: HashMap<String, (i64, String, String, String)> = HashMap::new();
     let mut ends: HashMap<String, i64> = HashMap::new();
 
     for line in journal.lines() {
-        let mut tokens = line.split_whitespace();
-        let Some(timestamp) = tokens
-            .next()
-            .and_then(|token| token.split('.').next())
-            .and_then(|seconds| seconds.parse::<i64>().ok())
-        else {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
-        let rest: Vec<&str> = tokens.collect();
-        let Some(marker) = rest.iter().position(|token| *token == "session") else {
+        let (Some(message_id), Some(ts), Some(id)) = (
+            json_str(&entry, "MESSAGE_ID"),
+            journal_realtime_seconds(&entry),
+            json_str(&entry, "SESSION_ID"),
+        ) else {
             continue;
         };
-        let Some(id) = rest
-            .get(marker + 1)
-            .map(|token| token.trim_end_matches('.'))
-        else {
-            continue;
-        };
-        let preceding = &rest[..marker];
-        if preceding.contains(&"New") {
+        let boot_id = json_str(&entry, "_BOOT_ID").unwrap_or("");
+        let key = session_key(boot_id, id);
+        if message_id == LOGIND_SESSION_NEW_MESSAGE_ID {
+            let user = json_str(&entry, "USER_ID").unwrap_or("").to_string();
             starts
-                .entry(id.to_string())
-                .and_modify(|first| *first = (*first).min(timestamp))
-                .or_insert(timestamp);
-        } else if preceding.contains(&"Removed") {
-            ends.entry(id.to_string())
-                .and_modify(|last| *last = (*last).max(timestamp))
-                .or_insert(timestamp);
+                .entry(key)
+                .and_modify(|(first, ..)| *first = (*first).min(ts))
+                .or_insert((ts, user, boot_id.to_string(), id.to_string()));
+        } else if message_id == LOGIND_SESSION_REMOVED_MESSAGE_ID {
+            ends.entry(key)
+                .and_modify(|last| *last = (*last).max(ts))
+                .or_insert(ts);
         }
     }
 
-    starts.iter().any(|(id, &start)| {
-        if start < window_start || start > window_end {
-            return false;
+    let mut sessions: Vec<LogindSession> = starts
+        .into_iter()
+        .map(|(key, (start, user, boot_id, id))| LogindSession {
+            boot_id,
+            id,
+            user,
+            start,
+            end: ends.get(&key).copied(),
+        })
+        .collect();
+    sessions.sort_by(|a, b| {
+        a.start
+            .cmp(&b.start)
+            .then_with(|| a.boot_id.cmp(&b.boot_id))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    sessions
+}
+
+/// Parse `journalctl -o json` lines for sshd `Accepted` logins.
+fn parse_ssh_logins(journal: &str) -> Vec<SshLogin> {
+    let mut logins = Vec::new();
+    for line in journal.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
         }
-        let end = ends.get(id).copied().unwrap_or(boot_start).min(boot_start);
-        end - start >= minimum_session_seconds
-    })
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let (Some(timestamp), Some(message)) = (
+            journal_realtime_seconds(&entry),
+            json_str(&entry, "MESSAGE"),
+        ) else {
+            continue;
+        };
+        let tokens: Vec<&str> = message.split_whitespace().collect();
+        let Some(accepted) = tokens.iter().position(|token| *token == "Accepted") else {
+            continue;
+        };
+        // "Accepted publickey for <user> from <client> port <n> ssh2: ..."
+        let tail = &tokens[accepted..];
+        let (Some(user), Some(client)) = (token_after(tail, "for"), token_after(tail, "from"))
+        else {
+            continue;
+        };
+        logins.push(SshLogin {
+            boot_id: json_str(&entry, "_BOOT_ID").unwrap_or("").to_string(),
+            timestamp,
+            user: user.to_string(),
+            client: client.to_string(),
+        });
+    }
+    logins
+}
+
+fn login_matches_session(login: &SshLogin, session: &LogindSession) -> bool {
+    login.boot_id == session.boot_id
+        && login.user == session.user
+        && (login.timestamp - session.start).abs() <= SESSION_CORRELATION_SECONDS
+}
+
+/// Keys of the sessions that line up with an `Accepted` SSH login `want` selects
+/// (by client address), in the same boot and for the same user.
+fn correlated_session_keys(
+    sessions: &[LogindSession],
+    logins: &[SshLogin],
+    want: impl Fn(&SshLogin) -> bool,
+) -> HashSet<String> {
+    sessions
+        .iter()
+        .filter(|session| {
+            logins
+                .iter()
+                .any(|login| want(login) && login_matches_session(login, session))
+        })
+        .map(|session| session_key(&session.boot_id, &session.id))
+        .collect()
+}
+
+/// Classify a single session and report the length credited to it. An unclosed
+/// session is measured up to `boot_start` (nothing outlives the reboot that woke
+/// us).
+fn classify_session(session: &LogindSession, filter: &SessionFilter) -> (SessionVerdict, i64) {
+    let key = session_key(&session.boot_id, &session.id);
+    let end = session
+        .end
+        .unwrap_or(filter.boot_start)
+        .min(filter.boot_start);
+    let duration = end - session.start;
+    let verdict = if filter.timevault_keys.contains(&key) {
+        SessionVerdict::TimevaultBackup
+    } else if filter.user_is_ignored(&session.user) {
+        SessionVerdict::IgnoredUser
+    } else if session.start < filter.window_start {
+        SessionVerdict::BeforeWindow
+    } else if session.start > filter.window_end {
+        SessionVerdict::NearBoot
+    } else if filter.require_interactive && !filter.interactive_keys.contains(&key) {
+        SessionVerdict::NotInteractive
+    } else if duration < filter.minimum_session_seconds {
+        SessionVerdict::TooShort
+    } else {
+        SessionVerdict::Counted
+    };
+    (verdict, duration)
+}
+
+fn any_session_counts(sessions: &[LogindSession], filter: &SessionFilter) -> bool {
+    sessions
+        .iter()
+        .any(|session| classify_session(session, filter).0 == SessionVerdict::Counted)
 }
 
 fn retry_remote_readiness_until<T, F>(
@@ -2427,64 +3000,355 @@ mod tests {
     }
 
     #[test]
-    fn parses_remote_uptime_seconds() {
-        assert_eq!(parse_uptime_seconds("123.45\\n"), Some(123));
-        assert_eq!(parse_uptime_seconds("not-a-number"), None);
+    fn parses_remote_now_and_uptime() {
+        assert_eq!(
+            parse_now_and_uptime("1788781182\n5704.19\n"),
+            Some((1788781182, 5704))
+        );
+        assert_eq!(
+            parse_now_and_uptime("1788781182 5704.19"),
+            Some((1788781182, 5704))
+        );
+        assert_eq!(parse_now_and_uptime("1788781182"), None);
+        assert_eq!(parse_now_and_uptime("not a number"), None);
     }
 
     #[test]
-    fn qualifying_session_needs_minimum_duration_inside_window() {
-        // window: [1000, 2000], reboot at 3000, threshold 300s.
-        let journal = "\
-1100.000000 host systemd-logind[80]: New session 5 of user alex.
-1180.000000 host systemd-logind[80]: Removed session 5.
-1300.000000 host systemd-logind[80]: New session 6 of user alex.
-1900.000000 host systemd-logind[80]: Removed session 6.
-";
-        // session 5 lasts 80s (too short); session 6 lasts 600s (qualifies).
-        assert!(journal_has_qualifying_session(
-            journal, 1000, 2000, 3000, 300
-        ));
+    fn describes_clock_offset() {
+        assert_eq!(describe_clock_offset(0), "in sync with this host");
+        assert_eq!(describe_clock_offset(-2), "in sync with this host");
+        assert_eq!(describe_clock_offset(37), "37s ahead of this host");
+        assert_eq!(describe_clock_offset(-5704), "95m 4s behind this host");
+    }
+
+    // --- session-check helpers -------------------------------------------------
+
+    /// One `journalctl -o json` line for a logind session create/remove event.
+    fn logind_line(new: bool, boot: &str, id: &str, user: &str, secs: i64) -> String {
+        let message_id = if new {
+            LOGIND_SESSION_NEW_MESSAGE_ID
+        } else {
+            LOGIND_SESSION_REMOVED_MESSAGE_ID
+        };
+        format!(
+            r#"{{"MESSAGE_ID":"{message_id}","_BOOT_ID":"{boot}","SESSION_ID":"{id}","USER_ID":"{user}","__REALTIME_TIMESTAMP":"{}"}}"#,
+            secs * 1_000_000
+        )
+    }
+
+    /// One `journalctl -o json` line for an sshd `Accepted` login.
+    fn sshd_line(boot: &str, user: &str, client: &str, secs: i64) -> String {
+        format!(
+            r#"{{"_BOOT_ID":"{boot}","__REALTIME_TIMESTAMP":"{}","MESSAGE":"Accepted publickey for {user} from {client} port 46614 ssh2: ED25519 SHA256:abc"}}"#,
+            secs * 1_000_000
+        )
+    }
+
+    /// Prior window [1000, 2000], boot at 5000, threshold 300s.
+    fn test_filter<'a>(
+        timevault_keys: &'a HashSet<String>,
+        interactive_keys: &'a HashSet<String>,
+        ignored_users: &'a [String],
+        require_interactive: bool,
+    ) -> SessionFilter<'a> {
+        SessionFilter {
+            window_start: 1000,
+            window_end: 2000,
+            boot_start: 5000,
+            minimum_session_seconds: 300,
+            timevault_keys,
+            interactive_keys,
+            ignored_users,
+            require_interactive,
+        }
     }
 
     #[test]
-    fn short_session_does_not_qualify() {
-        let journal = "\
-1100.000000 host systemd-logind[80]: New session 5 of user alex.
-1180.000000 host systemd-logind[80]: Removed session 5.
-";
-        assert!(!journal_has_qualifying_session(
-            journal, 1000, 2000, 3000, 300
-        ));
+    fn boot_time_session_from_a_skewed_clock_does_not_count() {
+        // spitfire booted at (remote-clock) @1788775478 and its clock is slow, so
+        // a session logind opens at boot lands "before" the boot in the journal.
+        // With the window derived from the remote's own clock, boot_start is
+        // @1788775478 and window_end is 600s earlier, so the session is NearBoot.
+        let boot_start = 1788775478;
+        let (window_start, window_end) = remote_activity_window(boot_start);
+        let session = LogindSession {
+            boot_id: "b0".to_string(),
+            id: "18".to_string(),
+            user: "jallen".to_string(),
+            start: boot_start + 1,
+            end: None,
+        };
+        let empty = HashSet::new();
+        let filter = SessionFilter {
+            window_start,
+            window_end,
+            boot_start,
+            minimum_session_seconds: 300,
+            timevault_keys: &empty,
+            interactive_keys: &empty,
+            ignored_users: &[],
+            require_interactive: true,
+        };
+        assert_eq!(
+            classify_session(&session, &filter).0,
+            SessionVerdict::NearBoot
+        );
+        assert!(!any_session_counts(std::slice::from_ref(&session), &filter));
     }
 
     #[test]
-    fn session_started_before_window_does_not_qualify() {
-        let journal = "\
-500.000000 host systemd-logind[80]: New session 5 of user alex.
-2500.000000 host systemd-logind[80]: Removed session 5.
-";
-        assert!(!journal_has_qualifying_session(
-            journal, 1000, 2000, 3000, 300
-        ));
+    fn parses_ssh_connection_client_takes_first_field() {
+        assert_eq!(
+            parse_ssh_connection_client("10.0.0.5 51234 10.0.0.9 22\n").as_deref(),
+            Some("10.0.0.5")
+        );
+        assert_eq!(
+            parse_ssh_connection_client("2001:db8::5 40100 2001:db8::9 22").as_deref(),
+            Some("2001:db8::5")
+        );
+        assert_eq!(parse_ssh_connection_client("   "), None);
     }
 
     #[test]
-    fn unclosed_session_is_measured_to_boot_start() {
-        // New session with no Removed line: it ran until the reboot at 3000.
-        let journal = "1200.000000 host systemd-logind[80]: New session 7 of user alex.\n";
-        assert!(journal_has_qualifying_session(
-            journal, 1000, 2000, 3000, 300
-        ));
-        // ...but not long enough if the reboot came quickly.
-        assert!(!journal_has_qualifying_session(
-            journal, 1000, 2000, 1300, 300
-        ));
+    fn ssh_user_of_extracts_login_name() {
+        assert_eq!(ssh_user_of("root@spitfire"), Some("root"));
+        assert_eq!(ssh_user_of("backup@host.example.com"), Some("backup"));
+        assert_eq!(ssh_user_of("spitfire"), None);
+        assert_eq!(ssh_user_of("ssh-alias"), None);
+        assert_eq!(ssh_user_of("@host"), None);
     }
 
     #[test]
-    fn empty_journal_has_no_qualifying_session() {
-        assert!(!journal_has_qualifying_session("", 1000, 2000, 3000, 300));
+    fn a_person_from_the_timevault_host_still_counts() {
+        // Timevault connects as root@10.0.0.1; an admin on that same box SSHes to
+        // the source as themselves and works for an hour -> that is real use.
+        let journal = [
+            logind_line(true, "b", "2", "root", 1100), // Timevault's rsync
+            logind_line(false, "b", "2", "root", 4800),
+            logind_line(true, "b", "5", "jallen", 1500), // admin, from 10.0.0.1
+            logind_line(false, "b", "5", "jallen", 4800),
+        ]
+        .join("\n");
+        let sshd = [
+            sshd_line("b", "root", "10.0.0.1", 1099),
+            sshd_line("b", "jallen", "10.0.0.1", 1501),
+        ]
+        .join("\n");
+        let sessions = parse_logind_sessions(&journal);
+        let logins = parse_ssh_logins(&sshd);
+        let origin = "10.0.0.1";
+        let tv_user = Some("root");
+        let is_tv = |l: &SshLogin| l.client == origin && tv_user.is_none_or(|u| l.user == u);
+        let tv = correlated_session_keys(&sessions, &logins, is_tv);
+        let interactive = correlated_session_keys(&sessions, &logins, |l| !is_tv(l));
+        let filter = test_filter(&tv, &interactive, &[], true);
+        assert_eq!(
+            classify_session(sessions.iter().find(|s| s.id == "2").unwrap(), &filter).0,
+            SessionVerdict::TimevaultBackup
+        );
+        assert_eq!(
+            classify_session(sessions.iter().find(|s| s.id == "5").unwrap(), &filter).0,
+            SessionVerdict::Counted
+        );
+    }
+
+    #[test]
+    fn parses_logind_sessions_from_json_with_boot_user_and_open_end() {
+        let journal = [
+            logind_line(true, "bootA", "5", "alex", 1100),
+            logind_line(false, "bootA", "5", "alex", 1180),
+            logind_line(true, "bootA", "6", "root", 1300),
+        ]
+        .join("\n");
+        assert_eq!(
+            parse_logind_sessions(&journal),
+            vec![
+                LogindSession {
+                    boot_id: "bootA".to_string(),
+                    id: "5".to_string(),
+                    user: "alex".to_string(),
+                    start: 1100,
+                    end: Some(1180),
+                },
+                LogindSession {
+                    boot_id: "bootA".to_string(),
+                    id: "6".to_string(),
+                    user: "root".to_string(),
+                    start: 1300,
+                    end: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn reused_session_ids_across_boots_are_not_merged() {
+        // The spitfire bug: `New session 18` on one boot, `Removed session 18` on
+        // the next. Keyed by (boot, id) they stay two ~1s sessions, not one 5704s.
+        let journal = [
+            logind_line(true, "bootA", "18", "jallen", 1788775478),
+            logind_line(false, "bootA", "18", "jallen", 1788775479),
+            logind_line(true, "bootB", "18", "jallen", 1788781182),
+            logind_line(false, "bootB", "18", "jallen", 1788781182),
+        ]
+        .join("\n");
+        let sessions = parse_logind_sessions(&journal);
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].end, Some(1788775479));
+        assert_eq!(sessions[0].start, 1788775478);
+        assert_eq!(sessions[1].boot_id, "bootB");
+        assert!(sessions.iter().all(|s| s.end.unwrap() - s.start <= 1));
+    }
+
+    #[test]
+    fn parses_ssh_logins_from_json() {
+        let journal = [
+            sshd_line("bootA", "root", "10.0.0.5", 1200),
+            r#"{"_BOOT_ID":"bootA","__REALTIME_TIMESTAMP":"1500000000","MESSAGE":"Connection from 10.0.0.5 port 46620"}"#.to_string(),
+        ]
+        .join("\n");
+        assert_eq!(
+            parse_ssh_logins(&journal),
+            vec![SshLogin {
+                boot_id: "bootA".to_string(),
+                timestamp: 1200,
+                user: "root".to_string(),
+                client: "10.0.0.5".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn correlation_needs_same_boot_user_and_time() {
+        let sessions = vec![
+            LogindSession {
+                boot_id: "bootA".to_string(),
+                id: "2".to_string(),
+                user: "root".to_string(),
+                start: 1201,
+                end: Some(4000),
+            },
+            // same id/user/time but a different boot -> must not correlate.
+            LogindSession {
+                boot_id: "bootB".to_string(),
+                id: "2".to_string(),
+                user: "root".to_string(),
+                start: 1201,
+                end: Some(4000),
+            },
+        ];
+        let logins = vec![sshd_line_login("bootA", "root", "10.0.0.5", 1200)];
+        let matched = correlated_session_keys(&sessions, &logins, |l| l.client == "10.0.0.5");
+        assert!(matched.contains(&session_key("bootA", "2")));
+        assert!(!matched.contains(&session_key("bootB", "2")));
+    }
+
+    fn sshd_line_login(boot: &str, user: &str, client: &str, secs: i64) -> SshLogin {
+        parse_ssh_logins(&sshd_line(boot, user, client, secs))
+            .pop()
+            .expect("one login")
+    }
+
+    #[test]
+    fn only_a_non_timevault_ssh_login_makes_a_session_count() {
+        // Three ~1h sessions in the window, all long enough on duration alone.
+        let journal = [
+            logind_line(true, "b", "2", "jallen", 1100), // Timevault's rsync
+            logind_line(false, "b", "2", "jallen", 4800),
+            logind_line(true, "b", "3", "jallen", 1500), // a person over SSH
+            logind_line(false, "b", "3", "jallen", 4800),
+            logind_line(true, "b", "4", "root", 1700), // a cron @reboot job
+            logind_line(false, "b", "4", "root", 4800),
+        ]
+        .join("\n");
+        let sshd = [
+            sshd_line("b", "jallen", "10.0.0.9", 1099), // Timevault's address
+            sshd_line("b", "jallen", "192.0.2.50", 1501), // a person's laptop
+        ]
+        .join("\n");
+        let sessions = parse_logind_sessions(&journal);
+        let logins = parse_ssh_logins(&sshd);
+        let origin = "10.0.0.9";
+        let tv = correlated_session_keys(&sessions, &logins, |l| l.client == origin);
+        let interactive = correlated_session_keys(&sessions, &logins, |l| l.client != origin);
+        let filter = test_filter(&tv, &interactive, &[], true);
+
+        let verdict =
+            |id: &str| classify_session(sessions.iter().find(|s| s.id == id).unwrap(), &filter).0;
+        assert_eq!(verdict("2"), SessionVerdict::TimevaultBackup);
+        assert_eq!(verdict("3"), SessionVerdict::Counted);
+        assert_eq!(verdict("4"), SessionVerdict::NotInteractive);
+        assert!(any_session_counts(&sessions, &filter));
+    }
+
+    #[test]
+    fn timevault_backup_session_does_not_keep_a_cold_host_in_service() {
+        // Only activity was Timevault's own hour-long rsync as jallen.
+        let journal = [
+            logind_line(true, "b", "2", "jallen", 1200),
+            logind_line(false, "b", "2", "jallen", 4800),
+        ]
+        .join("\n");
+        let sshd = sshd_line("b", "jallen", "10.0.0.9", 1199);
+        let sessions = parse_logind_sessions(&journal);
+        let logins = parse_ssh_logins(&sshd);
+        let tv = correlated_session_keys(&sessions, &logins, |l| l.client == "10.0.0.9");
+        let interactive = correlated_session_keys(&sessions, &logins, |l| l.client != "10.0.0.9");
+        assert!(tv.contains(&session_key("b", "2")));
+        let filter = test_filter(&tv, &interactive, &[], true);
+        assert_eq!(
+            classify_session(&sessions[0], &filter).0,
+            SessionVerdict::TimevaultBackup
+        );
+        assert!(!any_session_counts(&sessions, &filter));
+    }
+
+    #[test]
+    fn display_manager_greeter_does_not_count_as_use() {
+        let journal = logind_line(true, "b", "c1", "Debian-gdm", 1100);
+        let sessions = parse_logind_sessions(&journal);
+        let empty = HashSet::new();
+        let defaults: Vec<String> = DEFAULT_IGNORED_SESSION_USERS
+            .iter()
+            .map(|user| user.to_string())
+            .collect();
+        // Ignored by name...
+        assert_eq!(
+            classify_session(&sessions[0], &test_filter(&empty, &empty, &defaults, true)).0,
+            SessionVerdict::IgnoredUser
+        );
+        // ...and even off the list it has no SSH login, so it still cannot count.
+        assert_eq!(
+            classify_session(&sessions[0], &test_filter(&empty, &empty, &[], true)).0,
+            SessionVerdict::NotInteractive
+        );
+    }
+
+    #[test]
+    fn falls_back_to_session_length_when_origin_unknown() {
+        // $SSH_CONNECTION unreadable -> require_interactive = false, so a long
+        // in-window session counts on duration alone (old behaviour).
+        let journal = [
+            logind_line(true, "b", "7", "alex", 1200),
+            logind_line(false, "b", "7", "alex", 1900),
+        ]
+        .join("\n");
+        let sessions = parse_logind_sessions(&journal);
+        let empty = HashSet::new();
+        assert!(any_session_counts(
+            &sessions,
+            &test_filter(&empty, &empty, &[], false)
+        ));
+        // still respects the minimum
+        let short = [
+            logind_line(true, "b", "8", "alex", 1200),
+            logind_line(false, "b", "8", "alex", 1300),
+        ]
+        .join("\n");
+        assert!(!any_session_counts(
+            &parse_logind_sessions(&short),
+            &test_filter(&empty, &empty, &[], false)
+        ));
     }
 
     #[test]
@@ -2613,6 +3477,7 @@ mod tests {
             BackupOptions {
                 exclude_pristine: false,
                 exclude_pristine_only: false,
+                session_seconds_override: None,
             },
         )
         .expect("backup report");
@@ -2703,6 +3568,7 @@ mod tests {
             BackupOptions {
                 exclude_pristine: true,
                 exclude_pristine_only: false,
+                session_seconds_override: None,
             },
             false,
             true,

@@ -29,6 +29,10 @@ pub struct Cli {
     pub exclude_pristine: bool,
     #[arg(long, global = true)]
     pub exclude_pristine_only: bool,
+    /// Override remote.minimumSessionSeconds for the cold-boot check this run
+    /// (testing aid).
+    #[arg(long, global = true, value_name = "SECONDS")]
+    pub min_session_seconds: Option<u64>,
 
     #[arg(long, global = true)]
     pub disk_id: Option<String>,
@@ -224,6 +228,14 @@ mod tests {
         let cli = Cli::parse_from(["timevault", "--job", "all"]);
         assert!(cli.command.is_none());
         assert_eq!(cli.job, vec!["all"]);
+    }
+
+    #[test]
+    fn parses_min_session_seconds_override() {
+        let cli = Cli::parse_from(["timevault", "--min-session-seconds", "30"]);
+        assert_eq!(cli.min_session_seconds, Some(30));
+        let cli = Cli::parse_from(["timevault"]);
+        assert_eq!(cli.min_session_seconds, None);
     }
 
     #[test]

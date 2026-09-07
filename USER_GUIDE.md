@@ -78,7 +78,8 @@ Remote power options are available for SSH-style sources:
 - `remote.broadcast`, `remote.port`, `remote.interface`, `remote.keepaliveSeconds`: Optional WOL delivery and keepalive settings; used only when `remote.wol` is `true`.
 - `remote.probeTimeoutSeconds`: Total readiness budget for ping followed by an SSH `echo` probe. Default: `180`.
 - `remote.minimumUptimeSeconds`: Uptime below this value after WOL is treated as a cold boot. Default: `600`. For a cold boot, Timevault checks recent persistent `systemd-logind` interactive-session records before deciding whether a backup is needed.
-- `remote.minimumSessionSeconds`: Shortest `systemd-logind` session, in seconds, that counts as real use when deciding whether a cold boot should back up. Default: `300`. A session that starts in the prior daily window and stays open at least this long qualifies; a session still open at reboot is measured up to that boot. Briefly logging in to power the host off therefore does not keep it in service.
+- `remote.minimumSessionSeconds`: Shortest `systemd-logind` session, in seconds, that counts as real use when deciding whether a cold boot should back up. Default: `300`. To count, a session must (a) belong to the same boot and line up in time with an `Accepted` SSH login by a person — i.e. any login except one from Timevault's own address (`$SSH_CONNECTION`) as the user Timevault connects as (`root`); an admin reaching the host as a different user, even from the Timevault box, still counts — (b) start inside the prior daily window, and (c) stay open at least this long (a session still open at reboot is measured up to that boot). This means greeter, `systemd --user` manager, `@reboot`/cron and Timevault's own rsync/hook/probe sessions never count, and briefly logging in to power the host off does not keep it in service. Sessions are keyed by `(boot id, session id)`, so a session number reused across reboots is not stitched into one long session. If Timevault cannot read `$SSH_CONNECTION`, it falls back to session length alone.
+- `remote.ignoredSessionUsers`: `systemd-logind` session owners that never count as use, chiefly display-manager greeter accounts idling at the login screen. Unset applies a built-in list (`gdm`, `gdm3`, `Debian-gdm`, `sddm`, `lightdm`, `lxdm`, `xdm`, `kdm`, `slim`); an explicit list replaces it entirely, and `[]` disables the filter so any session owner counts.
 - `remote.afterBackup`: Action after a successful backup: `return` (default), `none`, `suspend`, or `shutdown`.
 - Ping- and SSH-readiness failures are always reported as `offline` and skipped. `remote.offlineIfUnreachable: true` also reports other remote-startup failures as `offline`. Default: `false`.
 
@@ -92,7 +93,7 @@ A cold boot with no qualifying prior activity skips the backup and powers the ho
 
 Suspend ownership rule:
 
-For each SSH-style backup job with `remote` options, Timevault probes the backup source host with ping and then SSH. If `remote.wol` is enabled, it sends WOL only when the initial ping fails. Both probes must succeed within `probeTimeoutSeconds` before the backup starts. After WOL, Timevault reads `/proc/uptime`. A low uptime is a cold boot, so it queries the remote persistent system journal for `systemd-logind` `New session`/`Removed session` records from 24 hours before that boot, excluding a 10-minute buffer at both ends. A session that starts in that window and lasts at least `minimumSessionSeconds` (an unclosed session is measured up to the boot) means the host was used during the daily interval and the backup proceeds; no qualifying session means Timevault skips the backup and powers the host off. The remote journal must be persisted across reboots.
+For each SSH-style backup job with `remote` options, Timevault probes the backup source host with ping and then SSH. If `remote.wol` is enabled, it sends WOL only when the initial ping fails. Both probes must succeed within `probeTimeoutSeconds` before the backup starts. Once SSH is up, Timevault reads the host's wall clock and `/proc/uptime` together; if the host's clock differs from the Timevault host's by more than a few seconds it prints a `warning:` line (a drifting backup-source clock skews rsync timestamps and the cold-boot window — usually an NTP problem). A low uptime is a cold boot, so it queries the remote persistent journal (as JSON) for logind's session create/remove events and for sshd `Accepted` logins, from 24 hours before that boot, excluding a 10-minute buffer at both ends. The boot instant and the window are computed from the host's *own* clock (`now − uptime`), so a skewed remote clock no longer drags boot-time sessions into the window. Each session is keyed by `(_BOOT_ID, session id)` — a session number reused across reboots is not stitched together. A session counts as "a person used the host" only if it starts in the window, lasts at least `minimumSessionSeconds` (an unclosed session is measured up to the boot), and lines up in time with an `Accepted` SSH login **from an address other than Timevault's own** ($SSH_CONNECTION). That excludes greeter, `systemd --user` manager, cron/`@reboot`, and Timevault's own rsync/hook/probe sessions. If any session qualifies the backup proceeds; otherwise Timevault skips it and powers the host off. Sessions owned by a display-manager greeter account (see `remote.ignoredSessionUsers`) are dropped up front. If Timevault cannot read `$SSH_CONNECTION`, it falls back to session length alone. The check needs the remote journal persisted across reboots (`Storage=persistent`, or a `/var/log/journal` directory) and retaining `sshd` records; if the journal holds no record at all for the prior-day window, Timevault prints a `warning:` and backs the host up without the cold-boot check rather than powering it off. (SSH-style remote jobs already require `root@` for rsync, and root can always read the journal.)
 Cascade jobs copied from a remote job ignore wake and suspend handling after their source is rewritten to the primary disk's local snapshot path.
 
 It runs on the backup source host:
@@ -204,6 +205,7 @@ jobs:
       probeTimeoutSeconds: 180
       minimumUptimeSeconds: 600
       minimumSessionSeconds: 300
+      ignoredSessionUsers: ["gdm", "sddm"]
       afterBackup: return
     excludes: []
 ```
@@ -218,6 +220,7 @@ Global options:
 - `--print-order`: Print resolved job order and exit.
 - `--exclude-pristine`: Exclude pristine package-managed files.
 - `--exclude-pristine-only`: Generate pristine excludes and exit (no backup).
+- `--min-session-seconds <n>`: Override `remote.minimumSessionSeconds` for every job this run, for the cold-boot session check. A testing aid — e.g. `--min-session-seconds 30` to make a short login count while validating wake behaviour.
 - `--rsync <args...>`: Pass remaining args to rsync.
 - `--disk-id <id>`: Select a specific enrolled disk by disk id.
 - `--cascade`: Run backups across all connected disks.

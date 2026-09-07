@@ -53,6 +53,7 @@ pub fn run() -> Result<()> {
     let options = BackupOptions {
         exclude_pristine: cli.exclude_pristine || cli.exclude_pristine_only,
         exclude_pristine_only: cli.exclude_pristine_only,
+        session_seconds_override: cli.min_session_seconds,
     };
 
     let command = cli.command.clone().unwrap_or(Command::Backup);
@@ -264,6 +265,9 @@ fn print_help() {
     println!("  --exclude-pristine     Exclude pristine package-managed files");
     println!("  --exclude-pristine-only  Generate pristine excludes and exit");
     println!("  --print-order          Print resolved job order and exit");
+    println!(
+        "  --min-session-seconds <n>  Override remote.minimumSessionSeconds for the cold-boot check (testing)"
+    );
     println!("  --rsync <args...>      Pass remaining args to rsync");
     println!("  --disk-id <id>         Select enrolled backup disk by id");
     println!("  --cascade              Run backup across all connected disks");

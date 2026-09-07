@@ -47,6 +47,7 @@ pub fn run_backup_command(
     let options = BackupOptions {
         exclude_pristine: options.exclude_pristine || cfg.options.exclude_pristine.unwrap_or(false),
         exclude_pristine_only: options.exclude_pristine_only,
+        session_seconds_override: options.session_seconds_override,
     };
     let report_options = cfg.options.report.clone();
 

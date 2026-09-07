@@ -290,6 +290,7 @@ jobs:
       probeTimeoutSeconds: 120
       minimumUptimeSeconds: 600
       minimumSessionSeconds: 120
+      ignoredSessionUsers: ["gdm", "kiosk"]
       afterBackup: return
       offlineIfUnreachable: true
 "#;
@@ -306,6 +307,10 @@ jobs:
         assert_eq!(remote.probe_timeout_seconds, Some(120));
         assert_eq!(remote.minimum_uptime_seconds, Some(600));
         assert_eq!(remote.minimum_session_seconds, Some(120));
+        assert_eq!(
+            remote.ignored_session_users.as_deref(),
+            Some(&["gdm".to_string(), "kiosk".to_string()][..])
+        );
         assert_eq!(
             remote.after_backup,
             Some(crate::config::model::RemoteAfterBackup::Return)
