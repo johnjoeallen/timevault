@@ -335,7 +335,7 @@ fn run_backup_job(
     if !run_mode.dry_run {
         fs::create_dir_all(&tmp_dir)?;
     }
-    let excludes_file = tmp_dir.join("timevault.excludes");
+    let excludes_file = job_excludes_path(&tmp_dir, &job.name);
     let excludes = build_exclude_list(job, pristine_excludes)?;
     if run_mode.dry_run {
         println!(
@@ -709,7 +709,7 @@ pub fn run_pristine_only(jobs: Vec<Job>, run_mode: RunMode, options: BackupOptio
         if !run_mode.dry_run {
             fs::create_dir_all(&tmp_dir)?;
         }
-        let excludes_file = tmp_dir.join("timevault.excludes");
+        let excludes_file = job_excludes_path(&tmp_dir, &job.name);
         let excludes = build_exclude_list(&job, &pristine_excludes)?;
         if run_mode.dry_run {
             println!(
@@ -2691,6 +2691,13 @@ fn hard_link_if_missing(source: &Path, target: &Path) -> io::Result<()> {
     }
 }
 
+/// Per-job rsync excludes file. Distinct per job so parallel `timevault` runs for
+/// different jobs never clobber each other's list (the per-job lock keeps a
+/// single writer per job). Job names are `is_safe_name`-restricted, so safe here.
+fn job_excludes_path(tmp_dir: &Path, job_name: &str) -> PathBuf {
+    tmp_dir.join(format!("timevault.{}.excludes", job_name))
+}
+
 fn resolve_job_dest(job: &Job, disk_mount: &Path) -> Result<PathBuf> {
     if !crate::util::paths::is_safe_name(&job.name) {
         return Err(TimevaultError::message(format!(
@@ -3710,6 +3717,16 @@ mod tests {
         assert_eq!(current_before.dev(), current_after.dev());
         assert_eq!(current_before.ino(), current_after.ino());
         assert!(!same_inode(&previous_file, &current_file));
+    }
+
+    #[test]
+    fn job_excludes_path_is_per_job() {
+        let tmp = Path::new("/root/tmp");
+        assert_eq!(
+            job_excludes_path(tmp, "spitfire-primary"),
+            tmp.join("timevault.spitfire-primary.excludes")
+        );
+        assert_ne!(job_excludes_path(tmp, "a"), job_excludes_path(tmp, "b"));
     }
 
     #[test]

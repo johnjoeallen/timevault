@@ -10,8 +10,8 @@ use crate::config::model::BackupDiskConfig;
 use crate::disk::fs_type::detect_fs_type;
 use crate::disk::identity::{identity_path, read_identity, verify_identity};
 use crate::disk::{
-    connected_disks_in_order, device_path_for_uuid, mount_disk_guarded, mount_options_for_backup,
-    select_first_connected,
+    connected_disks_in_order, device_path_for_uuid, mount_disk_for_backup,
+    mount_options_for_backup, select_first_connected, sweep_stale_run_mounts,
 };
 use crate::error::{DiskError, Result, TimevaultError};
 use crate::mount::guard::MountGuard;
@@ -50,6 +50,10 @@ pub fn run_backup_command(
         session_seconds_override: options.session_seconds_override,
     };
     let report_options = cfg.options.report.clone();
+
+    if !run_mode.dry_run {
+        sweep_stale_run_mounts(&mount_base);
+    }
 
     if backup_disks.is_empty() && !options.exclude_pristine_only {
         return Err(TimevaultError::message(
@@ -504,7 +508,7 @@ fn mount_and_verify(
     let (disk_guard, mountpoint) = if run_mode.dry_run {
         (None, mount_base.join(&disk.fs_uuid))
     } else {
-        match mount_disk_guarded(disk, mount_base, &options) {
+        match mount_disk_for_backup(disk, mount_base, &options) {
             Ok(result) => (Some(result.0), result.1),
             Err(TimevaultError::Disk(err)) => exit_for_disk_error(&err),
             Err(err) => return Err(err),

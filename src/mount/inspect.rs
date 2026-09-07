@@ -50,6 +50,27 @@ pub fn find_device_mountpoint(device: &Path) -> Result<Option<PathBuf>> {
     Ok(None)
 }
 
+pub fn find_all_device_mountpoints(device: &Path) -> Result<Vec<PathBuf>> {
+    let contents = read_mounts()?;
+    let device_real = device
+        .canonicalize()
+        .map_err(|e| TimevaultError::message(format!("resolve {}: {}", device.display(), e)))?;
+    let mut mountpoints = Vec::new();
+    for line in contents.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 2 {
+            continue;
+        }
+        let mounted_real = Path::new(fields[0])
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(fields[0]));
+        if mounted_real == device_real {
+            mountpoints.push(PathBuf::from(fields[1]));
+        }
+    }
+    Ok(mountpoints)
+}
+
 pub fn mountpoint_is_mounted(mountpoint: &Path) -> Result<bool> {
     let contents = read_mounts()?;
     for line in contents.lines() {

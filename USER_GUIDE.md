@@ -15,7 +15,7 @@ Timevault is built around a few principles:
 Timevault reads a YAML config file (default `/etc/timevault.yaml`).
 
 ### Top-level options
-- `mountBase`: Where Timevault mounts backup disks for backups. Default: `/run/timevault/mounts`.
+- `mountBase`: Where Timevault mounts backup disks for backups. Default: `/run/timevault/mounts`. Each run mounts each disk at its own transient sub-directory (`<fsUuid>.<pid>.<timestamp>`), so two `timevault` processes can back up different jobs to the same disk at once; these are unmounted and removed when the run ends, and a stale one left by a hard kill is swept on the next run.
 - `userMountBase`: Where Timevault mounts disks for user inspection. Default: `/run/timevault/user-mounts`.
 - `backupDisks`: List of enrolled backup disks (required for backups).
 - `excludes`: Global exclude paths applied to all jobs.
@@ -414,3 +414,4 @@ Remote power options require `systemctl` over SSH on the remote host for suspend
 - Backup disks must contain `/.timevault` and match the configured `diskId` and `fsUuid`.
 - Snapshot structure is `<mount>/<job>/<YYYYMMDD>` with a `current` symlink.
 - `--safe` and `--dry-run` are recommended when validating new configurations.
+- Two `timevault` processes may run different jobs concurrently, even against the same disk (each gets its own mount point and excludes file). A second run of the *same* job is refused with `job <name> is already running` (per-job lock at `/var/run/timevault.<job>.pid`, stale-pid aware).
