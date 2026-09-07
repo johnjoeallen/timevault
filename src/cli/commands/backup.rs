@@ -2,7 +2,7 @@ use std::process::Command;
 
 use chrono::Local;
 
-use crate::backup::report::{email_html_report, render_html, BackupRunReport};
+use crate::backup::report::{email_html_report, render_html, BackupJobStatus, BackupRunReport};
 use crate::backup::{print_job_details, run_backup, run_pristine_only, BackupOptions};
 use crate::cli::commands::exit_for_disk_error;
 use crate::config::load::load_config;
@@ -299,6 +299,21 @@ fn run_jobs_for_primary(
     }
 
     if cascade {
+        // A job only cascades if its backup to the primary disk produced a
+        // snapshot this run: no point (and it would be stale) to copy the
+        // primary's `current` for a job the primary skipped or failed. Snapshot
+        // the statuses now — `reports` is borrowed mutably again below.
+        let primary_statuses: HashMap<String, BackupJobStatus> = reports
+            .last()
+            .map(|report| {
+                report
+                    .jobs
+                    .iter()
+                    .map(|job| (job.name.clone(), job.status))
+                    .collect()
+            })
+            .unwrap_or_default();
+
         let mut cascades: HashMap<String, Vec<crate::config::model::Job>> = HashMap::new();
         for job in &jobs {
             let allowed = allowed_disks_for_job(job, connected);
@@ -320,6 +335,18 @@ fn run_jobs_for_primary(
             let (guard, mountpoint) = mount_and_verify(disk, mount_base, run_mode)?;
             let mut cascaded_jobs = Vec::new();
             for job in job_list {
+                match primary_statuses.get(&job.name).copied() {
+                    Some(status) if status.produced_snapshot() => {}
+                    other => {
+                        println!(
+                            "cascade skipped for job {} on disk {}: primary backup {}",
+                            job.name,
+                            disk.disk_id,
+                            other.map_or("did not run", BackupJobStatus::as_str)
+                        );
+                        continue;
+                    }
+                }
                 let mut job_override = job.clone();
                 let source = primary_current_base.join(&job.name).join("current");
                 if !run_mode.dry_run && !source.exists() {
@@ -328,8 +355,9 @@ fn run_jobs_for_primary(
                     return Ok(Some((
                         1,
                         format!(
-                            "missing cascade source {}; primary disk did not produce current snapshot",
-                            source.display()
+                            "cascade source {} missing though the primary backup for job {} succeeded",
+                            source.display(),
+                            job.name
                         ),
                     )));
                 }

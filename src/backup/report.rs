@@ -38,7 +38,7 @@ pub enum BackupJobStatus {
 }
 
 impl BackupJobStatus {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             BackupJobStatus::Success => "success",
             BackupJobStatus::Partial => "partial",
@@ -46,6 +46,12 @@ impl BackupJobStatus {
             BackupJobStatus::Offline => "offline",
             BackupJobStatus::Skipped => "skipped",
         }
+    }
+
+    /// Whether this run left a usable `current` snapshot on the disk — the
+    /// precondition for cascading the job to other disks.
+    pub fn produced_snapshot(self) -> bool {
+        matches!(self, BackupJobStatus::Success | BackupJobStatus::Partial)
     }
 }
 
@@ -454,6 +460,15 @@ fn quoted_printable_chunk(byte: u8) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_successful_statuses_produce_a_cascade_snapshot() {
+        assert!(BackupJobStatus::Success.produced_snapshot());
+        assert!(BackupJobStatus::Partial.produced_snapshot());
+        assert!(!BackupJobStatus::Failed.produced_snapshot());
+        assert!(!BackupJobStatus::Offline.produced_snapshot());
+        assert!(!BackupJobStatus::Skipped.produced_snapshot());
+    }
 
     #[test]
     fn email_message_uses_timevault_display_name_and_html_body() {

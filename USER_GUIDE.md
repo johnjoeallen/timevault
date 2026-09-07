@@ -241,7 +241,7 @@ By default Timevault uses `/usr/sbin/sendmail -t`; set `options.report.sendmail`
 - `timevault backup` with no `--job` is the same as `timevault backup --job all`.
 - Running Timevault with no command and no `--job` displays help, the same as `--help`.
 - Uses the first connected disk unless `--disk-id` is set to a disk id or filesystem UUID.
-- With `--cascade`, uses the primary disk’s `current` as the source for other disks.
+- With `--cascade`, uses the primary disk’s `current` as the source for other disks. A job is cascaded only if its backup to the primary disk produced a snapshot this run; if the primary backup was skipped, failed, or offline, that job's cascade is skipped (with a note) rather than copying a stale snapshot.
 
 ### Wake test
 - `timevault wake <job>`
