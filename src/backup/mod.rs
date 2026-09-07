@@ -1714,6 +1714,10 @@ fn remote_journal_has_qualifying_session(
         require_interactive: origin_client.is_some(),
     };
 
+    let qualifies = any_session_counts(&sessions, &filter);
+
+    // The skip case is explained at the call site; the per-session breakdown is
+    // only for `--verbose`.
     if run_mode.verbose {
         println!(
             "  cold-boot session check: prior-window @{}..@{} (boot @{}), minimum {}s",
@@ -1739,49 +1743,33 @@ fn remote_journal_has_qualifying_session(
                 ignored_users.join(", ")
             );
         }
-    }
-
-    // The per-session verdicts are always shown: this is what decides whether a
-    // WoL'd host gets backed up or powered straight off, and it runs at most once
-    // a day per host.
-    if sessions.is_empty() {
-        println!(
-            "  cold-boot check on {}: no logind sessions in the prior-day window",
-            ssh_host
-        );
-    } else {
-        println!(
-            "  cold-boot check on {}: {} logind session(s) in the prior-day window (need one \u{2265} {}s tied to a non-Timevault SSH login):",
-            ssh_host,
-            sessions.len(),
-            minimum_session_seconds
-        );
-    }
-    for session in &sessions {
-        let (verdict, duration) = classify_session(session, &filter);
-        println!(
-            "    session {} (boot {}) user {} for {} -> {}",
-            session.id,
-            short_boot_id(&session.boot_id),
-            if session.user.is_empty() {
-                "?"
-            } else {
-                session.user.as_str()
-            },
-            format_session_duration(duration),
-            verdict.as_str(),
-        );
-    }
-
-    let qualifies = any_session_counts(&sessions, &filter);
-    println!(
-        "  -> {}",
-        if qualifies {
-            "a person used the host in the prior day; backup proceeds"
-        } else {
-            "no qualifying session; skipping backup and powering the host off"
+        if sessions.is_empty() {
+            println!("    no logind sessions recorded in the window");
         }
-    );
+        for session in &sessions {
+            let (verdict, duration) = classify_session(session, &filter);
+            println!(
+                "    session {} (boot {}) user {} for {} -> {}",
+                session.id,
+                short_boot_id(&session.boot_id),
+                if session.user.is_empty() {
+                    "?"
+                } else {
+                    session.user.as_str()
+                },
+                format_session_duration(duration),
+                verdict.as_str(),
+            );
+        }
+        println!(
+            "    -> {}",
+            if qualifies {
+                "a person used the host in the prior day; backup proceeds"
+            } else {
+                "no qualifying session; skipping backup and powering the host off"
+            }
+        );
+    }
 
     Ok(qualifies)
 }
