@@ -26,6 +26,7 @@ pub struct BackupJobReport {
     pub attempts: usize,
     pub rsync_code: Option<i32>,
     pub failure_reason: Option<String>,
+    pub power: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,12 +92,12 @@ pub fn render_markdown(reports: &[BackupRunReport]) -> String {
             report.finished_at.format("%Y-%m-%d %H:%M:%S %Z")
         ));
         body.push_str(
-            "| Job | Name | Status | Reason | Rsync | Attempts | Snapshot | Source | Destination |\n",
+            "| Job | Name | Status | Reason | Rsync | Attempts | Snapshot | Source | Destination | Power |\n",
         );
-        body.push_str("| --- | --- | --- | --- | ---: | ---: | --- | --- | --- |\n");
+        body.push_str("| --- | --- | --- | --- | ---: | ---: | --- | --- | --- | --- |\n");
         for job in &report.jobs {
             body.push_str(&format!(
-                "| {} | {} | {} | {} | {} | {} | {} | `{}` | `{}` |\n",
+                "| {} | {} | {} | {} | {} | {} | {} | `{}` | `{}` | {} |\n",
                 escape_markdown(job_display_name(job)),
                 escape_markdown(&job.name),
                 job.status.as_str(),
@@ -107,7 +108,8 @@ pub fn render_markdown(reports: &[BackupRunReport]) -> String {
                 job.attempts,
                 escape_markdown(&job.backup_day),
                 escape_markdown(&job.source),
-                escape_markdown(&job.destination)
+                escape_markdown(&job.destination),
+                escape_markdown(job.power.as_deref().unwrap_or("-"))
             ));
         }
         body.push('\n');
@@ -200,6 +202,7 @@ pub fn render_html(reports: &[BackupRunReport]) -> String {
             "Snapshot",
             "Source",
             "Destination",
+            "Power",
         ] {
             body.push_str(&format!(
                 "<th align=\"left\" style=\"background:#134e4a; color:#ffffff; border-bottom:1px solid #0f766e; font-size:12px; text-transform:uppercase; letter-spacing:.04em;\">{}</th>",
@@ -223,6 +226,7 @@ pub fn render_html(reports: &[BackupRunReport]) -> String {
             body.push_str(&table_cell(&job.backup_day));
             body.push_str(&table_cell(&job.source));
             body.push_str(&table_cell(&job.destination));
+            body.push_str(&table_cell(job.power.as_deref().unwrap_or("-")));
             body.push_str("</tr>");
         }
         body.push_str("</tbody></table>");
@@ -523,6 +527,7 @@ mod tests {
                 attempts: 1,
                 rsync_code: Some(0),
                 failure_reason: None,
+                power: Some("Found powered off <by WOL>; leaving: power off requested".to_string()),
             }],
         }]);
 
@@ -531,6 +536,8 @@ mod tests {
         assert!(html.contains("Main filesystem"));
         assert!(html.contains(">Job</th>"));
         assert!(html.contains(">Name</th>"));
+        assert!(html.contains(">Power</th>"));
+        assert!(html.contains("Found powered off &lt;by WOL&gt;"));
         assert!(html.contains("background:#0f766e"));
         assert!(html.contains("background:#dcfce7"));
         assert!(html.contains("<table"));
@@ -554,6 +561,7 @@ mod tests {
                 attempts: 3,
                 rsync_code: Some(11),
                 failure_reason: Some("rsync failed: No space left on device".to_string()),
+                power: None,
             }],
         };
 

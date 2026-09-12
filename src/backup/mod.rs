@@ -38,6 +38,7 @@ const SUSPEND_TARGETS: [&str; 4] = [
 const PING_ATTEMPT_TIMEOUT: StdDuration = StdDuration::from_secs(2);
 const DEFAULT_REMOTE_PROBE_TIMEOUT_SECONDS: u64 = 180;
 const DEFAULT_REMOTE_MINIMUM_UPTIME_SECONDS: u64 = 600;
+const REMOTE_SLEEP_RESUME_GRACE_SECONDS: i64 = 15;
 const DEFAULT_REMOTE_MINIMUM_SESSION_SECONDS: u64 = 300;
 const REMOTE_ACTIVITY_WINDOW_SECONDS: i64 = 24 * 60 * 60;
 const REMOTE_ACTIVITY_BUFFER_SECONDS: i64 = 10 * 60;
@@ -218,6 +219,7 @@ fn run_backup_job(
             attempts: 0,
             rsync_code: None,
             failure_reason: None,
+            power: None,
         });
     }
 
@@ -239,14 +241,16 @@ fn run_backup_job(
         Ok(RemotePowerStart::InactiveColdBoot {
             uptime_seconds,
             minimum_session_seconds,
-            _power_guard,
+            power_guard,
         }) => {
             let reason = format!(
-                "host was started by Wake-on-LAN, has only {}s uptime, and had no interactive session lasting at least {}s in the prior daily window",
+                "host was cold-booted by Wake-on-LAN ({}s uptime) and had no interactive session lasting at least {}s in the prior daily window",
                 uptime_seconds, minimum_session_seconds
             );
             crate::pnote!("job {} skipped: {}", job.name, reason);
-            return Ok(skipped_job_report(job, disk_mount, backup_day, reason));
+            let mut report = skipped_job_report(job, disk_mount, backup_day, reason);
+            report.power = power_guard.map(|guard| guard.finish(true));
+            return Ok(report);
         }
         Err(err) if remote_readiness_failed(&err) || remote_offline_if_unreachable(job) => {
             crate::pnote!("job {} offline: {}", job.name, err);
@@ -291,6 +295,7 @@ fn run_backup_job(
                     script_result.exit_code,
                     &script_result.stderr,
                 )),
+                power: remote_power_guard.take().map(|guard| guard.finish(false)),
             });
         }
     }
@@ -322,6 +327,7 @@ fn run_backup_job(
                     script_result.exit_code,
                     &script_result.stderr,
                 )),
+                power: remote_power_guard.take().map(|guard| guard.finish(false)),
             });
         }
     }
@@ -504,11 +510,12 @@ fn run_backup_job(
             ));
         }
     }
-    if status != BackupJobStatus::Failed {
-        if let Some(guard) = remote_power_guard.as_mut() {
-            guard.backup_completed = true;
-        }
-    }
+    // Restore any suspend targets Timevault masked before asking the host to
+    // return to its selected post-backup state.
+    drop(_suspend_guard);
+    let power = remote_power_guard
+        .take()
+        .map(|guard| guard.finish(status != BackupJobStatus::Failed));
     Ok(BackupJobReport {
         name: job.name.clone(),
         description: job.description.clone(),
@@ -519,6 +526,7 @@ fn run_backup_job(
         attempts,
         rsync_code: Some(rc),
         failure_reason,
+        power,
     })
 }
 
@@ -546,6 +554,7 @@ fn failed_job_report(
         attempts: 0,
         rsync_code: None,
         failure_reason: Some(failure_reason),
+        power: None,
     }
 }
 
@@ -565,6 +574,7 @@ fn offline_job_report(
         attempts: 0,
         rsync_code: None,
         failure_reason: Some(reason),
+        power: None,
     }
 }
 
@@ -584,6 +594,7 @@ fn skipped_job_report(
         attempts: 0,
         rsync_code: None,
         failure_reason: Some(reason),
+        power: None,
     }
 }
 
@@ -903,6 +914,19 @@ enum FoundPowerState {
     PoweredOff,
 }
 
+enum SleepResumeHistory {
+    Available(Option<i64>),
+    Unavailable,
+}
+
+fn found_power_state_description(state: FoundPowerState) -> &'static str {
+    match state {
+        FoundPowerState::Running => "running",
+        FoundPowerState::Suspended => "suspended",
+        FoundPowerState::PoweredOff => "powered off",
+    }
+}
+
 /// The concrete action to take once the backup finishes, after resolving
 /// `afterBackup: return` against the host's [`FoundPowerState`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -932,8 +956,11 @@ struct RemotePowerGuard {
     keepalive: Option<WakeKeepalive>,
     action: PowerAction,
     backup_completed: bool,
+    finalized: bool,
     remote_host: String,
     job_name: String,
+    found_state: FoundPowerState,
+    found_by: String,
 }
 
 enum RemotePowerStart {
@@ -941,20 +968,45 @@ enum RemotePowerStart {
     InactiveColdBoot {
         uptime_seconds: u64,
         minimum_session_seconds: u64,
-        _power_guard: Option<RemotePowerGuard>,
+        power_guard: Option<RemotePowerGuard>,
     },
 }
 
 impl Drop for RemotePowerGuard {
     fn drop(&mut self) {
         drop(self.keepalive.take());
-        if !self.backup_completed || self.action == PowerAction::Leave {
+        if self.finalized || !self.backup_completed || self.action == PowerAction::Leave {
             return;
         }
+        let _ = self.run_power_action();
+    }
+}
+
+impl RemotePowerGuard {
+    fn finish(mut self, run_action: bool) -> String {
+        drop(self.keepalive.take());
+        self.backup_completed = run_action;
+        let leaving = if !run_action {
+            "left running because the backup did not complete".to_string()
+        } else if self.action == PowerAction::Leave {
+            "left running".to_string()
+        } else {
+            self.run_power_action()
+        };
+        self.finalized = true;
+        format!(
+            "Found {} ({}); {}",
+            found_power_state_description(self.found_state),
+            self.found_by,
+            leaving
+        )
+    }
+
+    fn run_power_action(&self) -> String {
         let (remote_command, verb) = match self.action {
             PowerAction::PowerOff => ("systemctl poweroff", "power off"),
             PowerAction::Suspend => ("systemctl suspend", "suspend"),
-            PowerAction::Leave => return,
+            PowerAction::Leave => return "left running".to_string(),
         };
         let mut cmd = Command::new("ssh");
         cmd.arg("-o")
@@ -967,21 +1019,34 @@ impl Drop for RemotePowerGuard {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         match cmd.status() {
-            Ok(status) if status.success() => {}
-            Ok(status) => crate::pnote!(
-                "failed to {} remote host {} after job {}: ssh exited with code {}",
-                verb,
-                self.remote_host,
-                self.job_name,
-                status.code().unwrap_or(1)
-            ),
-            Err(err) => crate::pnote!(
-                "failed to {} remote host {} after job {}: {}",
-                verb,
-                self.remote_host,
-                self.job_name,
-                err
-            ),
+            Ok(status) if status.success() => format!("{} requested", verb),
+            Ok(status) => {
+                let reason = format!("ssh exited with code {}", status.code().unwrap_or(1));
+                crate::pnote!(
+                    "failed to {} remote host {} after job {}: {}",
+                    verb,
+                    self.remote_host,
+                    self.job_name,
+                    reason
+                );
+                format!(
+                    "{} request failed; final power state is unknown ({})",
+                    verb, reason
+                )
+            }
+            Err(err) => {
+                crate::pnote!(
+                    "failed to {} remote host {} after job {}: {}",
+                    verb,
+                    self.remote_host,
+                    self.job_name,
+                    err
+                );
+                format!(
+                    "{} request failed; final power state is unknown ({})",
+                    verb, err
+                )
+            }
         }
     }
 }
@@ -1143,14 +1208,19 @@ fn start_remote_power_guard(
     }
     let deadline = Instant::now() + context.probe_timeout;
     crate::pstatus!("{}: reaching {}", job.name, context.host);
-    let was_woken = if ping_once(&context.host, run_mode)? {
+    let initially_reachable = ping_once(&context.host, run_mode)?;
+    let mut wake_sent_at = None;
+    let (was_woken, mut found_by) = if initially_reachable {
         if run_mode.verbose {
             crate::pnote!(
                 "wake host {} already responds to ping; skipping WOL",
                 context.host
             );
         }
-        false
+        (
+            false,
+            "initial ping responded; WOL was not sent".to_string(),
+        )
     } else if context.wol {
         if run_mode.verbose {
             crate::pnote!(
@@ -1160,6 +1230,7 @@ fn start_remote_power_guard(
             );
         }
         crate::pstatus!("{}: sending Wake-on-LAN to {}", job.name, context.host);
+        wake_sent_at = Some(Instant::now());
         send_wake_packets(
             context.mac.as_deref().expect("validated WOL MAC"),
             &context.targets,
@@ -1171,10 +1242,16 @@ fn start_remote_power_guard(
             &context.targets,
             run_mode,
         )?;
-        true
+        (
+            true,
+            "Wake-on-LAN was needed to make the host reachable".to_string(),
+        )
     } else {
         wait_for_ping_until(&context.host, deadline, run_mode)?;
-        false
+        (
+            false,
+            "host became reachable without Wake-on-LAN".to_string(),
+        )
     };
     wait_for_ssh_until(&context.ssh_host, deadline, run_mode)?;
 
@@ -1194,7 +1271,26 @@ fn start_remote_power_guard(
                 context.minimum_uptime_seconds
             );
         }
-        if uptime_seconds < context.minimum_uptime_seconds {
+        let sleep_resume = remote_sleep_resume_timestamp(&context.ssh_host);
+        let (state, detection) = classify_woken_host(
+            sleep_resume,
+            remote_now,
+            uptime_seconds,
+            context.minimum_uptime_seconds,
+            wake_sent_at
+                .expect("was_woken means a WOL packet was sent")
+                .elapsed()
+                .as_secs(),
+        );
+        if run_mode.verbose {
+            crate::pnote!(
+                "  remote {} state detection: {}",
+                context.ssh_host,
+                detection
+            );
+        }
+        found_by = format!("{}; {}", found_by, detection);
+        if state == FoundPowerState::PoweredOff {
             // Everything from here is in the remote's clock frame: `remote_now`
             // and the journal timestamps share it, so a skewed remote clock no
             // longer slides the window or backdates boot-time sessions into it.
@@ -1219,24 +1315,21 @@ fn start_remote_power_guard(
                 return Ok(RemotePowerStart::InactiveColdBoot {
                     uptime_seconds,
                     minimum_session_seconds: context.minimum_session_seconds,
-                    _power_guard: Some(RemotePowerGuard {
+                    power_guard: Some(RemotePowerGuard {
                         keepalive: None,
                         action: PowerAction::PowerOff,
                         backup_completed: true,
+                        finalized: false,
                         remote_host: context.ssh_host,
                         job_name: job.name.clone(),
+                        found_state: FoundPowerState::PoweredOff,
+                        found_by,
                     }),
                 });
             }
             FoundPowerState::PoweredOff
         } else {
-            if run_mode.verbose {
-                crate::pnote!(
-                    "  remote {} uptime is above the cold-boot threshold; treating it as resumed from suspend",
-                    context.ssh_host
-                );
-            }
-            FoundPowerState::Suspended
+            state
         }
     };
 
@@ -1266,8 +1359,11 @@ fn start_remote_power_guard(
         keepalive,
         action: resolve_after_backup(context.after_backup, found_state),
         backup_completed: false,
+        finalized: false,
         remote_host: context.ssh_host,
         job_name: job.name.clone(),
+        found_state,
+        found_by,
     })))
 }
 
@@ -1618,6 +1714,96 @@ fn remote_now_and_uptime(ssh_host: &str, run_mode: RunMode) -> Result<(i64, u64)
             ssh_host
         ))
     })
+}
+
+/// `CLOCK_BOOTTIME` advances during suspend, so uptime alone cannot tell a
+/// resumed machine from one that has been running for a while after a cold boot.
+/// systemd writes a completion record when `systemd-sleep` returns from sleep;
+/// query only the current boot and use the record time to ignore older resumes.
+fn remote_sleep_resume_timestamp(ssh_host: &str) -> SleepResumeHistory {
+    let output = Command::new("ssh")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ConnectTimeout=5")
+        .arg(ssh_host)
+        .arg("journalctl -b -t systemd-sleep --no-pager --output=json")
+        .stdin(Stdio::null())
+        .output();
+    let Ok(output) = output else {
+        return SleepResumeHistory::Unavailable;
+    };
+    if !output.status.success() {
+        return SleepResumeHistory::Unavailable;
+    }
+    SleepResumeHistory::Available(latest_systemd_sleep_resume_timestamp(
+        &String::from_utf8_lossy(&output.stdout),
+    ))
+}
+
+fn latest_systemd_sleep_resume_timestamp(journal: &str) -> Option<i64> {
+    journal
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|entry| {
+            let message = json_str(&entry, "MESSAGE")?;
+            (message.starts_with("System returned from sleep operation '")
+                && message.ends_with("'."))
+            .then(|| journal_realtime_seconds(&entry))
+            .flatten()
+        })
+        .max()
+}
+
+fn classify_woken_host(
+    history: SleepResumeHistory,
+    now: i64,
+    uptime_seconds: u64,
+    minimum_uptime_seconds: u64,
+    wake_elapsed_seconds: u64,
+) -> (FoundPowerState, String) {
+    match history {
+        SleepResumeHistory::Available(Some(resume_at)) => {
+            let age_seconds = now.saturating_sub(resume_at);
+            let maximum_age = wake_elapsed_seconds as i64 + REMOTE_SLEEP_RESUME_GRACE_SECONDS;
+            if (-REMOTE_SLEEP_RESUME_GRACE_SECONDS..=maximum_age).contains(&age_seconds) {
+                (
+                    FoundPowerState::Suspended,
+                    format!(
+                        "systemd recorded a sleep/resume {}s before the host became reachable",
+                        age_seconds.max(0)
+                    ),
+                )
+            } else {
+                (
+                    FoundPowerState::Running,
+                    format!(
+                        "no systemd sleep/resume record was found within {}s of this WOL request; latest record age is {}s",
+                        maximum_age,
+                        age_seconds
+                    ),
+                )
+            }
+        }
+        SleepResumeHistory::Available(None) => (
+            FoundPowerState::PoweredOff,
+            "current-boot systemd journal has no completed sleep/resume record".to_string(),
+        ),
+        SleepResumeHistory::Unavailable if uptime_seconds < minimum_uptime_seconds => (
+            FoundPowerState::PoweredOff,
+            format!(
+                "systemd sleep history unavailable; {}s uptime is below the {}s cold-boot threshold",
+                uptime_seconds, minimum_uptime_seconds
+            ),
+        ),
+        SleepResumeHistory::Unavailable => (
+            FoundPowerState::Suspended,
+            format!(
+                "systemd sleep history unavailable; {}s uptime is at or above the {}s cold-boot threshold",
+                uptime_seconds, minimum_uptime_seconds
+            ),
+        ),
+    }
 }
 
 fn parse_now_and_uptime(output: &str) -> Option<(i64, u64)> {
@@ -3036,6 +3222,53 @@ mod tests {
         );
         assert_eq!(parse_now_and_uptime("1788781182"), None);
         assert_eq!(parse_now_and_uptime("not a number"), None);
+    }
+
+    #[test]
+    fn classifies_wake_using_recent_systemd_resume_before_uptime_fallback() {
+        let (state, _) = classify_woken_host(
+            SleepResumeHistory::Available(Some(1_990)),
+            2_000,
+            5_000,
+            600,
+            180,
+        );
+        assert_eq!(state, FoundPowerState::Suspended);
+
+        let (state, _) =
+            classify_woken_host(SleepResumeHistory::Available(None), 2_000, 5_000, 600, 180);
+        assert_eq!(state, FoundPowerState::PoweredOff);
+
+        let (state, _) = classify_woken_host(
+            SleepResumeHistory::Available(Some(1_500)),
+            2_000,
+            5_000,
+            600,
+            180,
+        );
+        assert_eq!(state, FoundPowerState::Running);
+
+        let (state, _) =
+            classify_woken_host(SleepResumeHistory::Unavailable, 2_000, 5_000, 600, 180);
+        assert_eq!(state, FoundPowerState::Suspended);
+        let (state, _) = classify_woken_host(SleepResumeHistory::Unavailable, 2_000, 500, 600, 180);
+        assert_eq!(state, FoundPowerState::PoweredOff);
+    }
+
+    #[test]
+    fn parses_only_completed_systemd_sleep_records() {
+        let journal = [
+            r#"{"MESSAGE":"Performing sleep operation 'suspend'...","__REALTIME_TIMESTAMP":"1900000000000000"}"#,
+            r#"{"MESSAGE":"Failed to put system to sleep. System resumed again: device error","__REALTIME_TIMESTAMP":"1900000001000000"}"#,
+            r#"{"MESSAGE":"System returned from sleep operation 'suspend'.","__REALTIME_TIMESTAMP":"1900000002000000"}"#,
+            r#"{"MESSAGE":"System returned from sleep operation 'hibernate'.","__REALTIME_TIMESTAMP":"1900000003000000"}"#,
+        ]
+        .join("\n");
+        assert_eq!(
+            latest_systemd_sleep_resume_timestamp(&journal),
+            Some(1_900_000_003)
+        );
+        assert_eq!(latest_systemd_sleep_resume_timestamp(""), None);
     }
 
     #[test]
