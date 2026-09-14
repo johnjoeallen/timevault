@@ -1151,7 +1151,7 @@ fn start_remote_power_guard(
                     .unwrap_or(DEFAULT_REMOTE_MINIMUM_SESSION_SECONDS)
             });
             crate::pnote!(
-                "dry-run: would check uptime after WOL; below {} seconds, it would inspect the remote persistent journal for a session tied to a non-Timevault SSH login and lasting at least {} seconds{} during the prior daily window (greeter, manager, cron and Timevault's own sessions do not count; sessions are keyed by boot id)",
+                "dry-run: would check for a live non-greeter user session after WOL, then check uptime; below {} seconds it would inspect the remote persistent journal for a session tied to a non-Timevault SSH login and lasting at least {} seconds{} during the prior daily window",
                 remote
                     .minimum_uptime_seconds
                     .unwrap_or(DEFAULT_REMOTE_MINIMUM_UPTIME_SECONDS),
@@ -1272,7 +1272,7 @@ fn start_remote_power_guard(
             );
         }
         let sleep_resume = remote_sleep_resume_timestamp(&context.ssh_host);
-        let (state, detection) = classify_woken_host(
+        let (mut state, mut detection) = classify_woken_host(
             sleep_resume,
             remote_now,
             uptime_seconds,
@@ -1282,6 +1282,21 @@ fn start_remote_power_guard(
                 .elapsed()
                 .as_secs(),
         );
+        match remote_active_user_session(
+            &context.ssh_host,
+            &context.ignored_session_users,
+            run_mode,
+        ) {
+            Ok(Some(session)) => {
+                state = FoundPowerState::Running;
+                detection = format!("active user session for {} is present", session);
+            }
+            Ok(None) => {}
+            Err(err) if run_mode.verbose => {
+                crate::pnote!("  active-session check unavailable: {}", err);
+            }
+            Err(_) => {}
+        }
         if run_mode.verbose {
             crate::pnote!(
                 "  remote {} state detection: {}",
@@ -1365,6 +1380,93 @@ fn start_remote_power_guard(
         found_state,
         found_by,
     })))
+}
+
+/// Return the first live logind user session that is not Timevault's own SSH
+/// connection or an ignored greeter account. This is an independent signal of
+/// current use: a host with a logged-in user should be left running even when
+/// its sleep/resume journal record is missing.
+fn remote_active_user_session(
+    ssh_host: &str,
+    ignored_users: &[String],
+    run_mode: RunMode,
+) -> Result<Option<String>> {
+    let remote_command = concat!(
+        "command -v loginctl >/dev/null 2>&1 || exit 1; ",
+        "printf '__TIMEVAULT_CONTEXT__%s\\n' \"${SSH_CONNECTION:-}\"; ",
+        "printf '__TIMEVAULT_USER__%s\\n' \"$(id -un)\"; ",
+        "for id in $(loginctl list-sessions --no-legend --no-pager 2>/dev/null | awk 'NF {print $1}'); do ",
+        "loginctl show-session \"$id\" --no-pager -p Name -p Remote -p RemoteHost -p Service -p Class -p State 2>/dev/null; ",
+        "printf '%s\\n' '__TIMEVAULT_SESSION_END__'; ",
+        "done"
+    );
+    let output = remote_command_output(
+        ssh_host,
+        remote_command,
+        "read active remote user sessions",
+        run_mode,
+    )?;
+    Ok(parse_active_logind_session(&output, ignored_users))
+}
+
+fn parse_active_logind_session(output: &str, ignored_users: &[String]) -> Option<String> {
+    let mut own_connection = None;
+    let mut own_user = None;
+    let mut session = HashMap::<&str, String>::new();
+
+    for line in output.lines() {
+        if let Some(value) = line.strip_prefix("__TIMEVAULT_CONTEXT__") {
+            own_connection = parse_ssh_connection_client(value);
+        } else if let Some(value) = line.strip_prefix("__TIMEVAULT_USER__") {
+            own_user = Some(value.trim().to_string());
+        } else if line == "__TIMEVAULT_SESSION_END__" {
+            if let Some(user) = active_session_user(
+                &session,
+                own_connection.as_deref(),
+                own_user.as_deref(),
+                ignored_users,
+            ) {
+                return Some(user);
+            }
+            session.clear();
+        } else if let Some((key, value)) = line.split_once('=') {
+            session.insert(key, value.to_string());
+        }
+    }
+    active_session_user(
+        &session,
+        own_connection.as_deref(),
+        own_user.as_deref(),
+        ignored_users,
+    )
+}
+
+fn active_session_user(
+    session: &HashMap<&str, String>,
+    own_connection: Option<&str>,
+    own_user: Option<&str>,
+    ignored_users: &[String],
+) -> Option<String> {
+    let user = session.get("Name")?;
+    if ignored_users.iter().any(|ignored| ignored == user) {
+        return None;
+    }
+    if session.get("Class").is_some_and(|class| class != "user") {
+        return None;
+    }
+    if !matches!(
+        session.get("State").map(String::as_str),
+        Some("active" | "online")
+    ) {
+        return None;
+    }
+    let is_own_ssh = session
+        .get("Service")
+        .is_some_and(|service| service == "sshd")
+        && session.get("Remote").is_some_and(|remote| remote == "yes")
+        && session.get("RemoteHost").map(String::as_str) == own_connection
+        && own_user == Some(user.as_str());
+    (!is_own_ssh).then(|| user.clone())
 }
 
 fn remote_context(job: &Job) -> Result<Option<WakeContext>> {
@@ -2064,6 +2166,15 @@ fn remote_sshd_journal(
 }
 
 fn remote_journalctl(
+    ssh_host: &str,
+    remote_command: &str,
+    context: &str,
+    run_mode: RunMode,
+) -> Result<String> {
+    remote_command_output(ssh_host, remote_command, context, run_mode)
+}
+
+fn remote_command_output(
     ssh_host: &str,
     remote_command: &str,
     context: &str,
@@ -3253,6 +3364,50 @@ mod tests {
         assert_eq!(state, FoundPowerState::Suspended);
         let (state, _) = classify_woken_host(SleepResumeHistory::Unavailable, 2_000, 500, 600, 180);
         assert_eq!(state, FoundPowerState::PoweredOff);
+    }
+
+    #[test]
+    fn active_remote_user_session_counts_as_current_use() {
+        let output = concat!(
+            "__TIMEVAULT_CONTEXT__192.0.2.10 40000 192.0.2.20 22\n",
+            "__TIMEVAULT_USER__root\n",
+            "Name=alice\nRemote=yes\nRemoteHost=198.51.100.22\nService=sshd\nClass=user\nState=online\n",
+            "__TIMEVAULT_SESSION_END__\n"
+        );
+        assert_eq!(
+            parse_active_logind_session(output, &[]),
+            Some("alice".to_string())
+        );
+    }
+
+    #[test]
+    fn active_session_check_ignores_timevault_and_greeter_sessions() {
+        let output = concat!(
+            "__TIMEVAULT_CONTEXT__192.0.2.10 40000 192.0.2.20 22\n",
+            "__TIMEVAULT_USER__root\n",
+            "Name=root\nRemote=yes\nRemoteHost=192.0.2.10\nService=sshd\nClass=user\nState=online\n",
+            "__TIMEVAULT_SESSION_END__\n",
+            "Name=Debian-gdm\nRemote=no\nRemoteHost=\nService=gdm\nClass=user\nState=active\n",
+            "__TIMEVAULT_SESSION_END__\n"
+        );
+        assert_eq!(
+            parse_active_logind_session(output, &["Debian-gdm".to_string()]),
+            None
+        );
+    }
+
+    #[test]
+    fn active_session_from_backup_host_as_another_user_counts() {
+        let output = concat!(
+            "__TIMEVAULT_CONTEXT__192.0.2.10 40000 192.0.2.20 22\n",
+            "__TIMEVAULT_USER__root\n",
+            "Name=alice\nRemote=yes\nRemoteHost=192.0.2.10\nService=sshd\nClass=user\nState=online\n",
+            "__TIMEVAULT_SESSION_END__\n"
+        );
+        assert_eq!(
+            parse_active_logind_session(output, &[]),
+            Some("alice".to_string())
+        );
     }
 
     #[test]

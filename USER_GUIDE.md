@@ -89,6 +89,8 @@ Remote power options are available for SSH-style sources:
 - `suspend`: always `systemctl suspend`.
 - `shutdown`: always `systemctl poweroff`.
 
+After WOL, a live non-greeter `systemd-logind` user session counts as current use. Timevault leaves the host running after backup when it finds one, even if the sleep/resume journal record is missing. Timevault's own SSH session is excluded. If the remote session check is unavailable, the normal journal and uptime detection continues.
+
 A cold boot with no qualifying prior activity skips the backup and powers the host off regardless of `afterBackup`.
 
 Suspend ownership rule:
