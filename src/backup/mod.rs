@@ -39,6 +39,7 @@ const PING_ATTEMPT_TIMEOUT: StdDuration = StdDuration::from_secs(2);
 const DEFAULT_REMOTE_PROBE_TIMEOUT_SECONDS: u64 = 180;
 const DEFAULT_REMOTE_MINIMUM_UPTIME_SECONDS: u64 = 600;
 const REMOTE_SLEEP_RESUME_GRACE_SECONDS: i64 = 15;
+const REMOTE_BOOT_TIME_GRACE_SECONDS: i64 = 15;
 const DEFAULT_REMOTE_MINIMUM_SESSION_SECONDS: u64 = 300;
 const REMOTE_ACTIVITY_WINDOW_SECONDS: i64 = 24 * 60 * 60;
 const REMOTE_ACTIVITY_BUFFER_SECONDS: i64 = 10 * 60;
@@ -1210,6 +1211,7 @@ fn start_remote_power_guard(
     crate::pstatus!("{}: reaching {}", job.name, context.host);
     let initially_reachable = ping_once(&context.host, run_mode)?;
     let mut wake_sent_at = None;
+    let mut wake_sent_local_time = None;
     let (was_woken, mut found_by) = if initially_reachable {
         if run_mode.verbose {
             crate::pnote!(
@@ -1231,6 +1233,7 @@ fn start_remote_power_guard(
         }
         crate::pstatus!("{}: sending Wake-on-LAN to {}", job.name, context.host);
         wake_sent_at = Some(Instant::now());
+        wake_sent_local_time = Some(Utc::now().timestamp());
         send_wake_packets(
             context.mac.as_deref().expect("validated WOL MAC"),
             &context.targets,
@@ -1256,7 +1259,8 @@ fn start_remote_power_guard(
     wait_for_ssh_until(&context.ssh_host, deadline, run_mode)?;
 
     let local_now = Utc::now().timestamp();
-    let (remote_now, uptime_seconds) = remote_now_and_uptime(&context.ssh_host, run_mode)?;
+    let (remote_now, uptime_seconds, boot_time) =
+        remote_now_and_uptime(&context.ssh_host, run_mode)?;
     let clock_offset = remote_now - local_now;
     report_clock_drift(&context.ssh_host, clock_offset, run_mode);
 
@@ -1275,12 +1279,14 @@ fn start_remote_power_guard(
         let (mut state, mut detection) = classify_woken_host(
             sleep_resume,
             remote_now,
+            boot_time,
             uptime_seconds,
             context.minimum_uptime_seconds,
             wake_sent_at
                 .expect("was_woken means a WOL packet was sent")
                 .elapsed()
                 .as_secs(),
+            wake_sent_local_time.expect("was_woken means a WOL packet was sent") + clock_offset,
         );
         match remote_active_user_session(
             &context.ssh_host,
@@ -1309,7 +1315,7 @@ fn start_remote_power_guard(
             // Everything from here is in the remote's clock frame: `remote_now`
             // and the journal timestamps share it, so a skewed remote clock no
             // longer slides the window or backdates boot-time sessions into it.
-            let boot_start = remote_now - uptime_seconds as i64;
+            let boot_start = boot_time;
             let (window_start, window_end) = remote_activity_window(boot_start);
             crate::pstatus!("{}: cold-boot check", job.name);
             if run_mode.verbose {
@@ -1784,20 +1790,18 @@ fn wait_for_ssh_until(ssh_host: &str, deadline: Instant, run_mode: RunMode) -> R
     })
 }
 
-/// Read the remote's wall-clock time and its uptime in one round trip. Both come
-/// from the same clock, so `now - uptime` is the boot instant *in the remote's
-/// own time frame* — the frame its journal timestamps use — even when the remote
-/// clock disagrees with ours (a dead RTC, or NTP not yet resynced after a WOL
-/// cold boot). Deriving `boot_start` from our clock instead would slide the whole
-/// activity window by the offset.
-fn remote_now_and_uptime(ssh_host: &str, run_mode: RunMode) -> Result<(i64, u64)> {
+/// Read the remote's wall-clock time, uptime, and kernel boot epoch in one round
+/// trip. `btime` is the actual boot time and, unlike uptime, is not ambiguous
+/// after a suspend. All values come from the remote clock so they can be
+/// compared with the remote journal timestamps.
+fn remote_now_and_uptime(ssh_host: &str, run_mode: RunMode) -> Result<(i64, u64, i64)> {
     let mut cmd = Command::new("ssh");
     cmd.arg("-o")
         .arg("BatchMode=yes")
         .arg("-o")
         .arg("ConnectTimeout=5")
         .arg(ssh_host)
-        .arg("date +%s; cut -d. -f1 /proc/uptime")
+        .arg("date +%s; cut -d. -f1 /proc/uptime; awk '$1 == \"btime\" {print $2}' /proc/stat")
         .stdin(Stdio::null());
     maybe_print_command(&cmd, run_mode);
     let output = cmd.output().map_err(|err| {
@@ -1860,10 +1864,22 @@ fn latest_systemd_sleep_resume_timestamp(journal: &str) -> Option<i64> {
 fn classify_woken_host(
     history: SleepResumeHistory,
     now: i64,
+    boot_time: i64,
     uptime_seconds: u64,
     minimum_uptime_seconds: u64,
     wake_elapsed_seconds: u64,
+    wake_sent_remote_time: i64,
 ) -> (FoundPowerState, String) {
+    let boot_after_wake = boot_time >= wake_sent_remote_time - REMOTE_BOOT_TIME_GRACE_SECONDS;
+    if boot_after_wake {
+        return (
+            FoundPowerState::PoweredOff,
+            format!(
+                "kernel boot time was {}s after the Wake-on-LAN request",
+                boot_time.saturating_sub(wake_sent_remote_time)
+            ),
+        );
+    }
     match history {
         SleepResumeHistory::Available(Some(resume_at)) => {
             let age_seconds = now.saturating_sub(resume_at);
@@ -1908,11 +1924,12 @@ fn classify_woken_host(
     }
 }
 
-fn parse_now_and_uptime(output: &str) -> Option<(i64, u64)> {
+fn parse_now_and_uptime(output: &str) -> Option<(i64, u64, i64)> {
     let mut fields = output.split_whitespace();
     let now = fields.next()?.parse::<i64>().ok()?;
     let uptime = fields.next()?.split('.').next()?.parse::<u64>().ok()?;
-    Some((now, uptime))
+    let boot_time = fields.next()?.parse::<i64>().ok()?;
+    Some((now, uptime, boot_time))
 }
 
 /// Surface a drifting backup-source clock. Always prints when the offset is past
@@ -3324,14 +3341,14 @@ mod tests {
     #[test]
     fn parses_remote_now_and_uptime() {
         assert_eq!(
-            parse_now_and_uptime("1788781182\n5704.19\n"),
-            Some((1788781182, 5704))
+            parse_now_and_uptime("1788781182\n5704.19\n1788775478\n"),
+            Some((1788781182, 5704, 1788775478))
         );
         assert_eq!(
-            parse_now_and_uptime("1788781182 5704.19"),
-            Some((1788781182, 5704))
+            parse_now_and_uptime("1788781182 5704.19 1788775478"),
+            Some((1788781182, 5704, 1788775478))
         );
-        assert_eq!(parse_now_and_uptime("1788781182"), None);
+        assert_eq!(parse_now_and_uptime("1788781182 5704.19"), None);
         assert_eq!(parse_now_and_uptime("not a number"), None);
     }
 
@@ -3340,29 +3357,66 @@ mod tests {
         let (state, _) = classify_woken_host(
             SleepResumeHistory::Available(Some(1_990)),
             2_000,
+            1_000,
             5_000,
             600,
             180,
+            1_500,
         );
         assert_eq!(state, FoundPowerState::Suspended);
 
-        let (state, _) =
-            classify_woken_host(SleepResumeHistory::Available(None), 2_000, 5_000, 600, 180);
+        let (state, _) = classify_woken_host(
+            SleepResumeHistory::Available(None),
+            2_000,
+            1_000,
+            5_000,
+            600,
+            180,
+            1_500,
+        );
         assert_eq!(state, FoundPowerState::PoweredOff);
 
         let (state, _) = classify_woken_host(
             SleepResumeHistory::Available(Some(1_500)),
             2_000,
+            1_000,
             5_000,
             600,
             180,
+            1_500,
         );
         assert_eq!(state, FoundPowerState::Running);
 
-        let (state, _) =
-            classify_woken_host(SleepResumeHistory::Unavailable, 2_000, 5_000, 600, 180);
+        let (state, _) = classify_woken_host(
+            SleepResumeHistory::Unavailable,
+            2_000,
+            1_000,
+            5_000,
+            600,
+            180,
+            1_500,
+        );
         assert_eq!(state, FoundPowerState::Suspended);
-        let (state, _) = classify_woken_host(SleepResumeHistory::Unavailable, 2_000, 500, 600, 180);
+        let (state, _) = classify_woken_host(
+            SleepResumeHistory::Unavailable,
+            2_000,
+            1_000,
+            500,
+            600,
+            180,
+            1_500,
+        );
+        assert_eq!(state, FoundPowerState::PoweredOff);
+
+        let (state, _) = classify_woken_host(
+            SleepResumeHistory::Unavailable,
+            2_000,
+            1_905,
+            5_000,
+            600,
+            180,
+            1_900,
+        );
         assert_eq!(state, FoundPowerState::PoweredOff);
     }
 
