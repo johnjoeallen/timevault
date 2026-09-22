@@ -221,6 +221,7 @@ fn run_backup_job(
             rsync_code: None,
             failure_reason: None,
             power: None,
+            power_diagnostics: None,
         });
     }
 
@@ -250,7 +251,11 @@ fn run_backup_job(
             );
             crate::pnote!("job {} skipped: {}", job.name, reason);
             let mut report = skipped_job_report(job, disk_mount, backup_day, reason);
-            report.power = power_guard.map(|guard| guard.finish(true));
+            if let Some(guard) = power_guard {
+                let power = guard.finish(true);
+                report.power = Some(power.summary);
+                report.power_diagnostics = Some(power.diagnostics);
+            }
             return Ok(report);
         }
         Err(err) if remote_readiness_failed(&err) || remote_offline_if_unreachable(job) => {
@@ -282,6 +287,7 @@ fn run_backup_job(
                 job.name,
                 script_result.exit_code
             );
+            let power_report = remote_power_guard.take().map(|guard| guard.finish(false));
             return Ok(BackupJobReport {
                 name: job.name.clone(),
                 description: job.description.clone(),
@@ -296,7 +302,8 @@ fn run_backup_job(
                     script_result.exit_code,
                     &script_result.stderr,
                 )),
-                power: remote_power_guard.take().map(|guard| guard.finish(false)),
+                power: power_report.as_ref().map(|report| report.summary.clone()),
+                power_diagnostics: power_report.map(|report| report.diagnostics),
             });
         }
     }
@@ -314,6 +321,7 @@ fn run_backup_job(
                 job.name,
                 script_result.exit_code
             );
+            let power_report = remote_power_guard.take().map(|guard| guard.finish(false));
             return Ok(BackupJobReport {
                 name: job.name.clone(),
                 description: job.description.clone(),
@@ -328,7 +336,8 @@ fn run_backup_job(
                     script_result.exit_code,
                     &script_result.stderr,
                 )),
-                power: remote_power_guard.take().map(|guard| guard.finish(false)),
+                power: power_report.as_ref().map(|report| report.summary.clone()),
+                power_diagnostics: power_report.map(|report| report.diagnostics),
             });
         }
     }
@@ -514,7 +523,7 @@ fn run_backup_job(
     // Restore any suspend targets Timevault masked before asking the host to
     // return to its selected post-backup state.
     drop(_suspend_guard);
-    let power = remote_power_guard
+    let power_report = remote_power_guard
         .take()
         .map(|guard| guard.finish(status != BackupJobStatus::Failed));
     Ok(BackupJobReport {
@@ -527,7 +536,8 @@ fn run_backup_job(
         attempts,
         rsync_code: Some(rc),
         failure_reason,
-        power,
+        power: power_report.as_ref().map(|report| report.summary.clone()),
+        power_diagnostics: power_report.map(|report| report.diagnostics),
     })
 }
 
@@ -556,6 +566,7 @@ fn failed_job_report(
         rsync_code: None,
         failure_reason: Some(failure_reason),
         power: None,
+        power_diagnostics: None,
     }
 }
 
@@ -576,6 +587,7 @@ fn offline_job_report(
         rsync_code: None,
         failure_reason: Some(reason),
         power: None,
+        power_diagnostics: None,
     }
 }
 
@@ -596,6 +608,7 @@ fn skipped_job_report(
         rsync_code: None,
         failure_reason: Some(reason),
         power: None,
+        power_diagnostics: None,
     }
 }
 
@@ -920,6 +933,13 @@ enum SleepResumeHistory {
     Unavailable,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ColdBootSessionCheck {
+    QualifyingActivity,
+    NoQualifyingActivity,
+    JournalUnavailable,
+}
+
 fn found_power_state_description(state: FoundPowerState) -> &'static str {
     match state {
         FoundPowerState::Running => "running",
@@ -962,6 +982,12 @@ struct RemotePowerGuard {
     job_name: String,
     found_state: FoundPowerState,
     found_by: String,
+    checks: Vec<String>,
+}
+
+struct PowerReport {
+    summary: String,
+    diagnostics: String,
 }
 
 enum RemotePowerStart {
@@ -984,7 +1010,7 @@ impl Drop for RemotePowerGuard {
 }
 
 impl RemotePowerGuard {
-    fn finish(mut self, run_action: bool) -> String {
+    fn finish(mut self, run_action: bool) -> PowerReport {
         drop(self.keepalive.take());
         self.backup_completed = run_action;
         let leaving = if !run_action {
@@ -995,12 +1021,20 @@ impl RemotePowerGuard {
             self.run_power_action()
         };
         self.finalized = true;
-        format!(
-            "Found {} ({}); {}",
-            found_power_state_description(self.found_state),
-            self.found_by,
-            leaving
-        )
+        PowerReport {
+            summary: format!(
+                "Found {} ({}); {}",
+                found_power_state_description(self.found_state),
+                self.found_by,
+                leaving
+            ),
+            diagnostics: format!(
+                "Found state: {}\nChecks completed:\n- {}\nPost-backup action: {}",
+                found_power_state_description(self.found_state),
+                self.checks.join("\n- "),
+                leaving
+            ),
+        }
     }
 
     fn run_power_action(&self) -> String {
@@ -1210,6 +1244,14 @@ fn start_remote_power_guard(
     let deadline = Instant::now() + context.probe_timeout;
     crate::pstatus!("{}: reaching {}", job.name, context.host);
     let initially_reachable = ping_once(&context.host, run_mode)?;
+    let mut checks = vec![format!(
+        "initial ping: {}",
+        if initially_reachable {
+            "responded"
+        } else {
+            "no response"
+        }
+    )];
     let mut wake_sent_at = None;
     let mut wake_sent_local_time = None;
     let (was_woken, mut found_by) = if initially_reachable {
@@ -1256,13 +1298,25 @@ fn start_remote_power_guard(
             "host became reachable without Wake-on-LAN".to_string(),
         )
     };
+    checks.push(if was_woken {
+        "Wake-on-LAN: sent; ping readiness succeeded".to_string()
+    } else if initially_reachable {
+        "Wake-on-LAN: not sent because initial ping responded".to_string()
+    } else {
+        "Wake-on-LAN: not configured; ping readiness succeeded".to_string()
+    });
     wait_for_ssh_until(&context.ssh_host, deadline, run_mode)?;
+    checks.push("SSH readiness: succeeded".to_string());
 
     let local_now = Utc::now().timestamp();
     let (remote_now, uptime_seconds, boot_time) =
         remote_now_and_uptime(&context.ssh_host, run_mode)?;
     let clock_offset = remote_now - local_now;
     report_clock_drift(&context.ssh_host, clock_offset, run_mode);
+    checks.push(format!(
+        "remote clock/uptime: clock={}, uptime={}s, boot_time={}",
+        remote_now, uptime_seconds, boot_time
+    ));
 
     let found_state = if !was_woken {
         FoundPowerState::Running
@@ -1288,6 +1342,7 @@ fn start_remote_power_guard(
                 .as_secs(),
             wake_sent_local_time.expect("was_woken means a WOL packet was sent") + clock_offset,
         );
+        checks.push(format!("power-state classification: {}", detection));
         match remote_active_user_session(
             &context.ssh_host,
             &context.ignored_session_users,
@@ -1296,12 +1351,14 @@ fn start_remote_power_guard(
             Ok(Some(session)) => {
                 state = FoundPowerState::Running;
                 detection = format!("active user session for {} is present", session);
+                checks.push(format!("active user-session check: present ({})", session));
             }
-            Ok(None) => {}
+            Ok(None) => checks.push("active user-session check: none found".to_string()),
             Err(err) if run_mode.verbose => {
                 crate::pnote!("  active-session check unavailable: {}", err);
+                checks.push(format!("active user-session check: unavailable ({})", err));
             }
-            Err(_) => {}
+            Err(_) => checks.push("active user-session check: unavailable".to_string()),
         }
         if run_mode.verbose {
             crate::pnote!(
@@ -1324,7 +1381,7 @@ fn start_remote_power_guard(
                     context.ssh_host
                 );
             }
-            if !remote_journal_has_qualifying_session(
+            let cold_boot_check = remote_journal_has_qualifying_session(
                 &context.ssh_host,
                 window_start,
                 window_end,
@@ -1332,7 +1389,22 @@ fn start_remote_power_guard(
                 context.minimum_session_seconds,
                 &context.ignored_session_users,
                 run_mode,
-            )? {
+            )?;
+            checks.push(format!(
+                "cold-boot prior-day journal/session check: {}",
+                match cold_boot_check {
+                    ColdBootSessionCheck::QualifyingActivity => {
+                        "qualifying activity found (backup proceeds)"
+                    }
+                    ColdBootSessionCheck::NoQualifyingActivity => {
+                        "no qualifying activity (backup skipped)"
+                    }
+                    ColdBootSessionCheck::JournalUnavailable => {
+                        "journal did not cover the window (check bypassed; backup proceeds)"
+                    }
+                }
+            ));
+            if cold_boot_check == ColdBootSessionCheck::NoQualifyingActivity {
                 return Ok(RemotePowerStart::InactiveColdBoot {
                     uptime_seconds,
                     minimum_session_seconds: context.minimum_session_seconds,
@@ -1345,6 +1417,7 @@ fn start_remote_power_guard(
                         job_name: job.name.clone(),
                         found_state: FoundPowerState::PoweredOff,
                         found_by,
+                        checks,
                     }),
                 });
             }
@@ -1385,6 +1458,7 @@ fn start_remote_power_guard(
         job_name: job.name.clone(),
         found_state,
         found_by,
+        checks,
     })))
 }
 
@@ -1986,7 +2060,7 @@ fn remote_journal_has_qualifying_session(
     minimum_session_seconds: u64,
     ignored_users: &[String],
     run_mode: RunMode,
-) -> Result<bool> {
+) -> Result<ColdBootSessionCheck> {
     let logind_journal = remote_logind_journal(ssh_host, window_start, boot_start, run_mode)?;
     let sessions = parse_logind_sessions(&logind_journal);
 
@@ -2001,7 +2075,7 @@ fn remote_journal_has_qualifying_session(
             "warning: the journal on {} has no records for the prior-day window (not persisted across reboots?). Backing up without the cold-boot usage check.",
             ssh_host
         );
-        return Ok(true);
+        return Ok(ColdBootSessionCheck::JournalUnavailable);
     }
 
     // The only way a person uses a headless backup source is over SSH, so a
@@ -2105,7 +2179,11 @@ fn remote_journal_has_qualifying_session(
         );
     }
 
-    Ok(qualifies)
+    Ok(if qualifies {
+        ColdBootSessionCheck::QualifyingActivity
+    } else {
+        ColdBootSessionCheck::NoQualifyingActivity
+    })
 }
 
 fn format_session_duration(seconds: i64) -> String {

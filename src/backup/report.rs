@@ -27,6 +27,7 @@ pub struct BackupJobReport {
     pub rsync_code: Option<i32>,
     pub failure_reason: Option<String>,
     pub power: Option<String>,
+    pub power_diagnostics: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,6 +231,25 @@ pub fn render_html(reports: &[BackupRunReport]) -> String {
             body.push_str("</tr>");
         }
         body.push_str("</tbody></table>");
+        let diagnostic_jobs: Vec<_> = report
+            .jobs
+            .iter()
+            .filter(|job| job.power_diagnostics.is_some())
+            .collect();
+        if !diagnostic_jobs.is_empty() {
+            body.push_str("<h3 style=\"font-size:15px; margin:16px 0 8px; color:#334155;\">Power diagnostics</h3>");
+            body.push_str("<div style=\"background:#f8fafc; border:1px solid #d8e2ea; padding:10px 12px; margin-bottom:18px; font-family:monospace; font-size:12px; line-height:1.55;\">");
+            for job in diagnostic_jobs {
+                body.push_str(&format!(
+                    "<strong>{}</strong><br>",
+                    escape_html(job_display_name(job))
+                ));
+                let details = job.power_diagnostics.as_deref().unwrap_or("");
+                body.push_str(&escape_html(details).replace('\n', "<br>"));
+                body.push_str("<br><br>");
+            }
+            body.push_str("</div>");
+        }
     }
 
     body.push_str("</div></div></body></html>\n");
@@ -528,6 +548,9 @@ mod tests {
                 rsync_code: Some(0),
                 failure_reason: None,
                 power: Some("Found powered off <by WOL>; leaving: power off requested".to_string()),
+                power_diagnostics: Some(
+                    "Found state: powered off\nChecks completed: ping, SSH readiness".to_string(),
+                ),
             }],
         }]);
 
@@ -538,6 +561,8 @@ mod tests {
         assert!(html.contains(">Name</th>"));
         assert!(html.contains(">Power</th>"));
         assert!(html.contains("Found powered off &lt;by WOL&gt;"));
+        assert!(html.contains("Power diagnostics"));
+        assert!(html.contains("Checks completed"));
         assert!(html.contains("background:#0f766e"));
         assert!(html.contains("background:#dcfce7"));
         assert!(html.contains("<table"));
@@ -562,6 +587,7 @@ mod tests {
                 rsync_code: Some(11),
                 failure_reason: Some("rsync failed: No space left on device".to_string()),
                 power: None,
+                power_diagnostics: None,
             }],
         };
 
