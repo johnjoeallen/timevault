@@ -188,6 +188,7 @@ fn parse_runtime(cfg: Config) -> Result<RuntimeConfig> {
             copies: job.copies,
             run_policy,
             excludes,
+            includes: job.includes,
             disk_ids: disk_ids_for_job,
             remote: job.remote,
         });

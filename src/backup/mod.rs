@@ -135,6 +135,9 @@ pub fn print_job_details(job: &Job) {
     crate::pnote!("  copies: {}", job.copies);
     crate::pnote!("  run: {}", job.run_policy.as_str());
     crate::pnote!("  excludes: {}", excludes);
+    if !job.includes.is_empty() {
+        crate::pnote!("  includes: {}", job.includes.join(", "));
+    }
     crate::pnote!("  disks: {}", disk_ids);
 }
 
@@ -2896,7 +2899,46 @@ fn build_exclude_list(job: &Job, pristine_excludes: &PristineExcludes) -> Result
     if let Some(pristine) = pristine_excludes_for_job(job, pristine_excludes) {
         excludes.extend(pristine.iter().cloned());
     }
-    Ok(excludes)
+    let mut rules = build_include_rules(&job.includes, &excludes);
+    rules.extend(excludes);
+    Ok(rules)
+}
+
+/// Builds rsync filter rules that re-include paths covered by an exclude.
+///
+/// rsync uses the first matching rule and never descends into an excluded
+/// directory, so each include also re-opens its ancestors. Ancestors that are
+/// themselves excluded get a `- ancestor/*` rule to keep their other children
+/// excluded. All `+` rules precede all `-` rules so nested includes win.
+fn build_include_rules(includes: &[String], excludes: &[String]) -> Vec<String> {
+    let mut plus: Vec<String> = Vec::new();
+    let mut minus: Vec<String> = Vec::new();
+    let push_unique = |list: &mut Vec<String>, rule: String| {
+        if !list.contains(&rule) {
+            list.push(rule);
+        }
+    };
+    for include in includes {
+        let path = include.trim_end_matches('/');
+        if path.is_empty() {
+            continue;
+        }
+        if path.starts_with('/') {
+            let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+            let mut ancestor = String::new();
+            for part in &parts[..parts.len().saturating_sub(1)] {
+                ancestor.push('/');
+                ancestor.push_str(part);
+                push_unique(&mut plus, format!("+ {}/", ancestor));
+                if excludes.iter().any(|e| e.trim_end_matches('/') == ancestor) {
+                    push_unique(&mut minus, format!("- {}/*", ancestor));
+                }
+            }
+        }
+        push_unique(&mut plus, format!("+ {}/***", path));
+    }
+    plus.extend(minus);
+    plus
 }
 
 fn build_pristine_excludes_for_jobs(
@@ -3195,6 +3237,7 @@ mod tests {
             copies: 1,
             run_policy: RunPolicy::Auto,
             excludes: vec!["/tmp".to_string()],
+            includes: Vec::new(),
             disk_ids: None,
             remote: None,
         }
@@ -4077,6 +4120,39 @@ mod tests {
         assert_eq!(
             excludes,
             vec!["/tmp".to_string(), "/usr/bin/bash".to_string()]
+        );
+    }
+
+    #[test]
+    fn include_rules_reopen_excluded_ancestors() {
+        let rules = build_include_rules(
+            &["/data/docker/volumes".to_string()],
+            &["/data/docker".to_string(), "/tmp".to_string()],
+        );
+        assert_eq!(
+            rules,
+            vec![
+                "+ /data/".to_string(),
+                "+ /data/docker/".to_string(),
+                "+ /data/docker/volumes/***".to_string(),
+                "- /data/docker/*".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn include_rules_precede_excludes() {
+        let mut j = job("/");
+        j.excludes = vec!["/data/docker".to_string()];
+        j.includes = vec!["/data/docker".to_string()];
+        let list = build_exclude_list(&j, &PristineExcludes::default()).expect("list");
+        assert_eq!(
+            list,
+            vec![
+                "+ /data/".to_string(),
+                "+ /data/docker/***".to_string(),
+                "/data/docker".to_string(),
+            ]
         );
     }
 

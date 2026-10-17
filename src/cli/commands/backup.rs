@@ -433,6 +433,7 @@ mod tests {
             copies: 1,
             run_policy: RunPolicy::Auto,
             excludes: Vec::new(),
+            includes: Vec::new(),
             disk_ids: None,
             remote: None,
         };
@@ -444,6 +445,7 @@ mod tests {
             copies: 1,
             run_policy: RunPolicy::Auto,
             excludes: Vec::new(),
+            includes: Vec::new(),
             disk_ids: Some(vec!["disk-a".to_string()]),
             remote: None,
         };
@@ -478,6 +480,7 @@ mod tests {
             copies: 1,
             run_policy: RunPolicy::Auto,
             excludes: Vec::new(),
+            includes: Vec::new(),
             disk_ids: Some(vec!["disk-b".to_string()]),
             remote: None,
         };
@@ -513,6 +516,7 @@ mod tests {
             copies: 1,
             run_policy: RunPolicy::Auto,
             excludes: Vec::new(),
+            includes: Vec::new(),
             disk_ids: None,
             remote: None,
         };

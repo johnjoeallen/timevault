@@ -64,6 +64,8 @@ jobs:
     # Optional disk allowlist for this job:
     # diskIds: ["primary"]
     excludes: []
+    # Re-include a path covered by a global exclude, for this job only:
+    # includes: ["/var/log"]
   - name: "remote-primary"
     description: "Remote primary filesystem"
     source: "root@example.com:/"

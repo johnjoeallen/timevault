@@ -648,7 +648,7 @@ dependencies = [
 
 [[package]]
 name = "timevault"
-version = "1.12.2"
+version = "1.13.0"
 dependencies = [
  "anyhow",
  "chrono",

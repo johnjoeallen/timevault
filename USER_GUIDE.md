@@ -50,6 +50,7 @@ Each job defines a backup source and retention policy.
 - `copies`: Number of snapshots to keep (oldest beyond this are removed).
 - `run`: Run policy (`auto`, `demand`, `off`).
 - `excludes`: Job-specific exclude paths.
+- `includes`: Optional paths to back up for this job even if a global or job exclude covers them (e.g. `/data/docker/volumes` when `/data/docker` is excluded). Paths are anchored at the job `source`. Excluded parent directories stay excluded except for the included path.
 - `diskIds`: Optional list of disk IDs this job is allowed to run on.
 - `remote`: Optional remote power behavior for SSH-style sources.
 
