@@ -16,6 +16,7 @@ pub fn run_rsync(
     source: &str,
     backup_dir: &Path,
     excludes_file: &Path,
+    link_dest: Option<&Path>,
     extra: &[String],
     run_mode: RunMode,
     label: &str,
@@ -31,6 +32,9 @@ pub fn run_rsync(
     if !run_mode.safe_mode {
         args.push("--delete-after".to_string());
         args.push("--delete-excluded".to_string());
+    }
+    if let Some(base) = link_dest {
+        args.push(format!("--link-dest={}", base.display()));
     }
     let streamed = progress::enabled();
     if streamed {

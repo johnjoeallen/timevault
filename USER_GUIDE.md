@@ -416,6 +416,19 @@ Remote job sources require passwordless SSH (keys configured for the remote host
 When `--exclude-pristine` is enabled for a `host:/...` source, Timevault uses SSH to inspect the remote host's package database and file hashes, then stores that host's pristine cache separately on the local machine. Remote pristine analysis supports SSH-style rsync sources, not `rsync://` daemon sources.
 Remote power options require `systemctl` over SSH on the remote host for suspend/shutdown handling and `ping` on the Timevault host for wake readiness checks.
 
+## Snapshot generations
+Each run builds the next generation with a single `rsync --link-dest` against the last completed generation (the one `current` points at). Unchanged files become hard links, so every generation is a full, independently browsable tree that only costs the space of what changed. The on-disk layout is unchanged, so repositories created by earlier releases (which seeded the new day with hard links and synced in place) are used as-is, with no migration.
+
+- The new generation is built in `<mount>/<job>/.timevault-staging` and renamed to `<YYYYMMDD>` only after rsync succeeds (exit 0 or 24). A failed or interrupted run is never published, `current` does not move, and nothing is pruned.
+- Old generations are pruned after the new one is published, keeping `copies` of them. Earlier releases pruned first and so left `copies + 1` generations after a run. The generation `current` points at is never pruned.
+- Completed generations are never written to. Previously, a permission, owner or timestamp change at the source was applied to the shared inode and so rewrote that file in every generation that linked it.
+- A leftover `.timevault-staging` is removed on the next run when there is a previous generation to link against, and resumed for an initial backup. Re-running a job on a day that already has a generation builds a fresh one and swaps it in with a rename; an interrupted swap is repaired automatically on the next run (`.timevault-replaced-<day>`).
+- A partial `<YYYYMMDD>` directory left by an earlier release's failed run is replaced the same way, but until then it still counts toward `copies`.
+- Files are linked only when every attribute rsync preserves matches (`-a`: permissions, owner, group, mtime). Adding `--xattrs`, `--acls` or `--numeric-ids` through `rsync` options therefore makes the first run afterwards copy everything.
+- A renamed or moved file is copied again, as before; `--link-dest` matches files by path.
+- `--safe` still skips every deletion; a stale staging or replaced directory is then left in place.
+- Post-backup scripts receive the final `<YYYYMMDD>` path; after a failed run that directory does not exist.
+
 ## Notes
 - Backup disks must contain `/.timevault` and match the configured `diskId` and `fsUuid`.
 - Snapshot structure is `<mount>/<job>/<YYYYMMDD>` with a `current` symlink.

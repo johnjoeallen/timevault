@@ -12,7 +12,6 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration as StdDuration, Instant};
 
 use chrono::{Duration, Local, Utc};
-use walkdir::WalkDir;
 
 use crate::backup::pristine::{build_pristine_excludes_for_source, PristineSource};
 use crate::backup::report::{BackupJobReport, BackupJobStatus, BackupRunReport};
@@ -23,6 +22,7 @@ use crate::types::RunMode;
 use crate::util::command::maybe_print_command;
 use crate::util::paths::job_lock_path;
 
+pub mod generation;
 pub mod pristine;
 pub mod report;
 pub mod rsync;
@@ -377,52 +377,20 @@ fn run_backup_job(
         }
     }
 
-    crate::pstatus!("{}: pruning old snapshots", job.name);
-    expire_old_backups(job, &dest, run_mode)?;
-
-    let current = dest.join("current");
     let backup_dir = dest.join(backup_day);
-
-    if current.exists() && !backup_dir.exists() {
-        if run_mode.dry_run {
-            crate::pnote!("dry-run: mkdir -p {}", backup_dir.display());
-        } else {
-            fs::create_dir_all(&backup_dir)?;
-        }
-        copy_snapshot_without_symlinks(&current, &backup_dir, run_mode)?;
-    }
-
-    let mut rc = 1;
-    let mut attempts = 0;
-    let mut rsync_stderr = String::new();
-    for attempt in 1..=3 {
-        attempts = attempt;
-        crate::progress::status(if attempt == 1 {
-            format!("{}: syncing", job.name)
-        } else {
-            format!("{}: syncing (attempt {}/3)", job.name, attempt)
-        });
-        let rsync_result = run_rsync(
-            &job.source,
-            &backup_dir,
-            &excludes_file,
-            rsync_extra,
-            run_mode,
-            &job.name,
-        )?;
-        rc = rsync_result.exit_code;
-        rsync_stderr = rsync_result.stderr;
-        if rc == 0 || rc == 24 {
-            break;
-        }
-        if attempt < 3 {
-            crate::progress::note(format!(
-                "rsync failed with exit code {}; retrying ({}/3)",
-                rc,
-                attempt + 1
-            ));
-        }
-    }
+    let sync = sync_generation(
+        job,
+        &dest,
+        backup_day,
+        &excludes_file,
+        rsync_extra,
+        run_mode,
+    )?;
+    let SyncOutcome {
+        rc,
+        attempts,
+        stderr: rsync_stderr,
+    } = sync;
     let rsync_ok = rc == 0 || rc == 24;
     let mut failure_reason = if rsync_ok {
         None
@@ -3052,11 +3020,18 @@ fn expire_old_backups(job: &Job, dest: &Path, run_mode: RunMode) -> io::Result<(
     for entry in fs::read_dir(dest)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().to_string();
-        if name == "." || name == ".." || name == "current" || name == TIMEVAULT_MARKER {
+        if name == "."
+            || name == ".."
+            || name == "current"
+            || name == TIMEVAULT_MARKER
+            || generation::is_internal_name(&name)
+        {
             continue;
         }
         backups.push(name);
     }
+    // Never delete the generation `current` points at: it is the link-dest base.
+    let protected = generation::link_dest_base(dest);
 
     backups.sort();
     if backups.len() <= job.copies {
@@ -3066,6 +3041,10 @@ fn expire_old_backups(job: &Job, dest: &Path, run_mode: RunMode) -> io::Result<(
     let to_delete = backups.len() - job.copies;
     for name in backups.iter().take(to_delete) {
         let target = dest.join(name);
+        if protected.is_some() && target.canonicalize().ok() == protected {
+            crate::pnote!("skip delete (current generation): {}", target.display());
+            continue;
+        }
         let meta = fs::symlink_metadata(&target)?;
         if meta.file_type().is_symlink() {
             crate::pnote!("skip symlink delete: {}", target.display());
@@ -3090,57 +3069,93 @@ fn expire_old_backups(job: &Job, dest: &Path, run_mode: RunMode) -> io::Result<(
     Ok(())
 }
 
-fn copy_snapshot_without_symlinks(source: &Path, dest: &Path, run_mode: RunMode) -> io::Result<()> {
-    for entry in WalkDir::new(source).follow_links(false) {
-        let entry = entry?;
-        let src_path = entry.path();
-        let rel = src_path.strip_prefix(source).unwrap_or(src_path);
-        if rel.as_os_str().is_empty() {
-            continue;
-        }
-        let target = dest.join(rel);
-        let ft = entry.file_type();
-        if ft.is_symlink() {
-            if run_mode.dry_run {
-                crate::pnote!("dry-run: skip symlink {}", src_path.display());
-            }
-            continue;
-        }
-        if ft.is_dir() {
-            if run_mode.dry_run {
-                crate::pnote!("dry-run: mkdir -p {}", target.display());
-            } else {
-                fs::create_dir_all(&target)?;
-            }
-            continue;
-        }
-        if ft.is_file() {
-            if run_mode.dry_run {
-                crate::pnote!("dry-run: ln {} {}", src_path.display(), target.display());
-            } else {
-                hard_link_if_missing(src_path, &target)?;
-            }
-        }
-    }
-    Ok(())
+struct SyncOutcome {
+    rc: i32,
+    attempts: usize,
+    stderr: String,
 }
 
-fn hard_link_if_missing(source: &Path, target: &Path) -> io::Result<()> {
-    if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent)?;
+/// Build the next generation in staging with `rsync --link-dest` against the
+/// last completed generation, publish it only if rsync succeeded, and prune
+/// expired generations only after that. A failed run leaves every completed
+/// generation untouched.
+fn sync_generation(
+    job: &Job,
+    dest: &Path,
+    backup_day: &str,
+    excludes_file: &Path,
+    rsync_extra: &[String],
+    run_mode: RunMode,
+) -> Result<SyncOutcome> {
+    if !run_mode.dry_run && !dest.exists() {
+        fs::create_dir_all(dest)?;
+    }
+    generation::recover_interrupted(dest, run_mode)?;
+    let base = generation::link_dest_base(dest);
+    match &base {
+        Some(base) if run_mode.verbose => {
+            crate::pnote!("  link-dest: {}", base.display());
+        }
+        None => crate::pnote!(
+            "{}: no previous generation; performing a full initial backup",
+            job.name
+        ),
+        _ => {}
+    }
+    let staging = generation::prepare_staging(dest, base.is_some(), run_mode)?;
+
+    let mut rc = 1;
+    let mut attempts = 0;
+    let mut rsync_stderr = String::new();
+    for attempt in 1..=3 {
+        attempts = attempt;
+        crate::progress::status(if attempt == 1 {
+            format!("{}: syncing", job.name)
+        } else {
+            format!("{}: syncing (attempt {}/3)", job.name, attempt)
+        });
+        let rsync_result = run_rsync(
+            &job.source,
+            &staging,
+            excludes_file,
+            base.as_deref(),
+            rsync_extra,
+            run_mode,
+            &job.name,
+        )?;
+        rc = rsync_result.exit_code;
+        rsync_stderr = rsync_result.stderr;
+        if rc == 0 || rc == 24 {
+            break;
+        }
+        if attempt < 3 {
+            crate::progress::note(format!(
+                "rsync failed with exit code {}; retrying ({}/3)",
+                rc,
+                attempt + 1
+            ));
+        }
     }
 
-    match fs::symlink_metadata(target) {
-        Ok(_) => return Ok(()),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-        Err(err) => return Err(err),
+    if rc == 0 || rc == 24 {
+        generation::publish(dest, &staging, backup_day, run_mode).map_err(|err| {
+            TimevaultError::message(format!(
+                "publish {} as {}: {}",
+                staging.display(),
+                dest.join(backup_day).display(),
+                err
+            ))
+        })?;
+        crate::pstatus!("{}: pruning old snapshots", job.name);
+        if let Err(err) = expire_old_backups(job, dest, run_mode) {
+            crate::pnote!("warning: pruning old snapshots failed: {}", err);
+        }
     }
-
-    match fs::hard_link(source, target) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(()),
-        Err(err) => Err(err),
-    }
+    Ok(SyncOutcome {
+        rc,
+        attempts,
+        stderr: rsync_stderr,
+    })
 }
 
 /// Per-job rsync excludes file. Distinct per job so parallel `timevault` runs for
@@ -3227,7 +3242,7 @@ fn acquire_lock_for_job(job_name: &str, run_mode: RunMode) -> Result<Option<Lock
 mod tests {
     use super::*;
     use crate::types::RunPolicy;
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     fn job(source: &str) -> Job {
         Job {
@@ -4290,50 +4305,6 @@ mod tests {
     }
 
     #[test]
-    fn missing_current_file_is_hard_linked_from_previous() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let previous = tmp.path().join("previous");
-        let current = tmp.path().join("current");
-        let previous_file = previous.join("nested/file.txt");
-        let current_file = current.join("nested/file.txt");
-        fs::create_dir_all(previous_file.parent().expect("parent")).expect("mkdir previous");
-        fs::write(&previous_file, "previous").expect("write previous");
-
-        copy_snapshot_without_symlinks(&previous, &current, run_mode()).expect("seed");
-
-        assert_eq!(
-            fs::read_to_string(&current_file).expect("read current"),
-            "previous"
-        );
-        assert!(same_inode(&previous_file, &current_file));
-    }
-
-    #[test]
-    fn existing_current_file_is_not_replaced() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let previous = tmp.path().join("previous");
-        let current = tmp.path().join("current");
-        let previous_file = previous.join("file.txt");
-        let current_file = current.join("file.txt");
-        fs::create_dir_all(&previous).expect("mkdir previous");
-        fs::create_dir_all(&current).expect("mkdir current");
-        fs::write(&previous_file, "same").expect("write previous");
-        fs::write(&current_file, "same").expect("write current");
-        let current_before = fs::metadata(&current_file).expect("metadata before");
-
-        copy_snapshot_without_symlinks(&previous, &current, run_mode()).expect("seed");
-
-        let current_after = fs::metadata(&current_file).expect("metadata after");
-        assert_eq!(
-            fs::read_to_string(&current_file).expect("read current"),
-            "same"
-        );
-        assert_eq!(current_before.dev(), current_after.dev());
-        assert_eq!(current_before.ino(), current_after.ino());
-        assert!(!same_inode(&previous_file, &current_file));
-    }
-
-    #[test]
     fn job_excludes_path_is_per_job() {
         let tmp = Path::new("/root/tmp");
         assert_eq!(
@@ -4343,52 +4314,386 @@ mod tests {
         assert_ne!(job_excludes_path(tmp, "a"), job_excludes_path(tmp, "b"));
     }
 
-    #[test]
-    fn rerunning_seed_operation_is_idempotent() {
+    // ---- generation lifecycle (rsync --link-dest) ----
+
+    fn gen_job(source: &Path, copies: usize) -> Job {
+        let mut j = job(&source.to_string_lossy());
+        j.copies = copies;
+        j.excludes = Vec::new();
+        j
+    }
+
+    /// Run one backup day the way `run_backup_job` does: sync, then repoint
+    /// `current` on success. Returns rsync's exit code.
+    fn run_gen(source: &Path, dest: &Path, day: &str, copies: usize) -> i32 {
+        let excludes = dest.with_extension("excludes");
+        fs::write(&excludes, "").expect("excludes");
+        let outcome = sync_generation(
+            &gen_job(source, copies),
+            dest,
+            day,
+            &excludes,
+            &[],
+            run_mode(),
+        )
+        .expect("sync_generation");
+        if outcome.rc == 0 || outcome.rc == 24 {
+            let current = dest.join("current");
+            let _ = fs::remove_file(&current);
+            symlink(day, &current).expect("current link");
+        }
+        outcome.rc
+    }
+
+    fn gen_dirs(dest: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dest)
+            .expect("read dest")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn write(path: &Path, text: &str) {
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        fs::write(path, text).expect("write");
+    }
+
+    fn read(path: &Path) -> String {
+        fs::read_to_string(path).expect("read")
+    }
+
+    fn set_mtime(path: &Path, stamp: &str) {
+        let status = Command::new("touch")
+            .args(["-d", stamp])
+            .arg(path)
+            .status()
+            .expect("touch");
+        assert!(status.success());
+    }
+
+    struct Repo {
+        _tmp: tempfile::TempDir,
+        source: PathBuf,
+        dest: PathBuf,
+    }
+
+    fn repo() -> Repo {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let previous = tmp.path().join("previous");
-        let current = tmp.path().join("current");
-        let previous_file = previous.join("file.txt");
-        let current_file = current.join("file.txt");
-        fs::create_dir_all(&previous).expect("mkdir previous");
-        fs::write(&previous_file, "previous").expect("write previous");
-
-        copy_snapshot_without_symlinks(&previous, &current, run_mode()).expect("first seed");
-        let current_before = fs::metadata(&current_file).expect("metadata before");
-        copy_snapshot_without_symlinks(&previous, &current, run_mode()).expect("second seed");
-        let current_after = fs::metadata(&current_file).expect("metadata after");
-
-        assert_eq!(
-            fs::read_to_string(&current_file).expect("read current"),
-            "previous"
-        );
-        assert!(same_inode(&previous_file, &current_file));
-        assert_eq!(current_before.dev(), current_after.dev());
-        assert_eq!(current_before.ino(), current_after.ino());
+        let source = tmp.path().join("source");
+        let dest = tmp.path().join("dest/job");
+        fs::create_dir_all(&source).expect("source");
+        fs::create_dir_all(&dest).expect("dest");
+        Repo {
+            _tmp: tmp,
+            source,
+            dest,
+        }
     }
 
     #[test]
-    fn existing_current_file_with_different_contents_remains_unchanged() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let previous = tmp.path().join("previous");
-        let current = tmp.path().join("current");
-        let previous_file = previous.join("file.txt");
-        let current_file = current.join("file.txt");
-        fs::create_dir_all(&previous).expect("mkdir previous");
-        fs::create_dir_all(&current).expect("mkdir current");
-        fs::write(&previous_file, "previous").expect("write previous");
-        fs::write(&current_file, "current").expect("write current");
-        let current_before = fs::metadata(&current_file).expect("metadata before");
+    fn initial_backup_without_previous_generation() {
+        let r = repo();
+        write(&r.source.join("a.txt"), "alpha");
+        write(&r.source.join("dir/b.txt"), "beta");
 
-        copy_snapshot_without_symlinks(&previous, &current, run_mode()).expect("seed");
+        assert_eq!(run_gen(&r.source, &r.dest, "20260101", 3), 0);
 
-        let current_after = fs::metadata(&current_file).expect("metadata after");
+        assert_eq!(read(&r.dest.join("20260101/a.txt")), "alpha");
+        assert_eq!(read(&r.dest.join("20260101/dir/b.txt")), "beta");
+        assert_eq!(gen_dirs(&r.dest), vec!["20260101", "current"]);
+    }
+
+    #[test]
+    fn unchanged_files_share_inodes_and_changed_files_do_not() {
+        let r = repo();
+        write(&r.source.join("same.txt"), "same");
+        write(&r.source.join("changed.txt"), "v1");
+        run_gen(&r.source, &r.dest, "20260101", 3);
+
+        write(&r.source.join("changed.txt"), "version-two");
+        write(&r.source.join("new.txt"), "new");
+        run_gen(&r.source, &r.dest, "20260102", 3);
+
+        let (d1, d2) = (r.dest.join("20260101"), r.dest.join("20260102"));
+        assert!(same_inode(&d1.join("same.txt"), &d2.join("same.txt")));
+        assert!(!same_inode(&d1.join("changed.txt"), &d2.join("changed.txt")));
+        assert_eq!(read(&d1.join("changed.txt")), "v1");
+        assert_eq!(read(&d2.join("changed.txt")), "version-two");
+        assert!(!d1.join("new.txt").exists());
+        assert_eq!(read(&d2.join("new.txt")), "new");
+    }
+
+    #[test]
+    fn backup_with_no_changes_links_everything() {
+        let r = repo();
+        write(&r.source.join("a.txt"), "a");
+        write(&r.source.join("sub/b.txt"), "b");
+        run_gen(&r.source, &r.dest, "20260101", 3);
+        run_gen(&r.source, &r.dest, "20260102", 3);
+
+        for file in ["a.txt", "sub/b.txt"] {
+            assert!(same_inode(
+                &r.dest.join("20260101").join(file),
+                &r.dest.join("20260102").join(file)
+            ));
+        }
+    }
+
+    #[test]
+    fn deleted_files_and_dirs_vanish_from_new_generation_only() {
+        let r = repo();
+        write(&r.source.join("keep.txt"), "keep");
+        write(&r.source.join("gone.txt"), "gone");
+        write(&r.source.join("gonedir/x.txt"), "x");
+        run_gen(&r.source, &r.dest, "20260101", 3);
+
+        fs::remove_file(r.source.join("gone.txt")).unwrap();
+        fs::remove_dir_all(r.source.join("gonedir")).unwrap();
+        run_gen(&r.source, &r.dest, "20260102", 3);
+
+        let d2 = r.dest.join("20260102");
+        assert!(!d2.join("gone.txt").exists());
+        assert!(!d2.join("gonedir").exists());
+        assert_eq!(read(&r.dest.join("20260101/gone.txt")), "gone");
+        assert_eq!(read(&r.dest.join("20260101/gonedir/x.txt")), "x");
+    }
+
+    #[test]
+    fn permission_and_timestamp_changes_do_not_alter_earlier_generations() {
+        let r = repo();
+        let file = r.source.join("f.txt");
+        write(&file, "data");
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        set_mtime(&file, "2020-01-01 00:00:00");
+        run_gen(&r.source, &r.dest, "20260101", 3);
+
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+        run_gen(&r.source, &r.dest, "20260102", 3);
+        set_mtime(&file, "2021-06-06 06:06:06");
+        run_gen(&r.source, &r.dest, "20260103", 3);
+
+        let mode = |day: &str| {
+            fs::metadata(r.dest.join(day).join("f.txt"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        let mtime = |day: &str| fs::metadata(r.dest.join(day).join("f.txt")).unwrap().mtime();
+        assert_eq!(mode("20260101"), 0o644);
+        assert_eq!(mode("20260102"), 0o600);
+        assert_eq!(mtime("20260101"), mtime("20260102"));
+        assert_ne!(mtime("20260102"), mtime("20260103"));
+        assert!(!same_inode(
+            &r.dest.join("20260101/f.txt"),
+            &r.dest.join("20260102/f.txt")
+        ));
+    }
+
+    #[test]
+    fn renamed_file_is_restorable_from_both_generations() {
+        let r = repo();
+        write(&r.source.join("old-name.txt"), "payload");
+        run_gen(&r.source, &r.dest, "20260101", 3);
+
+        fs::rename(r.source.join("old-name.txt"), r.source.join("new-name.txt")).unwrap();
+        run_gen(&r.source, &r.dest, "20260102", 3);
+
+        // --link-dest matches by path, so a rename is a fresh copy (same as
+        // the previous cp -al + rsync behaviour without --fuzzy).
+        assert_eq!(read(&r.dest.join("20260101/old-name.txt")), "payload");
+        assert_eq!(read(&r.dest.join("20260102/new-name.txt")), "payload");
+        assert!(!r.dest.join("20260102/old-name.txt").exists());
+    }
+
+    #[test]
+    fn failed_backup_is_not_published_and_prunes_nothing() {
+        let r = repo();
+        write(&r.source.join("a.txt"), "a");
+        run_gen(&r.source, &r.dest, "20260101", 1);
+        let before = read(&r.dest.join("20260101/a.txt"));
+
+        let missing = r.source.with_file_name("does-not-exist");
+        let rc = run_gen(&missing, &r.dest, "20260102", 1);
+
+        assert_ne!(rc, 0);
+        assert!(!r.dest.join("20260102").exists());
+        assert_eq!(read(&r.dest.join("20260101/a.txt")), before);
         assert_eq!(
-            fs::read_to_string(&current_file).expect("read current"),
-            "current"
+            fs::read_link(r.dest.join("current")).unwrap(),
+            PathBuf::from("20260101")
         );
-        assert_eq!(current_before.dev(), current_after.dev());
-        assert_eq!(current_before.ino(), current_after.ino());
-        assert!(!same_inode(&previous_file, &current_file));
+    }
+
+    #[test]
+    fn retention_keeps_configured_generation_count() {
+        let r = repo();
+        write(&r.source.join("a.txt"), "a");
+        for (i, day) in ["20260101", "20260102", "20260103", "20260104"]
+            .into_iter()
+            .enumerate()
+        {
+            // Distinct sizes: same-size writes within one second look unchanged to rsync.
+            write(&r.source.join("day.txt"), &format!("{day}{}", "x".repeat(i)));
+            run_gen(&r.source, &r.dest, day, 2);
+        }
+
+        assert_eq!(gen_dirs(&r.dest), vec!["20260103", "20260104", "current"]);
+        // The shared file survives pruning of the generations it was linked from.
+        assert_eq!(read(&r.dest.join("20260103/a.txt")), "a");
+        assert!(read(&r.dest.join("20260104/day.txt")).starts_with("20260104"));
+        assert!(read(&r.dest.join("20260103/day.txt")).starts_with("20260103"));
+        assert_ne!(
+            read(&r.dest.join("20260103/day.txt")),
+            read(&r.dest.join("20260104/day.txt"))
+        );
+    }
+
+    #[test]
+    fn retention_never_deletes_the_current_generation() {
+        let r = repo();
+        for day in ["20260101", "20260102", "20260103"] {
+            fs::create_dir_all(r.dest.join(day)).unwrap();
+        }
+        // `current` points at the oldest name; it must survive pruning.
+        symlink("20260101", r.dest.join("current")).unwrap();
+
+        expire_old_backups(&gen_job(&r.source, 1), &r.dest, run_mode()).unwrap();
+
+        assert!(r.dest.join("20260101").exists());
+        assert!(!r.dest.join("20260102").exists());
+        assert!(r.dest.join("20260103").exists());
+    }
+
+    #[test]
+    fn links_against_legacy_cp_al_generation() {
+        let r = repo();
+        write(&r.source.join("a.txt"), "a");
+        write(&r.source.join("b.txt"), "b-v1");
+        // Seed a "legacy" generation: rsync it, then clone the way old releases did.
+        let seed = r.dest.parent().unwrap().join("seed");
+        let status = Command::new("rsync")
+            .arg("-ar")
+            .arg(format!("{}/", r.source.display()))
+            .arg(format!("{}/", seed.display()))
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let legacy = r.dest.join("20251231");
+        let status = Command::new("cp")
+            .arg("-al")
+            .arg(&seed)
+            .arg(&legacy)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        symlink("20251231", r.dest.join("current")).unwrap();
+
+        write(&r.source.join("b.txt"), "b-version-2");
+        run_gen(&r.source, &r.dest, "20260101", 5);
+
+        assert!(same_inode(
+            &legacy.join("a.txt"),
+            &r.dest.join("20260101/a.txt")
+        ));
+        assert!(!same_inode(
+            &legacy.join("b.txt"),
+            &r.dest.join("20260101/b.txt")
+        ));
+        assert_eq!(read(&legacy.join("b.txt")), "b-v1");
+    }
+
+    #[test]
+    fn stale_staging_is_discarded_when_a_base_exists() {
+        let r = repo();
+        write(&r.source.join("a.txt"), "a");
+        run_gen(&r.source, &r.dest, "20260101", 3);
+        write(&r.dest.join(generation::STAGING_NAME).join("junk.txt"), "junk");
+
+        run_gen(&r.source, &r.dest, "20260102", 3);
+
+        assert!(!r.dest.join("20260102/junk.txt").exists());
+        assert!(!r.dest.join(generation::STAGING_NAME).exists());
+    }
+
+    #[test]
+    fn initial_backup_resumes_partial_staging() {
+        let r = repo();
+        write(&r.source.join("a.txt"), "a");
+        write(&r.source.join("b.txt"), "b");
+        let staged = r.dest.join(generation::STAGING_NAME).join("a.txt");
+        write(&staged, "a");
+        let ino = fs::metadata(&staged).unwrap().ino();
+        let source_a = r.source.join("a.txt");
+        set_mtime(&staged, "2020-01-01 00:00:00");
+        set_mtime(&source_a, "2020-01-01 00:00:00");
+
+        run_gen(&r.source, &r.dest, "20260101", 3);
+
+        // Already-complete file kept as is; the rest completed.
+        assert_eq!(fs::metadata(r.dest.join("20260101/a.txt")).unwrap().ino(), ino);
+        assert_eq!(read(&r.dest.join("20260101/b.txt")), "b");
+    }
+
+    #[test]
+    fn same_day_rerun_replaces_generation_atomically() {
+        let r = repo();
+        write(&r.source.join("a.txt"), "v1");
+        run_gen(&r.source, &r.dest, "20260101", 3);
+        write(&r.source.join("a.txt"), "version-2");
+
+        run_gen(&r.source, &r.dest, "20260101", 3);
+
+        assert_eq!(read(&r.dest.join("20260101/a.txt")), "version-2");
+        assert_eq!(gen_dirs(&r.dest), vec!["20260101", "current"]);
+    }
+
+    #[test]
+    fn recovery_restores_generation_set_aside_by_interrupted_replace() {
+        let r = repo();
+        write(
+            &r.dest
+                .join(format!("{}20260101", generation::REPLACED_PREFIX))
+                .join("a.txt"),
+            "kept",
+        );
+
+        generation::recover_interrupted(&r.dest, run_mode()).unwrap();
+
+        assert_eq!(read(&r.dest.join("20260101/a.txt")), "kept");
+        assert_eq!(gen_dirs(&r.dest), vec!["20260101"]);
+    }
+
+    #[test]
+    fn recovery_removes_leftover_replaced_dir_when_replacement_landed() {
+        let r = repo();
+        write(&r.dest.join("20260101/a.txt"), "new");
+        write(
+            &r.dest
+                .join(format!("{}20260101", generation::REPLACED_PREFIX))
+                .join("a.txt"),
+            "old",
+        );
+
+        generation::recover_interrupted(&r.dest, run_mode()).unwrap();
+
+        assert_eq!(read(&r.dest.join("20260101/a.txt")), "new");
+        assert_eq!(gen_dirs(&r.dest), vec!["20260101"]);
+    }
+
+    #[test]
+    fn link_dest_base_is_absolute_and_ignores_non_symlink_current() {
+        let r = repo();
+        assert!(generation::link_dest_base(&r.dest).is_none());
+        fs::create_dir_all(r.dest.join("20260101")).unwrap();
+        symlink("20260101", r.dest.join("current")).unwrap();
+        let base = generation::link_dest_base(&r.dest).expect("base");
+        assert!(base.is_absolute());
+        assert!(base.ends_with("20260101"));
+
+        fs::remove_file(r.dest.join("current")).unwrap();
+        fs::create_dir_all(r.dest.join("current")).unwrap();
+        assert!(generation::link_dest_base(&r.dest).is_none());
     }
 }
