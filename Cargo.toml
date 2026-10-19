@@ -40,6 +40,7 @@ assets = [
   ["docs/recovery.md", "usr/share/doc/timevault/docs/recovery.md", "644"],
   ["docs/recreate.md", "usr/share/doc/timevault/docs/recreate.md", "644"],
   ["docs/relocation.md", "usr/share/doc/timevault/docs/relocation.md", "644"],
+  ["docs/remote-hashing.md", "usr/share/doc/timevault/docs/remote-hashing.md", "644"],
   ["docs/examples.md", "usr/share/doc/timevault/docs/examples.md", "644"],
   ["docs/design-rationale.md", "usr/share/doc/timevault/docs/design-rationale.md", "644"],
   ["LICENSE", "usr/share/doc/timevault/LICENSE", "644"],

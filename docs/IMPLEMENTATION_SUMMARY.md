@@ -33,7 +33,7 @@ Documentation: a `docs/` set (architecture, rotation strategies A to G, cascade,
 | The file index is per disk, built only from that disk, and never required | A disk stays usable on its own; corruption or loss costs time, never data | About 0.5 KB of disk per file and one walk of each new generation per run |
 | Moved files are offered to rsync as an extra read-only `--link-dest` of hard links | rsync never writes through a reference, so shared inodes cannot be modified, whatever changed at the source | An extra read-only pass per run |
 | Remote confirmation uses rsync's own checksum, not a script run as root on the remote | No remote code or scratch files, no shell parsing of file names | rsync's checksum is not SHA-256; only unique-move pairings are confirmed |
-| Folder moves trusted as a group; lone files checked; content comparison capped by size | Collective evidence is strong; bounds remote disk I/O | Huge files above the cap rely on a unique move unless `verify: hash` |
+| Folder moves trusted as a group; lone files checked; content comparison capped by size | Bounds remote disk I/O while avoiding reading whole moved folders | A trust decision, not a proof: a look-alike inside a moved folder, or a huge file above the cap, is accepted unless `verify: hash` is set. Superseded in design by remote hashing through rsync |
 | Retention protects the generation just published | Fixes `copies: 1` keeping two; safe because `current` is repaired after a crash | None found |
 | Moved-file detection on by default | Measured cost is small next to the saving on any reorganisation | A `.timevault-index` appears on every disk; `relocation: false` opts out |
 
@@ -78,7 +78,7 @@ The first mass-rename implementation took 55.7 s and saved nothing on uniform da
 | Previous generation comes from that disk's own history | Met | `previous_generation_*` tests; `strategy_d_*` checks inode links to the disk's own old generation |
 | Cascade avoids repeated remote transfers | Met by design; verified for correctness, not measured in bytes | Star topology; `remote_sources_over_real_ssh_cascade_and_reuse_moved_files` |
 | Every destination uses its own local reference and index | Met | `strategy_c_*`, `a_cascade_copy_reuses_moved_files_from_its_own_previous_generation` |
-| Relocated and renamed files reuse data without corrupting history | Met | Relocation tests, including look-alike files and a permission change on a moved file |
+| Relocated and renamed files reuse data without corrupting history | Met for every content-verified pairing. The default still trusts folder moves and files above `hashMaxSize` without reading them (a trust decision, not a proof), and `verify: size-mtime` trusts everything | Relocation tests, including look-alike files and a permission change on a moved file; `docs/remote-hashing.md` designs the way to prove the rest |
 | No completed generation is ever modified | Met | Bit-identical snapshots (mode, size, mtime, inode, contents) asserted after every crash point and every relocation scenario |
 | A failed backup cannot consume history through emergency pruning | Met | `a_full_disk_fails_the_run_and_deletes_nothing` with `copies: 1`; retention runs only after a successful publish |
 | Only the current target can be recreated | Met | `--recreate` takes no date; `recreate_refuses_a_day_older_than_the_newest_generation` |
@@ -89,7 +89,7 @@ The first mass-rename implementation took 55.7 s and saved nothing on uniform da
 
 ## Remaining limitations
 
-- **Remote ambiguity.** When thousands of renamed files share the same size and modification time, a remote source cannot tell them apart without reading them, so nothing is paired. A local source recovers them by content.
+- **Remote pairing is not fully content-proven.** Size and modification time are not proof of identity. For a remote source the default confirms lone files by checksum but trusts folder moves and files above `hashMaxSize`, and cannot pair thousands of renamed files that share a size and mtime. rsync can supply the hashes needed to fix all of this without a remote script (probed, not implemented): see [remote-hashing.md](remote-hashing.md). A local source is always proven by content.
 - **SSH overhead is measured on loopback only.** There was no real network latency or bandwidth limit; the figures show protocol and process cost. Cold caches, spinning disks and trees of millions of files were not measured.
 - **Index cost scales with all files, not changed files.** Recording a generation and advancing the index touch every row. Keying rows by generation and recording only changes would fix that. Extended attributes and ACLs are not captured in the index (rsync decides whether they match).
 - **A mount or lock error stops the run;** disks after it are not attempted. This is the existing behaviour, documented and now tested; no automatic fallback was added.
