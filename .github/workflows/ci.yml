@@ -32,3 +32,11 @@ jobs:
 
       - name: Test
         run: cargo test --locked
+
+      - name: Check user guide covers every CLI option
+        run: scripts/check-docs.sh
+
+      - name: Check YAML examples in docs parse
+        run: |
+          cargo build --locked
+          python3 scripts/check-docs-yaml.py

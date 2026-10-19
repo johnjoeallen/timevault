@@ -31,6 +31,14 @@ assets = [
   ["timevault.timer", "lib/systemd/system/timevault.timer", "644"],
   ["PACKAGING.md", "usr/share/doc/timevault/PACKAGING.md", "644"],
   ["README.md", "usr/share/doc/timevault/README.md", "644"],
+  ["USER_GUIDE.md", "usr/share/doc/timevault/USER_GUIDE.md", "644"],
+  ["docs/architecture.md", "usr/share/doc/timevault/docs/architecture.md", "644"],
+  ["docs/rotation.md", "usr/share/doc/timevault/docs/rotation.md", "644"],
+  ["docs/cascade.md", "usr/share/doc/timevault/docs/cascade.md", "644"],
+  ["docs/retention-capacity.md", "usr/share/doc/timevault/docs/retention-capacity.md", "644"],
+  ["docs/recovery.md", "usr/share/doc/timevault/docs/recovery.md", "644"],
+  ["docs/examples.md", "usr/share/doc/timevault/docs/examples.md", "644"],
+  ["docs/design-rationale.md", "usr/share/doc/timevault/docs/design-rationale.md", "644"],
   ["LICENSE", "usr/share/doc/timevault/LICENSE", "644"],
 ]
 maintainer-scripts = "debian"

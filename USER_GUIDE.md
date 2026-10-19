@@ -10,6 +10,12 @@ Timevault is built around a few principles:
 ## Other docs
 - [README](README.md)
 - [Packaging](PACKAGING.md)
+- [Architecture overview](docs/architecture.md): how generations, hard links, staging and cascade work.
+- [Disk rotation guide](docs/rotation.md): single-disk, two-disk and multi-disk arrangements and how to choose.
+- [Cascade guide](docs/cascade.md): copying one finished backup to other connected disks.
+- [Retention and capacity](docs/retention-capacity.md): `copies` versus calendar days, and how space is used.
+- [Recovery guide](docs/recovery.md): restores, failed backups, replacing a disk, running out of space.
+- [Operational examples](docs/examples.md) and [Design rationale](docs/design-rationale.md).
 
 ## Configuration
 Timevault reads a YAML config file (default `/etc/timevault.yaml`).
@@ -332,7 +338,7 @@ By default Timevault uses `/usr/sbin/sendmail -t`; set `options.report.sendmail`
 
 ## Job disk allowlists (`diskIds`)
 - If `diskIds` is set for a job, it will only run on those disks.
-- Without `--disk-id`, Timevault chooses the first connected disk in that list as the primary and cascades to the other connected disks in the list.
+- Without `--disk-id`, Timevault chooses the first eligible connected disk (in `backupDisks` order) that appears in that list as the primary and, with cascade, cascades to the other connected disks in the list.
 - With `--disk-id`, only jobs that include that disk in `diskIds` will run.
 - Disks with `disabled: true` are never used for backups.
 - Disks with `rotatedOut: true` are skipped by automatic selection and cascade planning, but can still be targeted with `--disk-id`.

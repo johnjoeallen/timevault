@@ -22,4 +22,5 @@ Timevault is a safe, rsync-based backup tool built for people who want dependabl
 
 ## Documentation
 - [User Guide](USER_GUIDE.md): configuration, commands, setup workflow, and systemd usage.
+- [Architecture](docs/architecture.md), [Disk rotation](docs/rotation.md), [Cascade](docs/cascade.md), [Retention and capacity](docs/retention-capacity.md), [Recovery](docs/recovery.md), [Examples](docs/examples.md) and [Design rationale](docs/design-rationale.md).
 - [Packaging](PACKAGING.md): build and install instructions for `.deb` and local installs.

@@ -13,6 +13,8 @@ Running record of changes, decisions and findings for the work described in [PLA
 | D5 | Remote hash tier extends the existing pristine helper pattern | 2026-10-19 | Backups already depend on root-to-root SSH keys. Helper input must be NUL-delimited, regular files only, no symlink following. |
 | D6 | Different jobs may run in parallel; users keep their directories non-overlapping | 2026-10-19 | Per-job locks already allow it. New shared state (index, caches) must be parallel-safe. |
 | D7 | Index is `rusqlite` with `bundled`; hash cache keyed `(dev, ino, size, mtime_ns)`, never `ctime` | 2026-10-19 | Hard-linking bumps `ctime`. |
+| D8 | Index lives at `<disk>/.timevault-index/file-index.sqlite` | 2026-10-19 | `<disk>/.timevault` is the identity file, not a directory, so the originally planned path was impossible. |
+| D9 | User docs describe only shipped behaviour; planned features are listed under "Not available yet" | 2026-10-19 | Checked in CI by `scripts/check-docs.sh` and `scripts/check-docs-yaml.py`. |
 
 ## Findings about the existing code
 
@@ -25,6 +27,11 @@ Running record of changes, decisions and findings for the work described in [PLA
 - `run_backup_job` writes its excludes file to `$HOME/tmp/timevault.<job>.excludes`, which blocks safe full-run tests.
 - `cargo fmt --check` already failed on `main` (formatting drift in `generation.rs` and a few test lines in `mod.rs`).
 - `run_pristine_only` does take the per-job lock (an early concern that it did not was wrong).
+- `<disk>/.timevault` is a YAML identity file at the disk root (`src/disk/identity.rs`).
+- Without `--cascade`, only each job's primary disk receives a backup; a second connected disk gets nothing.
+- Each job's primary is the first eligible connected disk allowed for it, in `backupDisks` order (not `diskIds` order).
+- rsync exit 24 maps to `Success` (`status_for_rsync_code`); the `Partial` status is currently unused by that path.
+- Suspected bug (read from code, not run): with `--disk-id <id> --cascade`, the cascade targets come from all connected disks and are not filtered for `disabled` or `rotatedOut`, unlike automatic runs. To confirm with a test and fix.
 - Same-size, same-second edits are invisible to rsync's quick check; tests must change file length or mtime.
 
 ## Change log
@@ -38,7 +45,16 @@ Running record of changes, decisions and findings for the work described in [PLA
 
 Deviations from the plan: the harness is in-crate test fixtures, not a `tests/` directory (private `sync_generation`, `/var/run` locks). Unrelated formatting drift in `generation.rs` was left alone to keep commits focused.
 
-### Phase 1 onwards
+### Phase 1: docs foundation (docs only; no version bump)
+
+- Added `docs/architecture.md` (layout, generation lifecycle, Mermaid workflow, hard-link behaviour, per-disk previous generation, parallel jobs), `rotation.md` (how disks are chosen; Strategies A to G; choosing guide), `cascade.md` (star topology, success dependencies, SSH examples), `retention-capacity.md` (frequency vs `copies` vs rotation, coverage calculations, capacity behaviour, out-of-space procedure), `recovery.md`, `examples.md` (eight scenarios), `design-rationale.md`.
+- Linked from `README.md` and `USER_GUIDE.md`; corrected the `diskIds` primary-selection sentence to say `backupDisks` order. `USER_GUIDE.md` and the seven pages are now in the deb assets (`USER_GUIDE.md` was linked from the README but not shipped before).
+- `scripts/check-docs.sh` fails if a flag in `--help` is missing from `USER_GUIDE.md`; `scripts/check-docs-yaml.py` runs every complete YAML example through the real config loader. Both run in CI. Both were checked to fail on a bad input.
+- Docs deliberately omit the index, relocation, recreate and index-rebuild procedures until they ship.
+- Coverage figures in the retention page (for example, 20 generations on a daily, two-of-three disk rotation spans about 30 days) were computed by hand from the generations-per-day rate; they are illustrative.
+- Not verified by running: restore commands (`disk mount`, `disk ls <disk>:/path`) were written from the CLI help and User Guide, not executed against a real disk.
+
+### Phase 2 onwards
 
 Not started.
 
@@ -46,4 +62,5 @@ Not started.
 
 - Test override for the `$HOME/tmp` excludes location, needed for full `run_backup_for_day` tests.
 - Formatting drift on `main` (`cargo fmt --check` fails); a separate formatting commit is needed before CI is clean.
+- Confirm and fix the `--disk-id --cascade` eligibility gap (a disabled or rotated-out disk may receive a cascade).
 - Verify the pristine helper's handling of unusual file names and file types before reusing it in Phase 5.
