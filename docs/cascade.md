@@ -41,7 +41,7 @@ Disks keep independent histories. Nothing is copied between them except the one 
 - If the cascade source directory is missing even though the primary succeeded, the run stops and reports an error.
 - A job failing on one downstream disk is recorded in the report for that disk; later disks and jobs still run.
 - A disk that cannot be mounted or verified, or a lock error, stops the run. Disks later in the order are not processed.
-- Each disk has its own section in the backup report, so you can see exactly which disk and job succeeded.
+- Each disk has its own section in the backup report, so you can see exactly which disk and job succeeded. The run output also ends with one line per job, for example `cascade summary for job web1: 2 of 3 disks complete (usb-a: success, usb-b: failed, usb-c: success)`. A disk the run never reached shows as `not run`.
 - Timevault does **not** fall back to the original source if the primary stage fails.
 
 Wake-on-LAN, suspend inhibition and remote hooks apply only to the primary stage. Cascaded jobs read a local path and ignore them.

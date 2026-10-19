@@ -35,7 +35,7 @@ The original source is read once; other disks copy from the primary's finished g
 
 A generation is built in a staging directory and renamed into place only after rsync succeeds.
 
-- **Why:** a generation name always means a complete tree; a crash or failed run leaves no half-backup that looks like a recovery point.
+- **Why:** a generation name always means a complete tree; a crash or failed run leaves no half-backup that looks like a recovery point. Data is flushed to disk before the completion marker is added, and the marker is added by rename, so a power loss cannot leave a marked generation whose data was never written.
 - **Cost:** the in-progress tree needs real room until it is published.
 
 ## Completed generations are never modified

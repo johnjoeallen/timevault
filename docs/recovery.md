@@ -77,6 +77,18 @@ Timevault never deletes completed generations to make room. See [Out of space](r
 
 `timevault disk check [<disk>]` verifies that connected disks have a `.timevault` identity matching the config. `timevault disk df` reports free space.
 
-## Interrupted publication
+## Interrupted runs
 
-If the machine loses power during a same-day replacement, the next run for that job restores or cleans up `.timevault-replaced-<day>` automatically before doing anything else. A generation under its final `YYYYMMDD` name is always one that was published successfully by a current release; a partial directory left by a very old release may still be present and counts toward `copies` until it is replaced.
+No manual repair is needed. At the start of each run for a job, Timevault resolves whatever an interruption left behind before it does anything else:
+
+| Interrupted at | State left behind | What the next run does |
+|---|---|---|
+| During rsync | partial `.timevault-staging` | discards it (a first backup resumes it) |
+| After rsync, before publishing | complete but unpublished `.timevault-staging` | discards it and builds again |
+| During a same-day replacement | `.timevault-publishing`, possibly the old generation under `.timevault-staging` or `.timevault-replaced-<day>` | keeps whichever generation was fully in place, removes the other, deletes the note |
+| After publishing, before `current` moves | `current` points at the previous generation | points `current` at the newest finished generation |
+| During retention | some old generations already deleted | deletes the rest on the next successful run |
+
+In every case completed generations are left exactly as they were. A generation under its final `YYYYMMDD` name was published successfully by a current release; a partial directory left by a very old release may still be present and counts toward `copies` until it is replaced.
+
+With `--safe`, nothing is deleted: displaced directories stay as `.timevault-replaced-<day>` until you remove them.

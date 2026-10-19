@@ -87,7 +87,7 @@ If the disk fills during a run, rsync fails (typically with exit code 11 and a "
 
 - publishes nothing and leaves `current` where it was,
 - prunes nothing, and
-- records a failed job with the rsync exit code and message in the report.
+- records a failed job in the report with the rsync exit code and message, followed by "the backup disk is out of space: no generation was published and no completed generation was deleted".
 
 Completed generations stay intact. Timevault does not delete old generations to make room. The partial staging directory is discarded on the next run when a previous generation exists.
 

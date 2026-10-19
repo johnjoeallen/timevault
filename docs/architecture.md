@@ -18,7 +18,11 @@ Each backup disk is an independent repository. Inside it, every job has its own 
     current -> 20261019       symlink to the latest completed generation
     .timevault-staging/       in-progress generation (exists only during a run)
     .timevault-replaced-<day>/  transient, only during a same-day replacement
+    .timevault-publishing     transient note used to finish an interrupted same-day replacement
+    .timevault-current.tmp    transient link renamed over `current`
 ```
+
+Each published generation also contains a small `.timevault-complete` file at its top level. It is written just before the generation is published and holds a random token, so its presence means the generation was finished and published by Timevault. It appears when you browse or restore a generation and can be ignored.
 
 - A generation is named after the **backup day**, which is the calendar day *before* the run starts. A run at 02:00 on 20 October writes `20261019`.
 - `current` is only moved after a generation has been published successfully.
@@ -31,9 +35,11 @@ Each backup disk is an independent repository. Inside it, every job has its own 
 3. **Pick the link-dest base.** The base is the directory `current` points to *on this disk, for this job*. If there is none, the run is a full initial backup.
 4. **Prepare staging.** A leftover `.timevault-staging` is discarded when there is a base (its files could be hard links into completed generations). For an initial backup it is kept and rsync resumes into it.
 5. **Run rsync** into `.timevault-staging` with `-ar --stats`, `--exclude-from`, `--link-dest=<base>`, and, unless `--safe`, `--delete-after --delete-excluded`. It retries up to three times. Exit code 0, or 24 (files vanished during the run), counts as success.
-6. **Publish.** On success the staging directory is renamed to `<job>/<backup day>`. The rename is atomic on one filesystem, so an incomplete generation is never visible under a generation name.
+6. **Finish and publish.** On success the staged data is flushed to disk, `.timevault-complete` is added, and the staging directory is renamed to `<job>/<backup day>`. The rename is atomic on one filesystem, so an incomplete generation is never visible under a generation name, and the marker never exists before the data is on disk. If that day's generation already exists (a same-day re-run), the two directories are swapped in a single step (`renameat2` with `RENAME_EXCHANGE`) where the filesystem supports it, so the day's name never disappears; otherwise the old one is set aside first. The displaced old generation is removed afterwards.
 7. **Retention.** Only after publishing, the oldest generations beyond `copies` are deleted. The generation `current` points to is never deleted.
-8. **Move `current`** to the new generation, then run post-hooks.
+8. **Move `current`** to the new generation by renaming a temporary link over it, so `current` is never missing or half-written. Then run post-hooks.
+
+At the start of every run, Timevault first finishes or undoes any interrupted replacement, then checks `current`: if it is missing, dangling, or older than the newest generation carrying a completion marker (a run was interrupted after publishing but before moving `current`), it is pointed at that generation. Generations from releases that predate the marker are not chosen by this repair.
 
 If rsync fails, nothing is published, `current` does not move, and nothing is pruned. Completed generations are never written to.
 
@@ -83,4 +89,4 @@ Two `timevault` processes may run **different** jobs at the same time, even agai
 
 ## Not available yet
 
-These are planned and are **not** part of the current behaviour: a disk-local content index, detection of moved or renamed files, an explicit way to recreate the current day's generation, and automatic crash recovery beyond the same-day replacement repair. The plan is in [PLAN.md](PLAN.md).
+These are planned and are **not** part of the current behaviour: a disk-local content index, detection of moved or renamed files, and an explicit way to recreate the current day's generation. The plan is in [PLAN.md](PLAN.md).

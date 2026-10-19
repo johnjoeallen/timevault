@@ -342,6 +342,58 @@ fn cascade_job_eligible(primary_status: Option<BackupJobStatus>) -> bool {
     primary_status.is_some_and(BackupJobStatus::produced_snapshot)
 }
 
+/// One line per job saying which disks completed it, so a partially
+/// successful cascade is visible in the run output. `expected` lists the
+/// primary first, then each downstream disk planned for this run; a disk with
+/// no report for a job (skipped, or the run stopped before reaching it) shows
+/// as `not run`.
+fn summarize_cascade(expected: &[String], reports: &[BackupRunReport]) -> Vec<String> {
+    let Some(primary) = expected
+        .first()
+        .and_then(|id| reports.iter().find(|report| &report.disk_id == id))
+    else {
+        return Vec::new();
+    };
+    primary
+        .jobs
+        .iter()
+        .map(|job| {
+            let mut complete = 0;
+            let parts: Vec<String> = expected
+                .iter()
+                .map(|disk_id| {
+                    let status = reports
+                        .iter()
+                        .find(|report| &report.disk_id == disk_id)
+                        .and_then(|report| report.jobs.iter().find(|j| j.name == job.name))
+                        .map(|j| j.status);
+                    if status.is_some_and(BackupJobStatus::produced_snapshot) {
+                        complete += 1;
+                    }
+                    format!(
+                        "{}: {}",
+                        disk_id,
+                        status.map_or("not run", BackupJobStatus::as_str)
+                    )
+                })
+                .collect();
+            format!(
+                "cascade summary for job {}: {} of {} disks complete ({})",
+                job.name,
+                complete,
+                expected.len(),
+                parts.join(", ")
+            )
+        })
+        .collect()
+}
+
+fn log_cascade_summary(expected: &[String], reports: &[BackupRunReport]) {
+    for line in summarize_cascade(expected, reports) {
+        crate::pnote!("{}", line);
+    }
+}
+
 /// Warning for a disk still carrying the deprecated `rotatedOut` flag.
 pub fn rotated_out_deprecation_warning(disk_id: &str) -> String {
     format!(
@@ -378,6 +430,7 @@ fn run_jobs_for_primary(
 ) -> Result<Option<(i32, String)>> {
     let (primary_guard, primary_mount) = mount_and_verify(primary_disk, mount_base, run_mode)?;
     let primary_current_base = primary_mount.clone();
+    let first_report = reports.len();
 
     if let Some((code, message)) = run_backup_checked(
         primary_disk.disk_id.clone(),
@@ -408,7 +461,10 @@ fn run_jobs_for_primary(
             })
             .unwrap_or_default();
 
-        for stage in plan_cascade(primary_disk, &jobs, connected) {
+        let stages = plan_cascade(primary_disk, &jobs, connected);
+        let mut expected = vec![primary_disk.disk_id.clone()];
+        expected.extend(stages.iter().map(|stage| stage.disk.disk_id.clone()));
+        for stage in stages {
             let disk = &stage.disk;
             let (guard, mountpoint) = mount_and_verify(disk, mount_base, run_mode)?;
             let mut cascaded_jobs = Vec::new();
@@ -463,10 +519,12 @@ fn run_jobs_for_primary(
             ) {
                 drop(guard);
                 drop(primary_guard);
+                log_cascade_summary(&expected, &reports[first_report..]);
                 return Ok(Some((code, message)));
             }
             drop(guard);
         }
+        log_cascade_summary(&expected, &reports[first_report..]);
     }
 
     drop(primary_guard);
@@ -677,6 +735,90 @@ mod tests {
             stage_summary(&stages),
             vec![("c".to_string(), vec!["etc".to_string()])]
         );
+    }
+
+    fn run_report(disk_id: &str, jobs: &[(&str, BackupJobStatus)]) -> BackupRunReport {
+        let now = Local::now();
+        BackupRunReport {
+            disk_id: disk_id.to_string(),
+            mountpoint: format!("/mnt/{disk_id}"),
+            started_at: now,
+            finished_at: now,
+            jobs: jobs
+                .iter()
+                .map(|(name, status)| crate::backup::report::BackupJobReport {
+                    name: name.to_string(),
+                    description: None,
+                    source: "/".to_string(),
+                    destination: String::new(),
+                    backup_day: "20261019".to_string(),
+                    status: *status,
+                    attempts: 1,
+                    rsync_code: Some(0),
+                    failure_reason: None,
+                    power: None,
+                    power_diagnostics: None,
+                })
+                .collect(),
+        }
+    }
+
+    fn ids(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|id| id.to_string()).collect()
+    }
+
+    #[test]
+    fn cascade_summary_reports_full_success() {
+        let reports = vec![
+            run_report("a", &[("etc", BackupJobStatus::Success)]),
+            run_report("b", &[("etc", BackupJobStatus::Success)]),
+        ];
+        assert_eq!(
+            summarize_cascade(&ids(&["a", "b"]), &reports),
+            vec!["cascade summary for job etc: 2 of 2 disks complete (a: success, b: success)"]
+        );
+    }
+
+    #[test]
+    fn cascade_summary_shows_a_failed_downstream_disk() {
+        let reports = vec![
+            run_report("a", &[("etc", BackupJobStatus::Success)]),
+            run_report("b", &[("etc", BackupJobStatus::Failed)]),
+            run_report("c", &[("etc", BackupJobStatus::Success)]),
+        ];
+        assert_eq!(
+            summarize_cascade(&ids(&["a", "b", "c"]), &reports),
+            vec![
+                "cascade summary for job etc: 2 of 3 disks complete (a: success, b: failed, c: success)"
+            ]
+        );
+    }
+
+    #[test]
+    fn cascade_summary_marks_disks_the_run_never_reached() {
+        // The run stopped (for example a mount error) before disk c.
+        let reports = vec![
+            run_report(
+                "a",
+                &[
+                    ("etc", BackupJobStatus::Success),
+                    ("home", BackupJobStatus::Failed),
+                ],
+            ),
+            run_report("b", &[("etc", BackupJobStatus::Success)]),
+        ];
+        assert_eq!(
+            summarize_cascade(&ids(&["a", "b", "c"]), &reports),
+            vec![
+                "cascade summary for job etc: 2 of 3 disks complete (a: success, b: success, c: not run)",
+                "cascade summary for job home: 0 of 3 disks complete (a: failed, b: not run, c: not run)",
+            ]
+        );
+    }
+
+    #[test]
+    fn cascade_summary_is_empty_without_a_primary_report() {
+        assert!(summarize_cascade(&ids(&["a", "b"]), &[]).is_empty());
     }
 
     #[test]

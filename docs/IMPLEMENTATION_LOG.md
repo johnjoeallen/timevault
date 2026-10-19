@@ -15,8 +15,10 @@ Running record of changes, decisions and findings for the work described in [PLA
 | D7 | Index is `rusqlite` with `bundled`; hash cache keyed `(dev, ino, size, mtime_ns)`, never `ctime` | 2026-10-19 | Hard-linking bumps `ctime`. |
 | D8 | Index lives at `<disk>/.timevault-index/file-index.sqlite` | 2026-10-19 | `<disk>/.timevault` is the identity file, not a directory, so the originally planned path was impossible. |
 | D9 | User docs describe only shipped behaviour; planned features are listed under "Not available yet" | 2026-10-19 | Checked in CI by `scripts/check-docs.sh` and `scripts/check-docs-yaml.py`. |
-| D11 | `rotatedOut` and `disk rotate-in/rotate-out` are deprecated: still work, print a warning, removed at the next major version | 2026-10-19 | There is no rotation concept in Timevault: users connect or disconnect enrolled disks. To stop writing to a connected disk use `disable`, which still allows mount, inspect, ls and df. |
 | D10 | A `disabled` disk never receives a cascade; `rotatedOut` is not filtered in the cascade planner | 2026-10-19 | A disk that is unplugged is rotated out by being absent. The `rotatedOut` flag only removes a connected disk from automatic primary selection. |
+| D11 | `rotatedOut` and `disk rotate-in/rotate-out` are deprecated: still work, print a warning, removed at the next major version | 2026-10-19 | There is no rotation concept in Timevault: users connect or disconnect enrolled disks. To stop writing to a connected disk use `disable`, which still allows mount, inspect, ls and df. |
+| D12 | Publication uses a completion marker (`.timevault-complete`, content = per-run token), written by rename after a `syncfs` of the staging filesystem | 2026-10-19 | The marker is atomic with publish and replaced by rename, never rewritten in place, because a cascade source tree can carry its own marker that rsync hard-links from an older generation. |
+| D13 | Same-day replacement uses `renameat2(RENAME_EXCHANGE)` journalled by `.timevault-publishing`; fall back to set-aside where unsupported | 2026-10-19 | Recovery decides by whether the intent's token is now in the final directory. |
 
 ## Findings about the existing code
 
@@ -66,7 +68,23 @@ Deviations from the plan: the harness is in-crate test fixtures, not a `tests/` 
 - Tests: warning text, planner does not filter on `rotatedOut`, and a disabled disk can still be selected for mounting (`select_disk_from_connected`).
 - Removal is left to the next major version, which is managed manually.
 
-### Phase 2 onwards
+### Phase 2: publication hardening (1.14.4, fix)
+
+- `src/backup/generation.rs`: completion marker and `finalize_staging` (flush, then stamp by rename); atomic `update_current` (temp symlink renamed over `current`, honouring dry-run, safe mode and a real-directory `current`); `repair_current` (missing, dangling or behind the newest marked generation); same-day replacement through `renameat2(RENAME_EXCHANGE)` with the `.timevault-publishing` intent and the set-aside fallback; `recover_exchange` resolves an interrupted swap by checking which directory holds the intent's token; `prepare_staging` always discards a marked staging directory; internal names extended. Test-only `failpoint` module simulates a crash at a named step.
+- `src/backup/mod.rs`: `sync_generation` repairs `current` first, finalizes before publishing and exposes `before-publish` / `after-publish` / `mid-prune` fail points; `run_backup_job` uses `update_current`; out-of-space rsync failures now say the disk is out of space, nothing was published and no completed generation was deleted.
+- `src/cli/commands/backup.rs`: per-job cascade summary line (`N of M disks complete (disk: status, ...)`, `not run` for disks never reached), logged after a cascade and when it aborts.
+- 19 new tests. Crash tests cover: during rsync (partial staging holding hard links into a completed generation), before publish, after publish before `current` moves, between the temp link and its rename, before the exchange, after the exchange, after the set-aside, the aside fallback (normal and crashed), mid-retention, a marked staging with no base, and a marker that rsync hard-linked from an earlier generation. Each asserts completed generations are bit-identical (mode, size, mtime, inode, contents). The exchange tests ran here (not skipped) and skip themselves if a filesystem lacks `RENAME_EXCHANGE`. Disabling the `current` repair makes the matching test fail.
+- Docs: `architecture.md` (marker, flush, exchange, repair), `recovery.md` (interrupted-runs table), `retention-capacity.md`, `cascade.md`, `design-rationale.md`, and the "Snapshot generations" section of `USER_GUIDE.md`.
+
+Notes and limits:
+- `syncfs` flushes the whole staging filesystem, including other parallel jobs' dirty data; accepted as the price of never publishing unflushed data.
+- Pre-publish validation is limited to: rsync exit code, staging is a directory, data flushed, marker written. Deeper tree validation is not done.
+- Generations from releases before the marker are never chosen by `repair_current`; a repository with no marked generation and a bad `current` still gets a full backup, as before.
+- With `--safe`, a leftover staging directory is still resumed into (existing behaviour), which can write through hard links into completed generations; not changed here.
+- The cascade summary is in the run output only, not in the emailed report.
+- Mid-rsync kills were simulated by a pre-built partial staging tree, not by killing a real rsync.
+
+### Phase 3 onwards
 
 Not started.
 

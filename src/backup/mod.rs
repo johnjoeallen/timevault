@@ -4,7 +4,6 @@ use std::ffi::CStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, ToSocketAddrs, UdpSocket};
-use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
@@ -429,44 +428,13 @@ fn run_backup_job(
     }
 
     if rsync_ok && backup_dir.exists() {
-        let current_link = dest.join("current");
-        if let Ok(meta) = fs::symlink_metadata(&current_link) {
-            if meta.file_type().is_symlink() || meta.is_file() {
-                if run_mode.safe_mode || run_mode.dry_run {
-                    if run_mode.dry_run {
-                        crate::pnote!("dry-run: rm -f {}", current_link.display());
-                    } else {
-                        crate::pnote!("skip remove (safe-mode): {}", current_link.display());
-                    }
-                } else {
-                    fs::remove_file(&current_link).map_err(|err| {
-                        TimevaultError::message(format!(
-                            "remove current link {}: {}",
-                            current_link.display(),
-                            err
-                        ))
-                    })?;
-                }
-            } else if meta.is_dir() {
-                crate::pnote!(
-                    "skip updating current (directory exists): {}",
-                    current_link.display()
-                );
-            }
-        }
-        if !current_link.exists() {
-            if run_mode.dry_run {
-                crate::pnote!("dry-run: ln -s {} {}", backup_day, current_link.display());
-            } else {
-                symlink(backup_day, &current_link).map_err(|err| {
-                    TimevaultError::message(format!(
-                        "create current link {}: {}",
-                        current_link.display(),
-                        err
-                    ))
-                })?;
-            }
-        }
+        generation::update_current(&dest, backup_day, run_mode).map_err(|err| {
+            TimevaultError::message(format!(
+                "update current link {}: {}",
+                dest.join("current").display(),
+                err
+            ))
+        })?;
     }
     let mut status = status_for_rsync_code(rc);
     if let Some(script_result) = run_remote_job_script(
@@ -616,11 +584,17 @@ fn status_for_rsync_code(rc: i32) -> BackupJobStatus {
 
 fn rsync_failure_reason(exit_code: i32, stderr: &str) -> String {
     let stderr = stderr.split_whitespace().collect::<Vec<_>>().join(" ");
-    if stderr.is_empty() {
+    let mut reason = if stderr.is_empty() {
         format!("rsync failed with exit code {}", exit_code)
     } else {
         format!("rsync failed with exit code {}: {}", exit_code, stderr)
+    };
+    if stderr.contains("No space left on device") {
+        reason.push_str(
+            " (the backup disk is out of space: no generation was published and no completed generation was deleted)",
+        );
     }
+    reason
 }
 
 fn script_failure_reason(kind: &str, exit_code: i32, stderr: &str) -> String {
@@ -3084,6 +3058,7 @@ fn expire_old_backups(job: &Job, dest: &Path, run_mode: RunMode) -> io::Result<(
             } else {
                 crate::pnote!("delete: {}", target.display());
                 fs::remove_dir_all(&target)?;
+                generation::failpoint_hit("mid-prune")?;
             }
         } else {
             crate::pnote!("skip non-dir delete: {}", target.display());
@@ -3115,6 +3090,7 @@ fn sync_generation(
         fs::create_dir_all(dest)?;
     }
     generation::recover_interrupted(dest, run_mode)?;
+    generation::repair_current(dest, run_mode)?;
     let base = generation::link_dest_base(dest);
     match &base {
         Some(base) if run_mode.verbose => {
@@ -3162,14 +3138,18 @@ fn sync_generation(
     }
 
     if rc == 0 || rc == 24 {
-        generation::publish(dest, &staging, backup_day, run_mode).map_err(|err| {
+        let publish_error = |err: io::Error| {
             TimevaultError::message(format!(
                 "publish {} as {}: {}",
                 staging.display(),
                 dest.join(backup_day).display(),
                 err
             ))
-        })?;
+        };
+        generation::finalize_staging(&staging, run_mode).map_err(publish_error)?;
+        generation::failpoint_hit("before-publish").map_err(publish_error)?;
+        generation::publish(dest, &staging, backup_day, run_mode).map_err(publish_error)?;
+        generation::failpoint_hit("after-publish").map_err(publish_error)?;
         crate::pstatus!("{}: pruning old snapshots", job.name);
         if let Err(err) = expire_old_backups(job, dest, run_mode) {
             crate::pnote!("warning: pruning old snapshots failed: {}", err);
@@ -3266,7 +3246,7 @@ fn acquire_lock_for_job(job_name: &str, run_mode: RunMode) -> Result<Option<Lock
 mod tests {
     use super::*;
     use crate::types::RunPolicy;
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 
     fn job(source: &str) -> Job {
         Job {
@@ -4248,7 +4228,7 @@ mod tests {
     fn rsync_failure_reason_includes_stderr() {
         assert_eq!(
             rsync_failure_reason(11, "rsync: write failed: No space left on device\n"),
-            "rsync failed with exit code 11: rsync: write failed: No space left on device"
+            "rsync failed with exit code 11: rsync: write failed: No space left on device (the backup disk is out of space: no generation was published and no completed generation was deleted)"
         );
     }
 
@@ -4362,9 +4342,7 @@ mod tests {
         )
         .expect("sync_generation");
         if outcome.rc == 0 || outcome.rc == 24 {
-            let current = dest.join("current");
-            let _ = fs::remove_file(&current);
-            symlink(day, &current).expect("current link");
+            generation::update_current(dest, day, run_mode()).expect("current link");
         }
         outcome.rc
     }
@@ -4905,5 +4883,402 @@ mod tests {
         // Earlier generations on the returning disk are unchanged.
         assert_eq!(read(&d.job_dir(0, "etc").join("20261003/a.txt")), "v1");
         assert_eq!(read(&d.job_dir(0, "etc").join("20261015/a.txt")), "v333");
+    }
+
+    // ---- crash recovery: interruptions at each publication step ----
+
+    use std::collections::BTreeMap;
+
+    /// Every entry under `dir` with its mode, size, mtime, inode and (for
+    /// files) contents, so a test can prove a generation is bit-identical.
+    fn snapshot(dir: &Path) -> BTreeMap<String, String> {
+        fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, String>) {
+            for entry in fs::read_dir(dir).expect("read_dir") {
+                let path = entry.expect("entry").path();
+                let meta = fs::symlink_metadata(&path).expect("meta");
+                let rel = path.strip_prefix(root).unwrap().display().to_string();
+                let content = if meta.is_file() {
+                    fs::read_to_string(&path).unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                out.insert(
+                    rel,
+                    format!(
+                        "{:o}|{}|{}.{}|{}|{}",
+                        meta.mode(),
+                        meta.len(),
+                        meta.mtime(),
+                        meta.mtime_nsec(),
+                        meta.ino(),
+                        content
+                    ),
+                );
+                if meta.is_dir() {
+                    walk(root, &path, out);
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        walk(dir, dir, &mut out);
+        out
+    }
+
+    fn try_run_gen(source: &Path, dest: &Path, day: &str, copies: usize) -> Result<i32> {
+        let excludes = dest.with_extension("excludes");
+        fs::write(&excludes, "").expect("excludes");
+        let outcome = sync_generation(
+            &gen_job(source, copies),
+            dest,
+            day,
+            &excludes,
+            &[],
+            run_mode(),
+        )?;
+        if outcome.rc == 0 || outcome.rc == 24 {
+            generation::update_current(dest, day, run_mode())?;
+        }
+        Ok(outcome.rc)
+    }
+
+    fn current_target(dest: &Path) -> Option<String> {
+        fs::read_link(dest.join("current"))
+            .ok()
+            .map(|t| t.to_string_lossy().to_string())
+    }
+
+    /// A job with two published generations (20260101, 20260102) and their
+    /// snapshots, to compare against after each simulated crash.
+    fn two_generations() -> (Repo, BTreeMap<String, String>, BTreeMap<String, String>) {
+        let r = repo();
+        write(&r.source.join("a.txt"), "one");
+        write(&r.source.join("dir/b.txt"), "bee");
+        assert_eq!(run_gen(&r.source, &r.dest, "20260101", 10), 0);
+        write(&r.source.join("a.txt"), "two!");
+        assert_eq!(run_gen(&r.source, &r.dest, "20260102", 10), 0);
+        let first = snapshot(&r.dest.join("20260101"));
+        let second = snapshot(&r.dest.join("20260102"));
+        (r, first, second)
+    }
+
+    fn exchange_supported() -> bool {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
+        fs::create_dir(&a).unwrap();
+        fs::create_dir(&b).unwrap();
+        let supported = matches!(generation::exchange_probe(&a, &b), Ok(true));
+        if !supported {
+            eprintln!("RENAME_EXCHANGE unsupported here; skipping");
+        }
+        supported
+    }
+
+    #[test]
+    fn crash_during_rsync_leaves_completed_generations_untouched() {
+        let (r, first, second) = two_generations();
+        // A killed rsync leaves a partial staging tree whose files may already
+        // be hard links into the previous generation.
+        let staged = r.dest.join(generation::STAGING_NAME);
+        fs::create_dir_all(&staged).unwrap();
+        fs::hard_link(r.dest.join("20260102/a.txt"), staged.join("a.txt")).unwrap();
+        write(&staged.join("partial.tmp"), "half");
+
+        write(&r.source.join("a.txt"), "three!!");
+        assert_eq!(run_gen(&r.source, &r.dest, "20260103", 10), 0);
+
+        assert_eq!(snapshot(&r.dest.join("20260101")), first);
+        assert_eq!(snapshot(&r.dest.join("20260102")), second);
+        assert!(!r.dest.join("20260103/partial.tmp").exists());
+        assert_eq!(read(&r.dest.join("20260102/a.txt")), "two!");
+        assert_eq!(read(&r.dest.join("20260103/a.txt")), "three!!");
+    }
+
+    #[test]
+    fn crash_before_publish_leaves_nothing_visible_and_reruns_cleanly() {
+        let (r, first, second) = two_generations();
+        write(&r.source.join("a.txt"), "three!!");
+        {
+            let _crash = generation::failpoint::set("before-publish");
+            assert!(try_run_gen(&r.source, &r.dest, "20260103", 10).is_err());
+        }
+
+        assert!(!r.dest.join("20260103").exists());
+        assert_eq!(current_target(&r.dest).as_deref(), Some("20260102"));
+        // The finished-but-unpublished tree is marked, so it is never reused.
+        assert!(generation::marker_token(&r.dest.join(generation::STAGING_NAME)).is_some());
+        assert_eq!(snapshot(&r.dest.join("20260101")), first);
+        assert_eq!(snapshot(&r.dest.join("20260102")), second);
+
+        assert_eq!(run_gen(&r.source, &r.dest, "20260103", 10), 0);
+        assert_eq!(read(&r.dest.join("20260103/a.txt")), "three!!");
+        assert!(!r.dest.join(generation::STAGING_NAME).exists());
+        assert_eq!(snapshot(&r.dest.join("20260102")), second);
+    }
+
+    #[test]
+    fn crash_after_publish_before_current_moves_is_repaired_next_run() {
+        let (r, first, second) = two_generations();
+        write(&r.source.join("a.txt"), "three!!");
+        {
+            let _crash = generation::failpoint::set("after-publish");
+            assert!(try_run_gen(&r.source, &r.dest, "20260103", 10).is_err());
+        }
+        // Published and marked, but `current` still points at the old one.
+        assert!(generation::marker_token(&r.dest.join("20260103")).is_some());
+        assert_eq!(current_target(&r.dest).as_deref(), Some("20260102"));
+
+        // The next run repairs `current` first, so it links against 20260103
+        // rather than the older generation.
+        write(&r.source.join("c.txt"), "see");
+        assert_eq!(run_gen(&r.source, &r.dest, "20260104", 10), 0);
+
+        assert!(same_inode(
+            &r.dest.join("20260103/a.txt"),
+            &r.dest.join("20260104/a.txt")
+        ));
+        assert_eq!(current_target(&r.dest).as_deref(), Some("20260104"));
+        assert_eq!(snapshot(&r.dest.join("20260101")), first);
+        assert_eq!(snapshot(&r.dest.join("20260102")), second);
+    }
+
+    #[test]
+    fn crash_while_replacing_current_keeps_the_old_link_valid() {
+        let (r, _first, _second) = two_generations();
+        {
+            let _crash = generation::failpoint::set("before-current-rename");
+            assert!(generation::update_current(&r.dest, "20260101", run_mode()).is_err());
+        }
+        // The old link was never removed; the leftover temp link is internal.
+        assert_eq!(current_target(&r.dest).as_deref(), Some("20260102"));
+        assert!(generation::link_dest_base(&r.dest).is_some());
+        assert!(generation::is_internal_name(generation::CURRENT_TMP));
+
+        generation::update_current(&r.dest, "20260101", run_mode()).unwrap();
+        assert_eq!(current_target(&r.dest).as_deref(), Some("20260101"));
+        assert!(!r.dest.join(generation::CURRENT_TMP).exists());
+    }
+
+    #[test]
+    fn repair_current_handles_missing_dangling_and_behind() {
+        let (r, _f, _s) = two_generations();
+
+        fs::remove_file(r.dest.join("current")).unwrap();
+        generation::repair_current(&r.dest, run_mode()).unwrap();
+        assert_eq!(current_target(&r.dest).as_deref(), Some("20260102"));
+
+        fs::remove_file(r.dest.join("current")).unwrap();
+        symlink("20991231", r.dest.join("current")).unwrap();
+        generation::repair_current(&r.dest, run_mode()).unwrap();
+        assert_eq!(current_target(&r.dest).as_deref(), Some("20260102"));
+
+        fs::remove_file(r.dest.join("current")).unwrap();
+        symlink("20260101", r.dest.join("current")).unwrap();
+        generation::repair_current(&r.dest, run_mode()).unwrap();
+        assert_eq!(current_target(&r.dest).as_deref(), Some("20260102"));
+    }
+
+    #[test]
+    fn repair_current_leaves_a_current_that_is_not_behind() {
+        let r = repo();
+        // Legacy generations (no marker) are never chosen by the repair.
+        write(&r.dest.join("20260101/a.txt"), "old");
+        symlink("20260101", r.dest.join("current")).unwrap();
+        generation::repair_current(&r.dest, run_mode()).unwrap();
+        assert_eq!(current_target(&r.dest).as_deref(), Some("20260101"));
+
+        // A current ahead of every marked generation is left alone.
+        write(&r.dest.join("20260102/a.txt"), "newer");
+        fs::remove_file(r.dest.join("current")).unwrap();
+        symlink("20260102", r.dest.join("current")).unwrap();
+        write(&r.dest.join("20260101/.timevault-complete"), "tok");
+        generation::repair_current(&r.dest, run_mode()).unwrap();
+        assert_eq!(current_target(&r.dest).as_deref(), Some("20260102"));
+
+        // No current and only legacy generations: nothing to choose.
+        fs::remove_file(r.dest.join("current")).unwrap();
+        fs::remove_file(r.dest.join("20260101/.timevault-complete")).unwrap();
+        generation::repair_current(&r.dest, run_mode()).unwrap();
+        assert_eq!(current_target(&r.dest), None);
+    }
+
+    #[test]
+    fn crash_before_exchange_keeps_the_old_generation() {
+        if !exchange_supported() {
+            return;
+        }
+        let (r, first, second) = two_generations();
+        write(&r.source.join("a.txt"), "rerun!!");
+        {
+            let _crash = generation::failpoint::set("before-exchange");
+            assert!(try_run_gen(&r.source, &r.dest, "20260102", 10).is_err());
+        }
+        assert!(r.dest.join(generation::PUBLISH_INTENT).exists());
+        assert_eq!(snapshot(&r.dest.join("20260102")), second);
+
+        generation::recover_interrupted(&r.dest, run_mode()).unwrap();
+        assert!(!r.dest.join(generation::PUBLISH_INTENT).exists());
+        assert_eq!(snapshot(&r.dest.join("20260102")), second);
+        assert_eq!(snapshot(&r.dest.join("20260101")), first);
+
+        // The rerun then completes normally.
+        assert_eq!(run_gen(&r.source, &r.dest, "20260102", 10), 0);
+        assert_eq!(read(&r.dest.join("20260102/a.txt")), "rerun!!");
+    }
+
+    #[test]
+    fn crash_after_exchange_keeps_the_new_generation_and_drops_the_old() {
+        if !exchange_supported() {
+            return;
+        }
+        let (r, first, _second) = two_generations();
+        write(&r.source.join("a.txt"), "rerun!!");
+        {
+            let _crash = generation::failpoint::set("after-exchange");
+            assert!(try_run_gen(&r.source, &r.dest, "20260102", 10).is_err());
+        }
+        // Swapped: the new generation is under the day name, the old one is
+        // sitting at the staging path.
+        assert_eq!(read(&r.dest.join("20260102/a.txt")), "rerun!!");
+        assert_eq!(
+            read(&r.dest.join(generation::STAGING_NAME).join("a.txt")),
+            "two!"
+        );
+
+        generation::recover_interrupted(&r.dest, run_mode()).unwrap();
+
+        assert_eq!(read(&r.dest.join("20260102/a.txt")), "rerun!!");
+        assert!(generation::marker_token(&r.dest.join("20260102")).is_some());
+        assert_eq!(gen_dirs(&r.dest), vec!["20260101", "20260102", "current"]);
+        assert_eq!(snapshot(&r.dest.join("20260101")), first);
+        assert!(generation::link_dest_base(&r.dest).is_some());
+    }
+
+    #[test]
+    fn crash_after_set_aside_finishes_cleanup() {
+        if !exchange_supported() {
+            return;
+        }
+        let (r, _f, _s) = two_generations();
+        write(&r.source.join("a.txt"), "rerun!!");
+        {
+            let _crash = generation::failpoint::set("after-set-aside");
+            assert!(try_run_gen(&r.source, &r.dest, "20260102", 10).is_err());
+        }
+        assert!(r.dest.join("20260102").exists());
+
+        generation::recover_interrupted(&r.dest, run_mode()).unwrap();
+
+        assert_eq!(read(&r.dest.join("20260102/a.txt")), "rerun!!");
+        assert_eq!(gen_dirs(&r.dest), vec!["20260101", "20260102", "current"]);
+    }
+
+    #[test]
+    fn replacement_works_without_rename_exchange() {
+        let _fallback = generation::failpoint::disable_exchange();
+        let (r, first, _second) = two_generations();
+        write(&r.source.join("a.txt"), "rerun!!");
+
+        assert_eq!(run_gen(&r.source, &r.dest, "20260102", 10), 0);
+
+        assert_eq!(read(&r.dest.join("20260102/a.txt")), "rerun!!");
+        assert_eq!(gen_dirs(&r.dest), vec!["20260101", "20260102", "current"]);
+        assert_eq!(snapshot(&r.dest.join("20260101")), first);
+    }
+
+    #[test]
+    fn crash_during_aside_fallback_restores_the_old_generation() {
+        let _fallback = generation::failpoint::disable_exchange();
+        let (r, _f, second) = two_generations();
+        write(&r.source.join("a.txt"), "rerun!!");
+        {
+            let _crash = generation::failpoint::set("after-aside");
+            assert!(try_run_gen(&r.source, &r.dest, "20260102", 10).is_err());
+        }
+        assert!(!r.dest.join("20260102").exists());
+
+        generation::recover_interrupted(&r.dest, run_mode()).unwrap();
+
+        assert_eq!(snapshot(&r.dest.join("20260102")), second);
+    }
+
+    #[test]
+    fn crash_during_retention_loses_no_current_data_and_resumes() {
+        let (r, _f, _s) = two_generations();
+        write(&r.source.join("a.txt"), "three!!");
+        assert_eq!(run_gen(&r.source, &r.dest, "20260103", 10), 0);
+        write(&r.source.join("a.txt"), "four!!!");
+        assert_eq!(run_gen(&r.source, &r.dest, "20260104", 10), 0);
+        let newest = snapshot(&r.dest.join("20260104"));
+        let third = snapshot(&r.dest.join("20260103"));
+
+        {
+            let _crash = generation::failpoint::set("mid-prune");
+            assert!(expire_old_backups(&gen_job(&r.source, 2), &r.dest, run_mode()).is_err());
+        }
+        // One oldest generation was deleted before the interruption.
+        assert_eq!(
+            gen_dirs(&r.dest),
+            vec!["20260102", "20260103", "20260104", "current"]
+        );
+        assert_eq!(snapshot(&r.dest.join("20260104")), newest);
+        assert_eq!(snapshot(&r.dest.join("20260103")), third);
+        assert!(generation::link_dest_base(&r.dest).is_some());
+
+        expire_old_backups(&gen_job(&r.source, 2), &r.dest, run_mode()).unwrap();
+        assert_eq!(gen_dirs(&r.dest), vec!["20260103", "20260104", "current"]);
+        assert_eq!(snapshot(&r.dest.join("20260104")), newest);
+    }
+
+    #[test]
+    fn marked_staging_is_discarded_even_without_a_base() {
+        let r = repo();
+        write(&r.source.join("a.txt"), "a");
+        let staged = r.dest.join(generation::STAGING_NAME);
+        write(&staged.join("stale.txt"), "stale");
+        write(&staged.join(generation::COMPLETE_MARKER), "tok");
+
+        assert_eq!(run_gen(&r.source, &r.dest, "20260101", 3), 0);
+
+        assert!(!r.dest.join("20260101/stale.txt").exists());
+        assert_eq!(read(&r.dest.join("20260101/a.txt")), "a");
+    }
+
+    #[test]
+    fn marker_is_replaced_not_rewritten_in_place() {
+        // A cascade source tree carries its own marker, which rsync can
+        // hard-link from the previous generation. Stamping the new generation
+        // must not rewrite that shared file.
+        let r = repo();
+        write(&r.source.join("a.txt"), "a");
+        assert_eq!(run_gen(&r.source, &r.dest, "20260101", 10), 0);
+        let marker1 = r.dest.join("20260101").join(generation::COMPLETE_MARKER);
+        let token1 = read(&marker1);
+
+        let source_marker = r.source.join(generation::COMPLETE_MARKER);
+        fs::copy(&marker1, &source_marker).unwrap();
+        let status = Command::new("touch")
+            .arg("-r")
+            .arg(&marker1)
+            .arg(&source_marker)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        assert_eq!(run_gen(&r.source, &r.dest, "20260102", 10), 0);
+
+        assert_eq!(read(&marker1), token1);
+        let marker2 = r.dest.join("20260102").join(generation::COMPLETE_MARKER);
+        assert_ne!(read(&marker2), token1);
+        assert!(!same_inode(&marker1, &marker2));
+    }
+
+    #[test]
+    fn finalize_staging_requires_a_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("nope");
+        assert!(generation::finalize_staging(&missing, run_mode()).is_err());
+        let file = tmp.path().join("file");
+        fs::write(&file, "x").unwrap();
+        assert!(generation::finalize_staging(&file, run_mode()).is_err());
     }
 }

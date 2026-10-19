@@ -1,6 +1,6 @@
 # Plan: relocation-aware reuse, disk-local index, safe publication, current-target recreation, rotation docs
 
-Status: approved plan, in progress. Phases 0 and 1 done; Phase 2 next. Evolves the existing architecture; it does not replace it.
+Status: approved plan, in progress. Phases 0, 1 and 2 done; Phase 3 next. Evolves the existing architecture; it does not replace it.
 
 This plan is kept current as work proceeds. What was done, decided and learned is recorded in [IMPLEMENTATION_LOG.md](IMPLEMENTATION_LOG.md); every change to the plan itself is noted there too.
 
@@ -8,7 +8,7 @@ This plan is kept current as work proceeds. What was done, decided and learned i
 |---|---|
 | 0 Testing seams | Done (`465c5d6`, `84caaf1`) |
 | 1 Docs foundation | Done |
-| 2 Publication hardening | Not started |
+| 2 Publication hardening | Done (1.14.4) |
 | 3 Current-target recreation | Not started |
 | 4 Disk-local SQLite index | Not started |
 | 5 Relocation-aware reuse | Not started |
@@ -99,7 +99,7 @@ Definition of done for every phase:
 - Architecture review addition: the shared pristine cache and remote helper files were fixed for parallel jobs in 1.14.1 (see log); document that parallel jobs must not overlap directories; inventory existing remote-execution paths (`run_remote_job_script`, the pristine helper, SSH helpers): transport, privileges, failure modes, cache format, and handling of unusual file names and file types.
 - Validation: read each document against the code; every command or option in an example must exist.
 
-### Phase 2: publication hardening (fix; patch)
+### Phase 2: publication hardening (fix; patch) — DONE
 - Completion marker; atomic `current` update with repair; pre-publish validation; clear ENOSPC reporting stating nothing was pruned; `RENAME_EXCHANGE` with fallback; structured per-disk and per-job cascade status including partial cascade success.
 - Crash-injection tests: during rsync, after rsync before publish, mid-exchange, after publish before `current` update, during retention. Completed generations must be bit-identical before and after.
 - Docs: `architecture.md`, `recovery.md`, and the "Snapshot generations" section of `USER_GUIDE.md`.
