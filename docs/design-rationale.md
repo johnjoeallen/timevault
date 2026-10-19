@@ -52,7 +52,7 @@ Moved and renamed files are offered to rsync as an extra `--link-dest` directory
 
 - **Why:** rsync never writes into a `--link-dest` reference. It links a file from it only when every preserved attribute matches the source, and otherwise writes a new file. A moved file whose permissions, owner or timestamp changed therefore cannot alter the old generation, which pre-populating the new generation with links could do, because hard-linked files share one inode's metadata.
 - **Why a dry run first:** rsync's own comparison of the source against the previous generation is the cheapest complete list of what is new and what vanished, and it handles arbitrary file names. Pairing a *vanished* old path with a *new* path of the same size and modification time is strong evidence of a move; a file that still exists is a copy and is only shared after its content is compared.
-- **Why bounded, and optional:** the extra pass is real work, especially over SSH. A time limit and a change limit make it fall back to ordinary copying instead of slowing the backup, and it is off until you turn it on.
+- **Why bounded, and on by default:** the extra pass is real work, especially over SSH: about 0.25 s per 20,000 files locally and 0.37 s over loopback SSH on a quiet night. It is on because a single reorganisation saves far more (157 MiB of copying avoided in the benchmark), it cannot damage history, and it never fails a backup. A time limit and a change limit make it fall back to ordinary copying instead of slowing the backup, and `relocation: false` turns it off globally or per job.
 - **Why rsync's checksum for remote confirmation:** it needs no code uploaded to, or run as root on, the remote host, and file names never pass through a shell.
 - **Why folder moves are trusted but lone files are checked:** unrelated files rarely line up as "everything in folder A is now in folder B", so a folder move is strong evidence without reading anything, while a single file is where a coincidence is most plausible and a checksum is cheapest relative to the risk. Reads are limited to the paired files and capped by size, so a huge file is never read unless you ask.
 - **Cost:** an extra pass per run, the file index, and, for remote sources, a checksum read of each lone candidate up to `hashMaxSize`.
@@ -64,7 +64,7 @@ The index that lets Timevault recognise moved files is stored on the backup disk
 - **Why:** a disk must stay usable on its own, and an index that lived on the host (or on another disk) would tie it to that machine or disk and go stale whenever disks are rotated. A disk-local index travels with the disk, describes exactly what that disk holds, and can be rebuilt from it.
 - **Why it is an optimisation, not a dependency:** the generations are the truth. Treating the index as disposable means a crash, a corrupt file or a version change can never make backups unreadable, only slower once.
 - **Why hashing is lazy:** hashing every file on every run would cost far more than the savings. Hashes are computed on demand, shared between hard links, and trusted only after the file is re-checked.
-- **Cost:** extra disk space and a walk of each new generation per run, which is why it is off by default and is switched on only by features that use it, such as moved-file detection.
+- **Cost:** extra disk space and a walk of each new generation per run, which is why `options.index` itself is off by default and the index is kept only while a feature that uses it, such as moved-file detection, is on.
 
 ## Completed generations are never modified
 

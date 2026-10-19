@@ -3101,6 +3101,8 @@ fn plan_relocation(
     run_mode: RunMode,
     file_index: &mut index::Session,
 ) -> Option<PathBuf> {
+    // An initial backup has no previous generation to take data from.
+    let prev_root = prev_root?;
     if run_mode.dry_run {
         crate::pnote!(
             "{}: dry-run: would look for moved or renamed files",
@@ -3108,8 +3110,6 @@ fn plan_relocation(
         );
         return None;
     }
-    // An initial backup has no previous generation to take data from.
-    let prev_root = prev_root?;
     let local_root = local_source_root(&job.source);
     let request = relocation::Prepare {
         cfg,
@@ -6573,10 +6573,9 @@ mod tests {
         write(&f.source.join("d/large.dat"), &"L".repeat(100 * 1024));
         set_mtime(&f.source.join("d/small.dat"), "2020-05-05 10:00:00");
         set_mtime(&f.source.join("d/large.dat"), "2020-05-05 10:00:00");
-        let defaults = relocation::RelocationConfig {
-            enabled: true,
-            ..relocation::RelocationConfig::default()
-        };
+        // What a user gets with no `relocation` setting at all.
+        let defaults = relocation::RelocationConfig::from_option(None).unwrap();
+        assert!(defaults.enabled);
         assert_eq!(
             f.run_reloc("20260101", defaults).status,
             BackupJobStatus::Success

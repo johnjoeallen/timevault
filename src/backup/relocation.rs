@@ -49,7 +49,9 @@ use crate::config::model::RelocationOption;
 
 pub const DEFAULT_MIN_SIZE: u64 = 64 * 1024;
 pub const DEFAULT_MAX_CHANGES: usize = 200_000;
-pub const DEFAULT_TIMEOUT_SECS: u64 = 900;
+pub const DEFAULT_TIMEOUT_SECS: u64 = 300;
+/// Whether moved-file detection runs when `options.relocation` is not set.
+pub const RELOCATION_DEFAULT: bool = true;
 /// Content is compared for files up to this size (2 GiB); larger files are
 /// not read. `0` removes the limit.
 pub const DEFAULT_HASH_MAX_SIZE: u64 = 2 * 1024 * 1024 * 1024;
@@ -91,6 +93,9 @@ impl RelocationConfig {
     }
 }
 
+/// The disabled baseline, with every limit at its default. The setting a
+/// user gets without configuring anything is [`RelocationConfig::from_option`]
+/// with `None`, which follows [`RELOCATION_DEFAULT`].
 impl Default for RelocationConfig {
     fn default() -> Self {
         RelocationConfig {
@@ -107,7 +112,10 @@ impl Default for RelocationConfig {
 impl RelocationConfig {
     /// Resolve `options.relocation`.
     pub fn from_option(option: Option<&RelocationOption>) -> Result<Self, String> {
-        let mut cfg = RelocationConfig::default();
+        let mut cfg = RelocationConfig {
+            enabled: RELOCATION_DEFAULT,
+            ..RelocationConfig::default()
+        };
         match option {
             None => {}
             Some(RelocationOption::Flag(enabled)) => cfg.enabled = *enabled,
@@ -1235,9 +1243,14 @@ mod tests {
 
     #[test]
     fn relocation_config_resolves_flags_settings_and_job_overrides() {
-        let off = RelocationConfig::from_option(None).unwrap();
+        // Unconfigured, it is on; the plain `Default` is the disabled baseline.
+        let unset = RelocationConfig::from_option(None).unwrap();
+        assert!(unset.enabled);
+        assert_eq!(unset.min_size, DEFAULT_MIN_SIZE);
+        assert_eq!(unset.timeout_secs, 300);
+        let off = RelocationConfig::from_option(Some(&RelocationOption::Flag(false))).unwrap();
         assert!(!off.enabled);
-        assert_eq!(off.min_size, DEFAULT_MIN_SIZE);
+        assert!(!RelocationConfig::default().enabled);
 
         let on = RelocationConfig::from_option(Some(&RelocationOption::Flag(true))).unwrap();
         assert!(on.enabled);
@@ -2050,5 +2063,45 @@ mod tests {
 
         assert!(result.unwrap_err().contains("rsync exited"));
         assert!(!w.dest.join("list").exists());
+    }
+
+    #[test]
+    fn a_config_file_without_a_relocation_setting_gets_the_default_on() {
+        fn resolve(options: &str, job_extra: &str) -> (RelocationConfig, Option<bool>) {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("timevault.yaml");
+            fs::write(
+                &path,
+                format!(
+                    "backupDisks:\n  - diskId: x\n    fsUuid: 11111111-1111-1111-1111-111111111111\n\
+                     {options}jobs:\n  - name: j\n    source: /tmp\n    copies: 1\n    run: auto\n{job_extra}"
+                ),
+            )
+            .unwrap();
+            let cfg = crate::config::load::load_config(path.to_str().unwrap()).unwrap();
+            (
+                RelocationConfig::from_option(cfg.options.relocation.as_ref()).unwrap(),
+                cfg.jobs[0].relocation,
+            )
+        }
+
+        let (unset, job) = resolve("", "");
+        assert!(unset.enabled);
+        assert_eq!(job, None);
+
+        let (off, _) = resolve("options:\n  relocation: false\n", "");
+        assert!(!off.enabled);
+
+        // A job can switch it back on, or off, whatever the global says.
+        let (global_off, job_on) =
+            resolve("options:\n  relocation: false\n", "    relocation: true\n");
+        assert!(global_off.for_job(job_on).enabled);
+        let (global_on, job_off) = resolve("", "    relocation: false\n");
+        assert!(!global_on.for_job(job_off).enabled);
+
+        // A settings block with no `enabled` key is on.
+        let (block, _) = resolve("options:\n  relocation:\n    minSize: 1\n", "");
+        assert!(block.enabled);
+        assert_eq!(block.min_size, 1);
     }
 }

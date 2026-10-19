@@ -71,7 +71,7 @@ Consequences:
 - Unchanged files cost no extra data blocks (they still cost directory entries).
 - A changed file is written as a new file. Older generations keep their old copy.
 - Completed generations are never modified, even when a permission or timestamp changes at the source: that file is simply stored again.
-- A file that is **moved or renamed** is stored again, because the path differs, unless moved-file detection is enabled (`options.relocation`), which finds such files and reuses their data. See [Reusing moved and renamed files](relocation.md) and [Retention and capacity](retention-capacity.md).
+- A file that is **moved or renamed** is stored again, because the path differs, unless moved-file detection (`options.relocation`, on by default) finds such files and reuses their data. See [Reusing moved and renamed files](relocation.md) and [Retention and capacity](retention-capacity.md).
 - Hard links cannot cross filesystems, so every disk stores its own copy of the data.
 
 ## Previous generation: per disk and per job
@@ -84,7 +84,7 @@ With `--cascade` (or `options.cascade: true`), a job is first backed up to its *
 
 ## Disk-local file index
 
-With `options.index: true`, each disk keeps a SQLite database describing the files of its generations, at `<disk>/.timevault-index/file-index.sqlite` (off by default; see the [User Guide](../USER_GUIDE.md)). Its purpose is to let [moved-file detection](relocation.md) recognise files that were moved or renamed without reading everything again; that feature switches the index on.
+Each disk keeps a SQLite database describing the files of its generations, at `<disk>/.timevault-index/file-index.sqlite`. It is kept while [moved-file detection](relocation.md) is on, which it is by default, or when `options.index: true` is set (see the [User Guide](../USER_GUIDE.md)). Its purpose is to let moved-file detection recognise files that were moved or renamed without reading everything again.
 
 - **It belongs to the disk.** The database lives on the backup disk, uses paths relative to a generation (never a mount point), and is built only from that disk's own generations. A disk never needs another disk's index, and rotating a disk in or out needs no synchronisation.
 - **It is not needed to restore.** Generations are ordinary directory trees; the index is an optimisation. If it is missing, stale or corrupt, it is rebuilt from the generations on the disk, and an index problem is reported as a warning and never fails a backup.
@@ -104,6 +104,6 @@ Two `timevault` processes may run **different** jobs at the same time, even agai
 
 ## Moved and renamed files
 
-With `options.relocation`, files that were moved or renamed since the previous generation are found before the copy and their data is reused. A scratch directory `<job>/.timevault-reloc` of hard links is passed to rsync as an extra read-only `--link-dest`, so rsync can never write through to a completed generation. It is off by default. See [Reusing moved and renamed files](relocation.md).
+With `options.relocation`, files that were moved or renamed since the previous generation are found before the copy and their data is reused. A scratch directory `<job>/.timevault-reloc` of hard links is passed to rsync as an extra read-only `--link-dest`, so rsync can never write through to a completed generation. It is on by default and can be turned off with `options.relocation: false`. See [Reusing moved and renamed files](relocation.md).
 
 The plan and its status are in [PLAN.md](PLAN.md).

@@ -21,13 +21,14 @@ Running record of changes, decisions and findings for the work described in [PLA
 | D13 | Same-day replacement uses `renameat2(RENAME_EXCHANGE)` journalled by `.timevault-publishing`; fall back to set-aside where unsupported | 2026-10-19 | Recovery decides by whether the intent's token is now in the final directory. |
 | D14 | The index is off by default (`options.index`, `INDEX_DEFAULT = false`) until Phase 5 uses it and the default is decided from benchmarks | 2026-10-19 | Measured on 100k files: about 1 s per run to record and publish, about 50 MB of database. Nothing consumes the index yet, so enabling it by default would cost without benefit. |
 | D15 | Remote confirmation uses rsync's own checksum (`-c`) against the shadow directory, not a custom helper run as root on the remote | 2026-10-19 | No remote code or scratch files, no shell parsing of file names, and no new privileges. Trade-offs: rsync's checksum is not SHA-256, and only unique-move pairings are confirmed (not copies or ambiguous groups). |
-| D16 | Relocation is off by default (`options.relocation`); per-job override `relocation: true/false` | 2026-10-19 | It adds a read-only pass and the file index. The remote cost was not measured, so the conservative default stands; local numbers are in `docs/relocation.md`. |
+| D16 | Relocation is off by default (`options.relocation`); per-job override `relocation: true/false` (superseded by D23: now on by default) | 2026-10-19 | It adds a read-only pass and the file index. The remote cost was not measured, so the conservative default stands; local numbers are in `docs/relocation.md`. |
 | D17 | Candidates come from a dry run of the real rsync command against the previous generation (not against staging) | 2026-10-19 | Against the previous generation rsync reports exactly `>f+++++++++` (new) and `*deleting` (vanished). Against empty staging it would report no deletions at all. |
 | D18 | Unverified (size and mtime) pairings are only made for a unique move where the old path vanished; a file whose old path still exists is a copy and needs content comparison | 2026-10-19 | A same-size, same-mtime, different-content look-alike would otherwise be backed up with the old file's bytes; an end-to-end test showed exactly that when verification was disabled. |
 | D19 | Content comparison is capped by file size (`hashMaxSize`, default 2 GiB, `0` = no limit); above the cap the default tier trusts a unique move and `verify: hash` skips the file | 2026-10-19 | Bounds remote disk I/O without a new remote mechanism; a byte-exact size on a huge file is strong evidence. Suggested after discussing boundary (head/tail) sampling, which was rejected as a gate: it adds a round trip for true moves and is weak on templated files, and rsync cannot read byte ranges. |
 | D20 | For a remote source, a folder move (three or more pairings from one old directory to one new directory) is trusted without reading content; lone files are confirmed with rsync's checksum | 2026-10-19 | Collective evidence is far stronger than a single coincidence. Supersedes the 1.17.0 remote default of trusting any unique move (D18, for remote sources). |
 | D21 | After a successful publish, retention protects the generation just published, not the one `current` still points at | 2026-10-19 | Found by the real full-disk test: with `copies: 1` the previous generation was protected (it was `current`) and so kept as an extra. A crash after the old one is pruned but before `current` moves leaves `current` dangling, which `repair_current` fixes on the next run. Without a published day (direct calls), `current` is still protected as before. |
 | D22 | Orchestration is testable through a `DiskHost` trait (connected disks, mounting, backup day); production uses `RealDisks` | 2026-10-19 | Lets whole rotation scenarios run through the real `run_automatic_backups` and cascade code with directories as disks. No behaviour change. |
+| D23 | Moved-file detection is on by default (`RELOCATION_DEFAULT = true`), for local, cascade and remote sources; the default time limit is lowered from 900 s to 300 s | 2026-10-19 | Decided by the project owner after the Phase 6 measurements: about 0.25 s per 20,000 files locally and +56 % (0.37 s) on a quiet night over loopback SSH, against 157 MiB of copying avoided per reorganised 20,000 files. `options.relocation: false` (or a job's `relocation: false`) turns it off. Supersedes D16. |
 
 ## Findings about the existing code
 
@@ -177,7 +178,16 @@ Notes and limits:
 Findings recorded rather than changed:
 - A mount or lock error stops the whole run and later disks are not attempted (the primary's result is kept). This is the existing, documented behaviour, now pinned by a test; no automatic fallback was added.
 - Remote ambiguous groups (many renamed files with identical size and mtime) are not recovered. Possible later improvement: disambiguate with rsync's checksum in rounds.
-- **Decision still open:** whether relocation should default to on. Measured: +56 % run time on a quiet night over loopback SSH and about 0.25 s per 20,000 files locally, against large savings on any reorganisation. Left off pending your decision.
+- **Decision (D23):** relocation defaults to on (see below).
+
+### Default on (1.19.0, behaviour change)
+
+- `RELOCATION_DEFAULT` is `true`: with no `options.relocation` setting, moved-file detection runs for local, cascade and remote sources, and keeps the file index on the disk. `RelocationConfig::default()` remains the disabled baseline used by tests and as a placeholder; the configured value comes from `RelocationConfig::from_option`. `options.relocation: false` and a job's `relocation: false` turn it off.
+- Default `timeoutSeconds` lowered from 900 to 300, so the worst case (a pass that runs to its limit and saves nothing) is five minutes, not fifteen.
+- The dry-run note ("would look for moved or renamed files") is now printed only when there is a previous generation, so initial backups stay quiet.
+- Tests: unconfigured resolves to enabled with a 300 s limit; an explicit `false` disables; the default-minimum-size end-to-end test now uses the unconfigured setting, proving the default on a real backup. All earlier tests are unchanged (they pass their own options).
+- Docs: `relocation.md` (on by default, what changes when you upgrade, when to turn it off, 300 s), the User Guide (option text and a behaviour-change note under Backup), README, `architecture.md`, `retention-capacity.md`, `design-rationale.md` and the example config.
+- What users will notice after upgrading: a `.timevault-index` directory on each disk, one walk of the previous generation on the first run, and one extra read-only rsync pass per job per run.
 
 ### Phase 7 onwards
 

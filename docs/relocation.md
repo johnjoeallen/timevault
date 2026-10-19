@@ -4,7 +4,21 @@
 
 `rsync --link-dest` decides whether a file is unchanged by looking at the file with the **same relative path** in the previous generation. If you move a folder or rename files, the new paths have no counterpart, so rsync stores the content again even though identical data is already on the disk in the older generations. Reorganising a large collection can therefore consume as much space as the collection itself, and on a nearly full disk the next backup can fail.
 
-Timevault can detect such files and reuse the existing data. It is **off by default**.
+Timevault detects such files and reuses the existing data. It is **on by default** (from version 1.19.0). To turn it off:
+
+```yaml
+options:
+  relocation: false
+```
+
+### What changes when you upgrade
+
+- A `.timevault-index` directory appears on each backup disk. On the first run after the upgrade, the previous generation of every job is walked once to build it.
+- Every run does one extra read-only rsync pass against the previous generation, and one walk of the new generation to keep the index current. On a quiet night this is the main cost: roughly 0.25 s per 20,000 files locally and 0.37 s over SSH (see [Cost and benefit](#cost-and-benefit)).
+- The index uses about half a kilobyte of disk per file of the indexed generation (about 50 MB per 100,000 files).
+- Initial backups, and runs on a disk with no previous generation for the job, are unaffected: there is nothing to take data from.
+
+Good reasons to turn it off for a job or globally: trees of millions of files that never reorganise, a very slow remote link, or a disk with no room for the index.
 
 ```yaml
 options:
@@ -60,7 +74,7 @@ Things that are not compared by Timevault itself (extended attributes, ACLs) are
 
 ```yaml
 options:
-  relocation: true            # defaults for everything else below
+  relocation: false           # turn it off everywhere (it is on unless you say so)
 ```
 
 or, to tune it:
@@ -71,14 +85,14 @@ options:
     enabled: true             # default true when this block is present
     minSize: 65536            # smallest file considered, in bytes (default 64 KiB)
     maxChanges: 200000        # give up if more files than this are new or vanished
-    timeoutSeconds: 900       # give up if planning takes longer than this
+    timeoutSeconds: 300       # give up if planning takes longer than this
     verify: auto              # auto | hash | size-mtime
     hashMaxSize: 2147483648   # largest file whose content is compared (default 2 GiB, 0 = no limit)
 jobs:
   - name: "photos"
     source: "/srv/photos"
     copies: 20
-    relocation: true          # per-job override of the global setting
+    relocation: true          # per-job override of the global setting (here, explicitly on)
   - name: "web1"
     source: "root@web1.example.com:/"
     copies: 14
@@ -89,7 +103,7 @@ jobs:
 - `hashMaxSize` bounds how much is read to compare content. Raise it (or set `0`) if you want even huge files proven.
 - Reaching `maxChanges` or `timeoutSeconds` abandons the pass for that run with a log line, and rsync copies everything normally. A large reorganisation therefore degrades to the old behaviour instead of making the backup slower.
 - A job's own `relocation:` overrides the global setting in either direction.
-- Relocation needs the file index and switches it on for the disk. See [the index cost](architecture.md#disk-local-file-index).
+- Relocation needs the file index and keeps it on for the disk while it is enabled. See [the index cost](architecture.md#disk-local-file-index).
 
 ## What you will see
 
