@@ -54,6 +54,7 @@ pub fn run() -> Result<()> {
         exclude_pristine: cli.exclude_pristine || cli.exclude_pristine_only,
         exclude_pristine_only: cli.exclude_pristine_only,
         session_seconds_override: cli.min_session_seconds,
+        recreate: cli.recreate,
     };
 
     let command = cli.command.clone().unwrap_or(Command::Backup);
@@ -281,6 +282,9 @@ fn print_help() {
     println!("  --rsync <args...>      Pass remaining args to rsync");
     println!("  --disk-id <id>         Select enrolled backup disk by id");
     println!("  --cascade              Run backup across all connected disks");
+    println!(
+        "  --recreate             Rebuild today's already-complete generation (alias --refresh)"
+    );
     println!("  --send-report          Send configured report email even during dry-run");
     println!("  --fs-uuid <uuid>       Filesystem UUID selector");
     println!("  --device <path>        Block device path (disk enroll)");

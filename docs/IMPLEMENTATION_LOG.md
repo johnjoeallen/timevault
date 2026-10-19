@@ -84,12 +84,28 @@ Notes and limits:
 - The cascade summary is in the run output only, not in the emailed report.
 - Mid-rsync kills were simulated by a pre-built partial staging tree, not by killing a real rsync.
 
-### Phase 3 onwards
+### Phase 3: skip-by-default and `--recreate` (1.15.0, feature)
+
+- **Behaviour change (D1):** a backup day that already has a completed generation on a disk is skipped and reported `already complete`: `check_existing_target` runs right after the job lock, before the remote host is woken, so no wake, hooks, rsync, retention or `current` change happens. Interruption cleanup (`recover_interrupted`, `repair_current`) runs first, so completeness is judged on the repaired state and a cascade reads a correct `current`. "Complete" = carries `.timevault-complete`, or is what `current` points at (covers generations from before the marker); any other directory with the day's name is treated as an old release's partial and replaced as before.
+- **Flag (D2):** `--recreate`, alias `--refresh`, global like the other options, plumbed through `BackupOptions.recreate`. Listed in `--help`; documented in the User Guide (the CI flag check failed until it was).
+- **`BackupJobStatus::AlreadyComplete`:** new status (`already complete`, blue in the HTML report). `produced_snapshot()` is true for it, so a job already complete on the primary still cascades to disks that lack the day, and a downstream disk that has it reports `already complete` too.
+- **Recreate references:** `generation::link_dest_refs` returns the `--link-dest` list. Normal runs: `[current]` as before. Recreating the day `current` points at: `[previous marked generation, existing target]`; no earlier generation: `[existing target]`. `run_rsync` now takes a list and emits one `--link-dest` per entry. The existing target is only read; the swap and old-copy removal reuse the Phase 2 exchange publication, so a failed or interrupted rebuild keeps the old generation.
+- **Guard:** recreate fails with `refusing to recreate <day>: newer generation <x> exists` when any newer generation directory is present. The flag takes no date, so a historical day cannot be named; the guard covers clock changes and injected days.
+- **Test seam (closes an open item):** `util::paths::scratch_dir()` replaces the hard-coded `$HOME/tmp` for the excludes file and redirects into the test lock directory under `cfg(test)`, so tests can drive the real `run_backup_for_day` without writing into the real home directory.
+- **Tests (+12, 206 total):** second run skipped and untouched; skip repairs `current` after a crash between publish and `current`; recreate rebuilds only the current day and leaves history bit-identical; recreate creates an absent day; recreate links against the previous generation and reuses the old target (inode assertions); failed recreate leaves the generation intact (source removed); crash after the exchange during recreate resolves to a complete generation; recreate refuses an older day; partial directory from an old release is not complete; reference-list selection cases; `--recreate`/`--refresh` parsing; `AlreadyComplete` cascades. Disabling the skip makes the skip test fail.
+- **Docs:** new `docs/recreate.md`; updates to `architecture.md`, `cascade.md`, `recovery.md`, `retention-capacity.md` (the "one generation per day" paragraph described the old replace behaviour), `design-rationale.md`, `examples.md`, README and the User Guide (options, Backup command with the behaviour-change note, Snapshot generations). `recreate.md` is in the deb assets.
+
+Notes and limits:
+- Behaviour change for users who run a job more than once a day: the generation now keeps the state of the first run unless `--recreate` is used.
+- `--recreate` applies to every disk in a run, including downstream cascade disks.
+- A recreate with no completed target behaves like a normal run.
+- Not exercised against a real mounted disk or a real SSH source; the tests drive `run_backup_for_day` on directories.
+- `cargo fmt --check` is clean again (the drift on `main` was fixed as a side effect of reformatting `generation.rs` in Phase 2).
+
+### Phase 4 onwards
 
 Not started.
 
 ## Open items
 
-- Test override for the `$HOME/tmp` excludes location, needed for full `run_backup_for_day` tests.
-- Formatting drift on `main` (`cargo fmt --check` fails); a separate formatting commit is needed before CI is clean.
 - Verify the pristine helper's handling of unusual file names and file types before reusing it in Phase 5.

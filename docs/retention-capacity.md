@@ -14,7 +14,7 @@ People often treat these as one. They are independent.
 
 ### One generation per day
 
-Generations are named by day. If a job runs more than once on the same backup day, the later run builds a fresh generation and replaces the earlier one (the swap is a rename; an interrupted swap is repaired on the next run). So an hourly schedule still produces one retained generation per day, holding the state at the last run of that day. Frequencies finer than a day add freshness, not extra restore points.
+Generations are named by day. If a job runs more than once on the same backup day, the later run is **skipped** (reported `already complete`) because that day's generation already exists; the generation holds the state at the first run of the day. To refresh it on purpose, run with `--recreate`, which rebuilds the current day's generation (see [Skipping completed days and recreating](recreate.md)). Either way an hourly schedule produces at most one retained generation per day, so frequencies finer than a day do not add restore points. (Before version 1.15.0 a later run on the same day replaced the earlier generation instead of being skipped.)
 
 ### How pruning works
 

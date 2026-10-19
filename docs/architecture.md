@@ -32,7 +32,8 @@ Each published generation also contains a small `.timevault-complete` file at it
 
 1. **Lock the job.** A per-job lock (`/var/run/timevault.<job>.pid`) stops two runs of the *same* job. Different jobs can run at the same time (see [Parallel jobs](#parallel-jobs)).
 2. **Prepare the source.** Remote jobs wake and inhibit suspend on the remote host if configured, then pre-hooks run.
-3. **Pick the link-dest base.** The base is the directory `current` points to *on this disk, for this job*. If there is none, the run is a full initial backup.
+2a. **Skip a completed day.** If the backup day already has a completed generation on this disk, the job is reported `already complete` and the steps below do not run, unless `--recreate` was given. This check happens before the remote host is woken. See [Skipping completed days and recreating](recreate.md).
+3. **Pick the link-dest base.** The base is the directory `current` points to *on this disk, for this job*. If there is none, the run is a full initial backup. When recreating the day `current` already points at, the previous generation is the base and the existing day is added as a second, read-only reference.
 4. **Prepare staging.** A leftover `.timevault-staging` is discarded when there is a base (its files could be hard links into completed generations). For an initial backup it is kept and rsync resumes into it.
 5. **Run rsync** into `.timevault-staging` with `-ar --stats`, `--exclude-from`, `--link-dest=<base>`, and, unless `--safe`, `--delete-after --delete-excluded`. It retries up to three times. Exit code 0, or 24 (files vanished during the run), counts as success.
 6. **Finish and publish.** On success the staged data is flushed to disk, `.timevault-complete` is added, and the staging directory is renamed to `<job>/<backup day>`. The rename is atomic on one filesystem, so an incomplete generation is never visible under a generation name, and the marker never exists before the data is on disk. If that day's generation already exists (a same-day re-run), the two directories are swapped in a single step (`renameat2` with `RENAME_EXCHANGE`) where the filesystem supports it, so the day's name never disappears; otherwise the old one is set aside first. The displaced old generation is removed afterwards.
@@ -89,4 +90,4 @@ Two `timevault` processes may run **different** jobs at the same time, even agai
 
 ## Not available yet
 
-These are planned and are **not** part of the current behaviour: a disk-local content index, detection of moved or renamed files, and an explicit way to recreate the current day's generation. The plan is in [PLAN.md](PLAN.md).
+These are planned and are **not** part of the current behaviour: a disk-local content index and detection of moved or renamed files. The plan is in [PLAN.md](PLAN.md).

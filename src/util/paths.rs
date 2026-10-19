@@ -26,6 +26,17 @@ pub fn job_lock_path(name: &str) -> Result<PathBuf> {
     Ok(PathBuf::from(format!("/var/run/timevault.{}.pid", name)))
 }
 
+/// Directory for per-run scratch files such as each job's excludes list:
+/// `$HOME/tmp` (falling back to `/tmp/tmp`).
+pub fn scratch_dir() -> PathBuf {
+    #[cfg(test)]
+    if let Some(dir) = test_lock_dir::scratch() {
+        return dir;
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    Path::new(&home).join("tmp")
+}
+
 /// Test-only lock directory, so unit tests can take job locks without write
 /// access to `/var/run`. Thread-local: parallel tests each get their own.
 #[cfg(test)]
@@ -39,6 +50,12 @@ pub mod test_lock_dir {
 
     pub fn get() -> Option<PathBuf> {
         DIR.with(|dir| dir.borrow().clone())
+    }
+
+    /// Scratch files go in a `scratch` sub-directory of the test lock dir, so
+    /// a test never writes into the real `$HOME`.
+    pub fn scratch() -> Option<PathBuf> {
+        get().map(|dir| dir.join("scratch"))
     }
 
     /// Restores `/var/run` locking for this thread when dropped.

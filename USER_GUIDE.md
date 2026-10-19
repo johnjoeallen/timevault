@@ -14,6 +14,7 @@ Timevault is built around a few principles:
 - [Disk rotation guide](docs/rotation.md): single-disk, two-disk and multi-disk arrangements and how to choose.
 - [Cascade guide](docs/cascade.md): copying one finished backup to other connected disks.
 - [Retention and capacity](docs/retention-capacity.md): `copies` versus calendar days, and how space is used.
+- [Skipping completed days and recreating](docs/recreate.md): why a second run on the same day is skipped, and `--recreate`.
 - [Recovery guide](docs/recovery.md): restores, failed backups, replacing a disk, running out of space.
 - [Operational examples](docs/examples.md) and [Design rationale](docs/design-rationale.md).
 
@@ -236,6 +237,7 @@ Global options:
 - `--rsync <args...>`: Pass remaining args to rsync.
 - `--disk-id <id>`: Select a specific enrolled disk by disk id.
 - `--cascade`: Run backups across all connected disks.
+- `--recreate` (alias `--refresh`): Rebuild the current backup day's generation even though it is already complete. Without it, a day that already has a completed generation is skipped (reported `already complete`). Only the current day can be rebuilt; older generations are never touched. See [Skipping completed days and recreating](docs/recreate.md).
 - `--send-report`: Send the configured report email even during `--dry-run`.
 - `--version`: Show version and license info.
 - `-h`: Show help.
@@ -253,6 +255,7 @@ By default Timevault uses `/usr/sbin/sendmail -t`; set `options.report.sendmail`
 - `timevault backup` with no `--job` is the same as `timevault backup --job all`.
 - Running Timevault with no command and no `--job` displays help, the same as `--help`.
 - Uses the first connected disk unless `--disk-id` is set to a disk id or filesystem UUID.
+- If the backup day already has a completed generation on a disk, that job is skipped for that disk and reported `already complete`: no hooks run and nothing is rebuilt. Add `--recreate` to rebuild it. **Behaviour change in 1.15.0:** earlier releases replaced the day's generation on every run, so a job run more than once a day now keeps the state of the first run unless `--recreate` is used.
 - With `--cascade`, uses the primary disk’s `current` as the source for other disks. A job is cascaded only if its backup to the primary disk produced a snapshot this run; if the primary backup was skipped, failed, or offline, that job's cascade is skipped (with a note) rather than copying a stale snapshot.
 
 ### Wake test
@@ -429,7 +432,7 @@ Each run builds the next generation with a single `rsync --link-dest` against th
 - The new generation is built in `<mount>/<job>/.timevault-staging`, flushed to disk, stamped with a `.timevault-complete` file and renamed to `<YYYYMMDD>` only after rsync succeeds (exit 0 or 24). A failed or interrupted run is never published, `current` does not move, and nothing is pruned. `current` is replaced atomically, and a run interrupted between publishing and moving `current` is repaired automatically at the start of the next run.
 - Old generations are pruned after the new one is published, keeping `copies` of them. Earlier releases pruned first and so left `copies + 1` generations after a run. The generation `current` points at is never pruned.
 - Completed generations are never written to. Previously, a permission, owner or timestamp change at the source was applied to the shared inode and so rewrote that file in every generation that linked it.
-- A leftover `.timevault-staging` is removed on the next run when there is a previous generation to link against, and resumed for an initial backup. Re-running a job on a day that already has a generation builds a fresh one and swaps it in (a single atomic exchange where the filesystem supports it, otherwise a rename); an interrupted swap is repaired automatically on the next run (`.timevault-publishing`, `.timevault-replaced-<day>`). See the [Recovery guide](docs/recovery.md).
+- A leftover `.timevault-staging` is removed on the next run when there is a previous generation to link against, and resumed for an initial backup. Re-running a job on a day that already has a completed generation skips it unless `--recreate` is given; with `--recreate` a fresh generation is built and swapped in (a single atomic exchange where the filesystem supports it, otherwise a rename); an interrupted swap is repaired automatically on the next run (`.timevault-publishing`, `.timevault-replaced-<day>`). See the [Recovery guide](docs/recovery.md).
 - A partial `<YYYYMMDD>` directory left by an earlier release's failed run is replaced the same way, but until then it still counts toward `copies`.
 - Files are linked only when every attribute rsync preserves matches (`-a`: permissions, owner, group, mtime). Adding `--xattrs`, `--acls` or `--numeric-ids` through `rsync` options therefore makes the first run afterwards copy everything.
 - A renamed or moved file is copied again, as before; `--link-dest` matches files by path.

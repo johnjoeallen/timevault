@@ -53,6 +53,7 @@ pub fn run_backup_command(
         exclude_pristine: options.exclude_pristine || cfg.options.exclude_pristine.unwrap_or(false),
         exclude_pristine_only: options.exclude_pristine_only,
         session_seconds_override: options.session_seconds_override,
+        recreate: options.recreate,
     };
     let report_options = cfg.options.report.clone();
 
@@ -860,6 +861,8 @@ mod tests {
     fn only_jobs_whose_primary_backup_produced_a_snapshot_cascade() {
         assert!(cascade_job_eligible(Some(BackupJobStatus::Success)));
         assert!(cascade_job_eligible(Some(BackupJobStatus::Partial)));
+        // The generation exists intact, and disks lacking it still need it.
+        assert!(cascade_job_eligible(Some(BackupJobStatus::AlreadyComplete)));
         assert!(!cascade_job_eligible(Some(BackupJobStatus::Failed)));
         assert!(!cascade_job_eligible(Some(BackupJobStatus::Offline)));
         assert!(!cascade_job_eligible(Some(BackupJobStatus::Skipped)));

@@ -38,6 +38,14 @@ A generation is built in a staging directory and renamed into place only after r
 - **Why:** a generation name always means a complete tree; a crash or failed run leaves no half-backup that looks like a recovery point. Data is flushed to disk before the completion marker is added, and the marker is added by rename, so a power loss cannot leave a marked generation whose data was never written.
 - **Cost:** the in-progress tree needs real room until it is published.
 
+## A completed day is skipped; only the current day can be recreated
+
+A second run on a day that already has a completed generation does nothing unless `--recreate` is given, and `--recreate` can only rebuild the newest generation.
+
+- **Why:** a completed generation is a recovery point. A later run that starts while the source is damaged, or a duplicate timer firing, must not be able to replace a good backup. Rebuilding a historical day would present today's data as that day's, destroying the one thing a historical generation is for.
+- **Cost:** a job run several times a day keeps the state of the first run, and refreshing it needs an explicit flag. This reverses the behaviour of releases before 1.15.0.
+- **Safe replacement:** the rebuild happens in staging and replaces the old generation by an atomic swap, so a failed rebuild leaves the old generation in place.
+
 ## Completed generations are never modified
 
 - **Why:** a restore from last month must still return last month. Hard links share inodes, so a permission or timestamp change applied in place to a shared file would rewrite that file in every generation that links it. Timevault builds into staging and stores a changed file anew.

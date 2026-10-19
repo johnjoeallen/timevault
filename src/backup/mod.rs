@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::env;
 use std::ffi::CStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -75,6 +74,9 @@ pub struct BackupOptions {
     /// CLI override for `remote.minimumSessionSeconds` on every job this run
     /// (`--min-session-seconds`); handy when testing the cold-boot gate.
     pub session_seconds_override: Option<u64>,
+    /// `--recreate`: rebuild the current backup day's generation even if it
+    /// is already complete.
+    pub recreate: bool,
 }
 
 struct LockGuard {
@@ -251,6 +253,12 @@ fn run_backup_job(
         });
     }
 
+    if let Some(report) =
+        check_existing_target(job, &dest, &backup_dir, backup_day, run_mode, options)?
+    {
+        return Ok(report);
+    }
+
     if run_mode.verbose {
         crate::pnote!("  backup day: {}", backup_day);
     }
@@ -376,8 +384,7 @@ fn run_backup_job(
         run_mode.dry_run,
     )?;
 
-    let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    let tmp_dir = Path::new(&home).join("tmp");
+    let tmp_dir = crate::util::paths::scratch_dir();
     if !run_mode.dry_run {
         fs::create_dir_all(&tmp_dir)?;
     }
@@ -408,6 +415,7 @@ fn run_backup_job(
         &excludes_file,
         rsync_extra,
         run_mode,
+        options.recreate,
     )?;
     let SyncOutcome {
         rc,
@@ -502,6 +510,66 @@ fn run_backup_job(
         power: power_report.as_ref().map(|report| report.summary.clone()),
         power_diagnostics: power_report.map(|report| report.diagnostics),
     })
+}
+
+/// Decide what to do when the backup day may already have a generation.
+///
+/// A completed generation is left alone: the job is reported
+/// [`BackupJobStatus::AlreadyComplete`] and nothing runs (no remote wake, no
+/// hooks, no rsync), unless `--recreate` was given. Recreation is only allowed
+/// for the newest generation, so an older day can never be rebuilt. Anything
+/// an interrupted run left behind is resolved first, so completeness is judged
+/// on the repaired state. Returns `None` when the job should go ahead.
+fn check_existing_target(
+    job: &Job,
+    dest: &Path,
+    backup_dir: &Path,
+    backup_day: &str,
+    run_mode: RunMode,
+    options: BackupOptions,
+) -> Result<Option<BackupJobReport>> {
+    if !dest.is_dir() {
+        return Ok(None);
+    }
+    generation::recover_interrupted(dest, run_mode)?;
+    generation::repair_current(dest, run_mode)?;
+    if !generation::is_complete_target(dest, backup_day) {
+        return Ok(None);
+    }
+    if options.recreate {
+        if let Some(newest) = generation::newest_generation(dest)? {
+            if newest.as_str() > backup_day {
+                return Err(TimevaultError::message(format!(
+                    "refusing to recreate {}: newer generation {} exists; only the current backup day can be recreated",
+                    backup_day, newest
+                )));
+            }
+        }
+        crate::pnote!(
+            "{}: recreating the complete generation {}",
+            job.name,
+            backup_day
+        );
+        return Ok(None);
+    }
+    let reason = format!(
+        "generation {} is already complete; use --recreate to rebuild it",
+        backup_day
+    );
+    crate::pnote!("job {} skipped: {}", job.name, reason);
+    Ok(Some(BackupJobReport {
+        name: job.name.clone(),
+        description: job.description.clone(),
+        source: job.source.clone(),
+        destination: backup_dir.display().to_string(),
+        backup_day: backup_day.to_string(),
+        status: BackupJobStatus::AlreadyComplete,
+        attempts: 0,
+        rsync_code: None,
+        failure_reason: Some(reason),
+        power: None,
+        power_diagnostics: None,
+    }))
 }
 
 fn failed_job_report(
@@ -714,8 +782,7 @@ pub fn run_pristine_only(jobs: Vec<Job>, run_mode: RunMode, options: BackupOptio
         build_pristine_excludes_for_jobs(&jobs, options, run_mode.verbose, run_mode.dry_run)?;
     for job in jobs {
         let _lock = acquire_lock_for_job(&job.name, run_mode)?;
-        let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        let tmp_dir = Path::new(&home).join("tmp");
+        let tmp_dir = crate::util::paths::scratch_dir();
         if !run_mode.dry_run {
             fs::create_dir_all(&tmp_dir)?;
         }
@@ -3085,24 +3152,25 @@ fn sync_generation(
     excludes_file: &Path,
     rsync_extra: &[String],
     run_mode: RunMode,
+    recreate: bool,
 ) -> Result<SyncOutcome> {
     if !run_mode.dry_run && !dest.exists() {
         fs::create_dir_all(dest)?;
     }
     generation::recover_interrupted(dest, run_mode)?;
     generation::repair_current(dest, run_mode)?;
-    let base = generation::link_dest_base(dest);
-    match &base {
-        Some(base) if run_mode.verbose => {
-            crate::pnote!("  link-dest: {}", base.display());
-        }
-        None => crate::pnote!(
+    let link_dests = generation::link_dest_refs(dest, backup_day, recreate)?;
+    if link_dests.is_empty() {
+        crate::pnote!(
             "{}: no previous generation; performing a full initial backup",
             job.name
-        ),
-        _ => {}
+        );
+    } else if run_mode.verbose {
+        for base in &link_dests {
+            crate::pnote!("  link-dest: {}", base.display());
+        }
     }
-    let staging = generation::prepare_staging(dest, base.is_some(), run_mode)?;
+    let staging = generation::prepare_staging(dest, !link_dests.is_empty(), run_mode)?;
 
     let mut rc = 1;
     let mut attempts = 0;
@@ -3118,7 +3186,7 @@ fn sync_generation(
             &job.source,
             &staging,
             excludes_file,
-            base.as_deref(),
+            &link_dests,
             rsync_extra,
             run_mode,
             &job.name,
@@ -4085,6 +4153,7 @@ mod tests {
                 exclude_pristine: false,
                 exclude_pristine_only: false,
                 session_seconds_override: None,
+                recreate: false,
             },
         )
         .expect("backup report");
@@ -4209,6 +4278,7 @@ mod tests {
                 exclude_pristine: true,
                 exclude_pristine_only: false,
                 session_seconds_override: None,
+                recreate: false,
             },
             false,
             true,
@@ -4339,6 +4409,7 @@ mod tests {
             &excludes,
             &[],
             run_mode(),
+            false,
         )
         .expect("sync_generation");
         if outcome.rc == 0 || outcome.rc == 24 {
@@ -4934,6 +5005,7 @@ mod tests {
             &excludes,
             &[],
             run_mode(),
+            false,
         )?;
         if outcome.rc == 0 || outcome.rc == 24 {
             generation::update_current(dest, day, run_mode())?;
@@ -5280,5 +5352,270 @@ mod tests {
         let file = tmp.path().join("file");
         fs::write(&file, "x").unwrap();
         assert!(generation::finalize_staging(&file, run_mode()).is_err());
+    }
+
+    // ---- skip-by-default and --recreate ----
+
+    /// A disk directory driven through the real `run_backup_for_day`, with job
+    /// locks and scratch files kept inside the test's own temp directory.
+    struct Full {
+        _tmp: tempfile::TempDir,
+        _lock_dir: crate::util::paths::test_lock_dir::Guard,
+        source: PathBuf,
+        disk: PathBuf,
+    }
+
+    fn full() -> Full {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let source = tmp.path().join("source");
+        let disk = tmp.path().join("disk");
+        fs::create_dir_all(&source).expect("source");
+        fs::create_dir_all(&disk).expect("disk");
+        fs::create_dir_all(tmp.path().join("locks")).expect("locks");
+        let lock_dir = crate::util::paths::test_lock_dir::set(&tmp.path().join("locks"));
+        Full {
+            _tmp: tmp,
+            _lock_dir: lock_dir,
+            source,
+            disk,
+        }
+    }
+
+    impl Full {
+        fn dest(&self) -> PathBuf {
+            self.disk.join("test")
+        }
+
+        fn run(&self, day: &str, recreate: bool) -> BackupJobReport {
+            let report = run_backup_for_day(
+                vec![gen_job(&self.source, 10)],
+                &[],
+                run_mode(),
+                &self.disk,
+                BackupOptions {
+                    exclude_pristine: false,
+                    exclude_pristine_only: false,
+                    session_seconds_override: None,
+                    recreate,
+                },
+                day,
+            )
+            .expect("backup report");
+            report.jobs.into_iter().next().expect("one job")
+        }
+    }
+
+    #[test]
+    fn second_run_on_the_same_day_is_skipped_and_changes_nothing() {
+        let f = full();
+        write(&f.source.join("a.txt"), "one");
+        let first = f.run("20260101", false);
+        assert_eq!(first.status, BackupJobStatus::Success);
+        let before = snapshot(&f.dest().join("20260101"));
+
+        write(&f.source.join("a.txt"), "two!");
+        let second = f.run("20260101", false);
+
+        assert_eq!(second.status, BackupJobStatus::AlreadyComplete);
+        assert_eq!(second.attempts, 0);
+        assert!(second.failure_reason.unwrap().contains("--recreate"));
+        assert_eq!(snapshot(&f.dest().join("20260101")), before);
+        assert_eq!(read(&f.dest().join("20260101/a.txt")), "one");
+        assert_eq!(gen_dirs(&f.dest()), vec!["20260101", "current"]);
+    }
+
+    #[test]
+    fn skip_repairs_current_after_a_crash_between_publish_and_current() {
+        let f = full();
+        write(&f.source.join("a.txt"), "one");
+        assert_eq!(f.run("20260101", false).status, BackupJobStatus::Success);
+        write(&f.source.join("a.txt"), "two!");
+        {
+            let _crash = generation::failpoint::set("after-publish");
+            assert_eq!(f.run("20260102", false).status, BackupJobStatus::Failed);
+        }
+        assert_eq!(current_target(&f.dest()).as_deref(), Some("20260101"));
+
+        // The day is complete, so it is skipped, but `current` is fixed first
+        // so a cascade would read the generation that actually exists.
+        let rerun = f.run("20260102", false);
+
+        assert_eq!(rerun.status, BackupJobStatus::AlreadyComplete);
+        assert_eq!(current_target(&f.dest()).as_deref(), Some("20260102"));
+        assert_eq!(read(&f.dest().join("20260102/a.txt")), "two!");
+    }
+
+    #[test]
+    fn recreate_rebuilds_only_the_current_day() {
+        let f = full();
+        write(&f.source.join("a.txt"), "one");
+        assert_eq!(f.run("20260101", false).status, BackupJobStatus::Success);
+        write(&f.source.join("a.txt"), "two!");
+        assert_eq!(f.run("20260102", false).status, BackupJobStatus::Success);
+        let history = snapshot(&f.dest().join("20260101"));
+
+        write(&f.source.join("a.txt"), "three!!");
+        let rebuilt = f.run("20260102", true);
+
+        assert_eq!(rebuilt.status, BackupJobStatus::Success);
+        assert_eq!(read(&f.dest().join("20260102/a.txt")), "three!!");
+        assert!(generation::marker_token(&f.dest().join("20260102")).is_some());
+        assert_eq!(current_target(&f.dest()).as_deref(), Some("20260102"));
+        assert_eq!(snapshot(&f.dest().join("20260101")), history);
+        assert_eq!(gen_dirs(&f.dest()), vec!["20260101", "20260102", "current"]);
+    }
+
+    #[test]
+    fn recreate_creates_the_day_when_it_does_not_exist() {
+        let f = full();
+        write(&f.source.join("a.txt"), "one");
+
+        let report = f.run("20260101", true);
+
+        assert_eq!(report.status, BackupJobStatus::Success);
+        assert_eq!(read(&f.dest().join("20260101/a.txt")), "one");
+    }
+
+    #[test]
+    fn recreate_links_against_the_previous_generation_and_reuses_the_old_target() {
+        let f = full();
+        write(&f.source.join("keep.txt"), "kept");
+        write(&f.source.join("a.txt"), "one");
+        assert_eq!(f.run("20260101", false).status, BackupJobStatus::Success);
+        write(&f.source.join("a.txt"), "two!");
+        write(&f.source.join("added.txt"), "added on day two");
+        assert_eq!(f.run("20260102", false).status, BackupJobStatus::Success);
+        let old_added = fs::metadata(f.dest().join("20260102/added.txt"))
+            .unwrap()
+            .ino();
+
+        write(&f.source.join("a.txt"), "three!!");
+        assert_eq!(f.run("20260102", true).status, BackupJobStatus::Success);
+
+        // Unchanged since day one: linked from the previous generation.
+        assert!(same_inode(
+            &f.dest().join("20260101/keep.txt"),
+            &f.dest().join("20260102/keep.txt")
+        ));
+        // Added on day two and unchanged since: reused from the old target.
+        assert_eq!(
+            fs::metadata(f.dest().join("20260102/added.txt"))
+                .unwrap()
+                .ino(),
+            old_added
+        );
+        assert_eq!(read(&f.dest().join("20260102/a.txt")), "three!!");
+    }
+
+    #[test]
+    fn failed_recreate_leaves_the_existing_generation_intact() {
+        let f = full();
+        write(&f.source.join("a.txt"), "one");
+        assert_eq!(f.run("20260101", false).status, BackupJobStatus::Success);
+        let before = snapshot(&f.dest().join("20260101"));
+
+        fs::remove_dir_all(&f.source).unwrap();
+        let report = f.run("20260101", true);
+
+        assert_eq!(report.status, BackupJobStatus::Failed);
+        assert_eq!(snapshot(&f.dest().join("20260101")), before);
+        assert_eq!(current_target(&f.dest()).as_deref(), Some("20260101"));
+        assert!(generation::marker_token(&f.dest().join("20260101")).is_some());
+    }
+
+    #[test]
+    fn crash_during_recreate_keeps_a_complete_generation() {
+        if !exchange_supported() {
+            return;
+        }
+        let f = full();
+        write(&f.source.join("a.txt"), "one");
+        assert_eq!(f.run("20260101", false).status, BackupJobStatus::Success);
+        write(&f.source.join("a.txt"), "two!");
+        {
+            let _crash = generation::failpoint::set("after-exchange");
+            assert_eq!(f.run("20260101", true).status, BackupJobStatus::Failed);
+        }
+
+        // The next run (skipped, nothing to rebuild) resolves the swap first.
+        let rerun = f.run("20260101", false);
+
+        assert_eq!(rerun.status, BackupJobStatus::AlreadyComplete);
+        assert_eq!(read(&f.dest().join("20260101/a.txt")), "two!");
+        assert_eq!(gen_dirs(&f.dest()), vec!["20260101", "current"]);
+    }
+
+    #[test]
+    fn recreate_refuses_a_day_older_than_the_newest_generation() {
+        let f = full();
+        write(&f.source.join("a.txt"), "one");
+        assert_eq!(f.run("20260101", false).status, BackupJobStatus::Success);
+        write(&f.source.join("a.txt"), "two!");
+        assert_eq!(f.run("20260102", false).status, BackupJobStatus::Success);
+        let old = snapshot(&f.dest().join("20260101"));
+        let newest = snapshot(&f.dest().join("20260102"));
+
+        write(&f.source.join("a.txt"), "three!!");
+        let report = f.run("20260101", true);
+
+        assert_eq!(report.status, BackupJobStatus::Failed);
+        assert!(report
+            .failure_reason
+            .unwrap()
+            .contains("refusing to recreate 20260101"));
+        assert_eq!(snapshot(&f.dest().join("20260101")), old);
+        assert_eq!(snapshot(&f.dest().join("20260102")), newest);
+    }
+
+    #[test]
+    fn partial_directory_from_an_old_release_is_not_a_complete_generation() {
+        let r = repo();
+        // No marker and not what `current` points at: an old release's partial.
+        write(&r.dest.join("20260101/a.txt"), "half");
+        assert!(!generation::is_complete_target(&r.dest, "20260101"));
+
+        // `current` only moved after a successful run, so its target counts.
+        symlink("20260101", r.dest.join("current")).unwrap();
+        assert!(generation::is_complete_target(&r.dest, "20260101"));
+
+        // A marker alone is enough.
+        write(&r.dest.join("20260102/.timevault-complete"), "tok");
+        assert!(generation::is_complete_target(&r.dest, "20260102"));
+
+        assert!(!generation::is_complete_target(&r.dest, "20260103"));
+    }
+
+    #[test]
+    fn link_dest_refs_choose_the_base_and_the_extra_reference() {
+        let (r, _f, _s) = two_generations();
+        let canon = |day: &str| r.dest.join(day).canonicalize().unwrap();
+
+        // Normal runs: just `current`.
+        assert_eq!(
+            generation::link_dest_refs(&r.dest, "20260103", false).unwrap(),
+            vec![canon("20260102")]
+        );
+        // Recreating the day `current` points at: previous generation first,
+        // then the existing day itself.
+        assert_eq!(
+            generation::link_dest_refs(&r.dest, "20260102", true).unwrap(),
+            vec![canon("20260101"), canon("20260102")]
+        );
+        // Recreating a day that does not exist yet behaves like a normal run.
+        assert_eq!(
+            generation::link_dest_refs(&r.dest, "20260103", true).unwrap(),
+            vec![canon("20260102")]
+        );
+    }
+
+    #[test]
+    fn link_dest_refs_with_nothing_older_use_only_the_existing_day() {
+        let r = repo();
+        write(&r.source.join("a.txt"), "one");
+        assert_eq!(run_gen(&r.source, &r.dest, "20260101", 10), 0);
+
+        let refs = generation::link_dest_refs(&r.dest, "20260101", true).unwrap();
+
+        assert_eq!(refs, vec![r.dest.join("20260101").canonicalize().unwrap()]);
     }
 }

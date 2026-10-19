@@ -1,5 +1,5 @@
 use std::io::{self, BufReader, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::error::{Result, TimevaultError};
@@ -16,7 +16,7 @@ pub fn run_rsync(
     source: &str,
     backup_dir: &Path,
     excludes_file: &Path,
-    link_dest: Option<&Path>,
+    link_dests: &[PathBuf],
     extra: &[String],
     run_mode: RunMode,
     label: &str,
@@ -33,7 +33,7 @@ pub fn run_rsync(
         args.push("--delete-after".to_string());
         args.push("--delete-excluded".to_string());
     }
-    if let Some(base) = link_dest {
+    for base in link_dests {
         args.push(format!("--link-dest={}", base.display()));
     }
     let streamed = progress::enabled();

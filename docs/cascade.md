@@ -37,6 +37,8 @@ Disks keep independent histories. Nothing is copied between them except the one 
 ## Success dependencies
 
 - A job cascades only if its backup to the primary produced a snapshot in this run. If the primary job failed, was skipped (for example, a failed pre-hook) or was offline, the cascade for that job is skipped with a note. Disks do not copy a stale `current`.
+- A job reported `already complete` on the primary (that day's generation already existed) still cascades. Its generation is intact, and a downstream disk that lacks that day still needs it. A downstream disk that already has the day reports `already complete` too and is left alone.
+- With `--recreate`, the primary rebuilds its current day first; downstream disks read the new generation only after it has been published, and if the rebuild fails they keep their existing generations. See [Skipping completed days and recreating](recreate.md).
 - The primary's `current` is only moved after a generation is published, so a downstream disk can never read an incomplete generation as its source.
 - If the cascade source directory is missing even though the primary succeeded, the run stops and reports an error.
 - A job failing on one downstream disk is recorded in the report for that disk; later disks and jobs still run.

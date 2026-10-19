@@ -164,6 +164,88 @@ fn current_generation_name(dest: &Path) -> Option<String> {
     dest.join(&name).is_dir().then_some(name)
 }
 
+/// Whether `<dest>/<backup_day>` is a completed generation: a real directory
+/// that either carries a completion marker or is what `current` points at
+/// (`current` only ever moved after a successful run, so this recognises
+/// generations from releases that predate the marker). Any other directory
+/// under that name is a partial left by an old release, not a recovery point.
+pub fn is_complete_target(dest: &Path, backup_day: &str) -> bool {
+    let target = dest.join(backup_day);
+    match fs::symlink_metadata(&target) {
+        Ok(meta) if meta.is_dir() => {}
+        _ => return false,
+    }
+    marker_token(&target).is_some() || current_generation_name(dest).as_deref() == Some(backup_day)
+}
+
+/// The newest generation directory of any kind, completed or not. Used to
+/// refuse rebuilding a day that is not the latest.
+pub fn newest_generation(dest: &Path) -> io::Result<Option<String>> {
+    let mut newest: Option<String> = None;
+    for entry in fs::read_dir(dest)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == "current" || name == ".timevault" || is_internal_name(&name) {
+            continue;
+        }
+        if entry.file_type()?.is_dir() && newest.as_deref().is_none_or(|n| name.as_str() > n) {
+            newest = Some(name);
+        }
+    }
+    Ok(newest)
+}
+
+/// The newest marked generation strictly older than `backup_day`.
+fn previous_complete_before(dest: &Path, backup_day: &str) -> io::Result<Option<PathBuf>> {
+    let mut best: Option<String> = None;
+    for entry in fs::read_dir(dest)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == "current" || name == ".timevault" || is_internal_name(&name) {
+            continue;
+        }
+        if name.as_str() >= backup_day
+            || !entry.file_type()?.is_dir()
+            || marker_token(&entry.path()).is_none()
+        {
+            continue;
+        }
+        if best.as_deref().is_none_or(|b| name.as_str() > b) {
+            best = Some(name);
+        }
+    }
+    Ok(best.and_then(|name| dest.join(name).canonicalize().ok()))
+}
+
+/// The `--link-dest` references for building `backup_day`, best first.
+///
+/// A normal run links against the last completed generation (`current`). When
+/// the day is being recreated and `current` is that very day, the previous
+/// generation is the base and the existing day is added as a second, read-only
+/// reference, so files unchanged since it are linked from it instead of stored
+/// again. The existing day is retired only after the replacement is published.
+pub fn link_dest_refs(dest: &Path, backup_day: &str, recreate: bool) -> io::Result<Vec<PathBuf>> {
+    let base = link_dest_base(dest);
+    if !recreate || !dest.is_dir() {
+        return Ok(base.into_iter().collect());
+    }
+    let existing = is_complete_target(dest, backup_day)
+        .then(|| dest.join(backup_day).canonicalize().ok())
+        .flatten();
+    let mut refs = Vec::new();
+    match (&base, &existing) {
+        (Some(base), Some(existing)) if base == existing => {
+            refs.extend(previous_complete_before(dest, backup_day)?);
+        }
+        (Some(base), _) => refs.push(base.clone()),
+        (None, _) => {}
+    }
+    if let Some(existing) = existing {
+        refs.push(existing);
+    }
+    Ok(refs)
+}
+
 /// The newest generation that carries a completion marker. Generations from
 /// releases that predate the marker are not considered.
 pub fn newest_complete(dest: &Path) -> io::Result<Option<String>> {

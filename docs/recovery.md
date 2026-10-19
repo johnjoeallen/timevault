@@ -51,7 +51,7 @@ A failed run never publishes anything, never moves `current` and never prunes.
 
 1. Read the failure reason in the run output or the emailed report. It includes the job, the disk, the rsync exit code and rsync's message.
 2. Fix the cause (unreachable host, full disk, failed hook, permission error).
-3. Run the job again: `sudo timevault backup --job <name>`.
+3. Run the job again: `sudo timevault backup --job <name>`. If the day was in fact published, the run reports `already complete`. To rebuild that day's generation anyway, add `--recreate` (see [Skipping completed days and recreating](recreate.md)).
 
 A leftover `.timevault-staging` directory is removed on the next run when the job has a previous generation. For an initial backup it is kept and rsync resumes into it. With `--safe`, it is left in place and the run resumes into it.
 
@@ -85,7 +85,7 @@ No manual repair is needed. At the start of each run for a job, Timevault resolv
 |---|---|---|
 | During rsync | partial `.timevault-staging` | discards it (a first backup resumes it) |
 | After rsync, before publishing | complete but unpublished `.timevault-staging` | discards it and builds again |
-| During a same-day replacement | `.timevault-publishing`, possibly the old generation under `.timevault-staging` or `.timevault-replaced-<day>` | keeps whichever generation was fully in place, removes the other, deletes the note |
+| During a `--recreate` (same-day replacement) | `.timevault-publishing`, possibly the old generation under `.timevault-staging` or `.timevault-replaced-<day>` | keeps whichever generation was fully in place, removes the other, deletes the note |
 | After publishing, before `current` moves | `current` points at the previous generation | points `current` at the newest finished generation |
 | During retention | some old generations already deleted | deletes the rest on the next successful run |
 

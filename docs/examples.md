@@ -152,6 +152,7 @@ Retention is per job and per disk: the three jobs keep different numbers of gene
 ```bash
 sudo timevault --job etc --print-order      # show how a job resolves
 sudo timevault backup --job etc --dry-run --verbose
+sudo timevault backup --job etc --recreate  # rebuild today's already-complete generation
 sudo timevault disk df
 sudo timevault disk check
 ```

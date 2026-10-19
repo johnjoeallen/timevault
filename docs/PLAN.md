@@ -1,6 +1,6 @@
 # Plan: relocation-aware reuse, disk-local index, safe publication, current-target recreation, rotation docs
 
-Status: approved plan, in progress. Phases 0, 1 and 2 done; Phase 3 next. Evolves the existing architecture; it does not replace it.
+Status: approved plan, in progress. Phases 0 to 3 done; Phase 4 next. Evolves the existing architecture; it does not replace it.
 
 This plan is kept current as work proceeds. What was done, decided and learned is recorded in [IMPLEMENTATION_LOG.md](IMPLEMENTATION_LOG.md); every change to the plan itself is noted there too.
 
@@ -9,7 +9,7 @@ This plan is kept current as work proceeds. What was done, decided and learned i
 | 0 Testing seams | Done (`465c5d6`, `84caaf1`) |
 | 1 Docs foundation | Done |
 | 2 Publication hardening | Done (1.14.4) |
-| 3 Current-target recreation | Not started |
+| 3 Current-target recreation | Done (1.15.0) |
 | 4 Disk-local SQLite index | Not started |
 | 5 Relocation-aware reuse | Not started |
 | 6 Rotation and cascade validation | Not started |
@@ -104,7 +104,7 @@ Definition of done for every phase:
 - Crash-injection tests: during rsync, after rsync before publish, mid-exchange, after publish before `current` update, during retention. Completed generations must be bit-identical before and after.
 - Docs: `architecture.md`, `recovery.md`, and the "Snapshot generations" section of `USER_GUIDE.md`.
 
-### Phase 3: current-target recreation (feature; minor)
+### Phase 3: current-target recreation (feature; minor) — DONE
 - `backup --recreate` (alias `--refresh`), current `backup_day` target only; historical targets are immutable and cannot be named.
 - Normal runs skip a completed target (`AlreadyComplete` status, so cascade still feeds disks that lack that generation).
 - Recreate builds fresh staging against the previous completed generation, optionally with the existing target as an extra read-only `--link-dest`, validates, exchanges, and retires the old copy only after success.
