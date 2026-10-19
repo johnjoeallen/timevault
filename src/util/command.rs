@@ -25,12 +25,7 @@ pub fn run_command(cmd: &mut Command, run_mode: RunMode) -> Result<i32> {
 
 pub fn run_nice_ionice(args: &[String], run_mode: RunMode) -> Result<i32> {
     let mut cmd = Command::new("nice");
-    cmd.arg("-n")
-        .arg("19")
-        .arg("ionice")
-        .arg("-c")
-        .arg("3")
-        .arg("-n7");
+    cmd.arg("-n").arg("19").arg("ionice").arg("-c").arg("3");
     for arg in args {
         cmd.arg(arg);
     }

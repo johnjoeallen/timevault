@@ -1,6 +1,6 @@
 # Plan: relocation-aware reuse, disk-local index, safe publication, current-target recreation, rotation docs
 
-Status: approved plan, in progress. Phases 0 to 5 done; Phase 6 next. Evolves the existing architecture; it does not replace it.
+Status: approved plan, in progress. Phases 0 to 6 done; Phase 7 (final pass and summary) next. Evolves the existing architecture; it does not replace it.
 
 This plan is kept current as work proceeds. What was done, decided and learned is recorded in [IMPLEMENTATION_LOG.md](IMPLEMENTATION_LOG.md); every change to the plan itself is noted there too.
 
@@ -12,7 +12,7 @@ This plan is kept current as work proceeds. What was done, decided and learned i
 | 3 Current-target recreation | Done (1.15.0) |
 | 4 Disk-local SQLite index | Done (1.16.0) |
 | 5 Relocation-aware reuse | Done (1.17.0; verification refined in 1.18.0) |
-| 6 Rotation and cascade validation | Not started |
+| 6 Rotation and cascade validation | Done (1.18.1) |
 | 7 Final pass and summary | Not started |
 
 Invariants (from the design brief): completed generations are immutable; each disk is an independent, self-contained repository; the index is an optimisation, never required for restore; retention never deletes completed generations to make room; cascade never consumes an incomplete upstream generation.
@@ -125,7 +125,7 @@ Definition of done for every phase:
 - Tests: bulk directory move, mass rename, rename plus move (check inode count and disk usage); shadow-directory test where a relocated file with changed permissions, owner or mtime is copied and earlier generations are untouched; bail-out falls back and the backup completes; dry-run vs real-run consistency when a file changes between passes; same size and mtime with different content caught by the hash tier; ENOSPC during linking, failed hard link, shadow cleanup after a crash; helper tests (arbitrary candidate list, cache hit and miss, remote failure falls back to size/mtime).
 - Docs: remove the "renamed files are copied again" caveat; document the pipeline, tiers, bail-out settings and benchmark results; `USER_GUIDE.md` job reference; note shared remote requirements with `--exclude-pristine`.
 
-### Phase 6: rotation and cascade validation (tests, plus fixes found)
+### Phase 6: rotation and cascade validation (tests, plus fixes found) — DONE
 - Integration scenarios for Strategies A, B, C, D, E, a 4-disk and a 5-disk setup, and G: disk returning after 7+ days and after several weeks; multiple jobs with different last-success dates; downstream disk cannot consume a failed upstream generation; disk fills while earlier generations stay intact; remote-source cascade (local stand-in, or loopback SSH gated by an environment variable).
 - Opt-in benchmark script (not in CI) against plain `--link-dest`: duration, bytes transferred, disk I/O, added space, hash CPU, SQLite overhead, bulk move, mass rename, and a remote job with nothing moved (pure overhead of the extra traversal). Record results honestly, including workloads where relocation does not help.
 - Docs: reconcile rotation and cascade guides with tested behaviour; add limitations found.

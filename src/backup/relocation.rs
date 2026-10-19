@@ -301,7 +301,7 @@ fn file_name_bytes(path: &[u8]) -> Vec<u8> {
 /// A read-only rsync run, started at low priority.
 fn rsync_command(args: &[&OsStr]) -> Command {
     let mut cmd = Command::new("nice");
-    cmd.args(["-n", "19", "ionice", "-c", "3", "-n7", "rsync"])
+    cmd.args(["-n", "19", "ionice", "-c", "3", "rsync"])
         .args(args)
         // rsync prints modification times in its own time zone.
         .env("TZ", "UTC")

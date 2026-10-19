@@ -3165,7 +3165,21 @@ fn create_excludes_file(excludes: &[String], filename: &Path) -> io::Result<()> 
     Ok(())
 }
 
-fn expire_old_backups(job: &Job, dest: &Path, run_mode: RunMode) -> io::Result<()> {
+/// Delete the oldest generations beyond `job.copies`.
+///
+/// After a successful publish pass the day that was just published as
+/// `published`: it is the one that must survive. The generation `current` still
+/// points at is then no longer special, so with `copies: 1` the previous
+/// generation is removed instead of being kept as an extra. (A crash before
+/// `current` moves leaves it dangling; the next run repairs it to the newest
+/// finished generation.) Without `published`, whatever `current` points at is
+/// protected, as it is the link-dest base.
+fn expire_old_backups(
+    job: &Job,
+    dest: &Path,
+    published: Option<&str>,
+    run_mode: RunMode,
+) -> io::Result<()> {
     if !dest.exists() {
         return Ok(());
     }
@@ -3183,14 +3197,18 @@ fn expire_old_backups(job: &Job, dest: &Path, run_mode: RunMode) -> io::Result<(
         }
         backups.push(name);
     }
-    // Never delete the generation `current` points at: it is the link-dest base.
-    let protected = generation::link_dest_base(dest);
+    let protected = match published {
+        Some(day) => dest.join(day).canonicalize().ok(),
+        None => generation::link_dest_base(dest),
+    };
 
     backups.sort();
     if backups.len() <= job.copies {
         return Ok(());
     }
 
+    // Only the oldest `to_delete` generations are candidates; a protected one
+    // among them is skipped, never replaced by a newer one.
     let to_delete = backups.len() - job.copies;
     for name in backups.iter().take(to_delete) {
         let target = dest.join(name);
@@ -3336,7 +3354,7 @@ fn sync_generation(
         generation::failpoint_hit("after-publish").map_err(publish_error)?;
         file_index.commit();
         crate::pstatus!("{}: pruning old snapshots", job.name);
-        if let Err(err) = expire_old_backups(job, dest, run_mode) {
+        if let Err(err) = expire_old_backups(job, dest, Some(backup_day), run_mode) {
             crate::pnote!("warning: pruning old snapshots failed: {}", err);
         }
     } else {
@@ -4774,7 +4792,7 @@ mod tests {
         // `current` points at the oldest name; it must survive pruning.
         symlink("20260101", r.dest.join("current")).unwrap();
 
-        expire_old_backups(&gen_job(&r.source, 1), &r.dest, run_mode()).unwrap();
+        expire_old_backups(&gen_job(&r.source, 1), &r.dest, None, run_mode()).unwrap();
 
         assert!(r.dest.join("20260101").exists());
         assert!(!r.dest.join("20260102").exists());
@@ -5419,7 +5437,7 @@ mod tests {
 
         {
             let _crash = generation::failpoint::set("mid-prune");
-            assert!(expire_old_backups(&gen_job(&r.source, 2), &r.dest, run_mode()).is_err());
+            assert!(expire_old_backups(&gen_job(&r.source, 2), &r.dest, None, run_mode()).is_err());
         }
         // One oldest generation was deleted before the interruption.
         assert_eq!(
@@ -5430,7 +5448,7 @@ mod tests {
         assert_eq!(snapshot(&r.dest.join("20260103")), third);
         assert!(generation::link_dest_base(&r.dest).is_some());
 
-        expire_old_backups(&gen_job(&r.source, 2), &r.dest, run_mode()).unwrap();
+        expire_old_backups(&gen_job(&r.source, 2), &r.dest, None, run_mode()).unwrap();
         assert_eq!(gen_dirs(&r.dest), vec!["20260103", "20260104", "current"]);
         assert_eq!(snapshot(&r.dest.join("20260104")), newest);
     }
@@ -6705,80 +6723,92 @@ mod tests {
         }
     }
 
+    fn disk_kib(disk: &Path) -> u64 {
+        let out = Command::new("du").arg("-sk").arg(disk).output().unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    fn scenario(
+        name: &str,
+        files: usize,
+        size: usize,
+        reloc: bool,
+        remote: Option<&crate::util::testsupport::SshLoopback>,
+        mutate: &dyn Fn(&Full),
+    ) {
+        let f = full();
+        let body = "x".repeat(size);
+        for i in 0..files {
+            let path = f.source.join(format!("d{:03}/f{:06}.dat", i % 200, i));
+            if i < 200 {
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+            }
+            fs::write(&path, format!("{i}:{body}")).unwrap();
+        }
+        let status = Command::new("find")
+            .arg(&f.source)
+            .args([
+                "-type",
+                "f",
+                "-exec",
+                "touch",
+                "-d",
+                "2020-05-05 10:00:00",
+                "{}",
+                "+",
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let cfg = if reloc {
+            relocation::RelocationConfig {
+                enabled: true,
+                min_size: 1,
+                ..relocation::RelocationConfig::default()
+            }
+        } else {
+            relocation::RelocationConfig::default()
+        };
+        let run = |day: &str| {
+            let mut job = gen_job(&f.source, 10);
+            if let Some(ssh) = remote {
+                job.source = ssh.source(&f.source);
+            }
+            f.run_jobs_reloc(vec![job], day, false, false, cfg)[0].status
+        };
+        let t = Instant::now();
+        assert_eq!(run("20260101"), BackupJobStatus::Success);
+        let first = t.elapsed();
+        let before = disk_kib(&f.disk);
+        mutate(&f);
+        let t = Instant::now();
+        assert_eq!(run("20260102"), BackupJobStatus::Success);
+        let second = t.elapsed();
+        let after = disk_kib(&f.disk);
+        eprintln!(
+            "{:<12} {:<18} initial {:>8.2?}  next run {:>8.2?}  extra disk {:>8} KiB",
+            name,
+            format!(
+                "{}{}",
+                if reloc { "relocation" } else { "plain" },
+                if remote.is_some() { " (ssh)" } else { "" }
+            ),
+            first,
+            second,
+            after - before
+        );
+    }
+
     /// Cost and benefit of moved-file detection on a local tree. Run with:
     /// `cargo test --release bench_relocation -- --ignored --nocapture`
     #[test]
     #[ignore]
     fn bench_relocation() {
-        fn disk_kib(disk: &Path) -> u64 {
-            let out = Command::new("du").arg("-sk").arg(disk).output().unwrap();
-            String::from_utf8_lossy(&out.stdout)
-                .split_whitespace()
-                .next()
-                .unwrap()
-                .parse()
-                .unwrap()
-        }
-
-        fn scenario(name: &str, files: usize, size: usize, reloc: bool, mutate: &dyn Fn(&Full)) {
-            let f = full();
-            let body = "x".repeat(size);
-            for i in 0..files {
-                let path = f.source.join(format!("d{:03}/f{:06}.dat", i % 200, i));
-                if i < 200 {
-                    fs::create_dir_all(path.parent().unwrap()).unwrap();
-                }
-                fs::write(&path, format!("{i}:{body}")).unwrap();
-            }
-            let status = Command::new("find")
-                .arg(&f.source)
-                .args([
-                    "-type",
-                    "f",
-                    "-exec",
-                    "touch",
-                    "-d",
-                    "2020-05-05 10:00:00",
-                    "{}",
-                    "+",
-                ])
-                .status()
-                .unwrap();
-            assert!(status.success());
-            let cfg = if reloc {
-                relocation::RelocationConfig {
-                    enabled: true,
-                    min_size: 1,
-                    ..relocation::RelocationConfig::default()
-                }
-            } else {
-                relocation::RelocationConfig::default()
-            };
-            let t = Instant::now();
-            assert_eq!(
-                f.run_reloc("20260101", cfg).status,
-                BackupJobStatus::Success
-            );
-            let first = t.elapsed();
-            let before = disk_kib(&f.disk);
-            mutate(&f);
-            let t = Instant::now();
-            assert_eq!(
-                f.run_reloc("20260102", cfg).status,
-                BackupJobStatus::Success
-            );
-            let second = t.elapsed();
-            let after = disk_kib(&f.disk);
-            eprintln!(
-                "{:<12} {:<10} initial {:>8.2?}  next run {:>8.2?}  extra disk {:>8} KiB",
-                name,
-                if reloc { "relocation" } else { "plain" },
-                first,
-                second,
-                after - before
-            );
-        }
-
         let files = 20_000;
         let size = 4096;
         let nothing: &dyn Fn(&Full) = &|_| {};
@@ -6801,13 +6831,179 @@ mod tests {
         };
         eprintln!("{} files of about {} bytes", files, size);
         for reloc in [false, true] {
-            scenario("no change", files, size, reloc, nothing);
+            scenario("no change", files, size, reloc, None, nothing);
         }
         for reloc in [false, true] {
-            scenario("bulk move", files, size, reloc, bulk_move);
+            scenario("bulk move", files, size, reloc, None, bulk_move);
         }
         for reloc in [false, true] {
-            scenario("mass rename", files, size, reloc, mass_rename);
+            scenario("mass rename", files, size, reloc, None, mass_rename);
         }
+    }
+
+    /// The same, with the source reached over real SSH to this machine, to
+    /// show what the extra dry-run pass costs through the rsync/SSH protocol.
+    /// Loopback has no network latency or bandwidth limit, so this shows the
+    /// protocol and process cost only. Needs key-based login to localhost:
+    /// `TIMEVAULT_TEST_SSH=1 cargo test --release bench_relocation_over_ssh \
+    ///    -- --ignored --nocapture --test-threads=1`
+    #[test]
+    #[ignore]
+    fn bench_relocation_over_ssh() {
+        let Some(ssh) = crate::util::testsupport::SshLoopback::enabled() else {
+            return;
+        };
+        let files = 20_000;
+        let size = 4096;
+        let nothing: &dyn Fn(&Full) = &|_| {};
+        let bulk_move: &dyn Fn(&Full) = &|f| {
+            fs::create_dir_all(f.source.join("moved")).unwrap();
+            for d in 0..200 {
+                fs::rename(
+                    f.source.join(format!("d{d:03}")),
+                    f.source.join(format!("moved/d{d:03}")),
+                )
+                .unwrap();
+            }
+        };
+        let mass_rename: &dyn Fn(&Full) = &|f| {
+            for i in 0..20_000usize {
+                let from = f.source.join(format!("d{:03}/f{:06}.dat", i % 200, i));
+                let to = f.source.join(format!("d{:03}/r{:06}.dat", i % 200, i));
+                fs::rename(from, to).unwrap();
+            }
+        };
+        eprintln!("{} files of about {} bytes", files, size);
+        for reloc in [false, true] {
+            scenario("no change", files, size, reloc, Some(&ssh), nothing);
+        }
+        for reloc in [false, true] {
+            scenario("bulk move", files, size, reloc, Some(&ssh), bulk_move);
+        }
+        for reloc in [false, true] {
+            scenario("mass rename", files, size, reloc, Some(&ssh), mass_rename);
+        }
+    }
+
+    // ---- a genuinely full disk ----
+
+    /// Fills a real (small) filesystem: the outer test re-runs this binary
+    /// inside a mount namespace that has a 3 MiB tmpfs at `$TIMEVAULT_SMALL_FS`.
+    #[test]
+    fn a_full_disk_fails_the_run_and_deletes_nothing() {
+        if let Some(ok) =
+            crate::util::testsupport::run_with_small_fs("backup::tests::full_disk_inner", "3m")
+        {
+            assert!(ok, "the inner test failed; see its output above");
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn full_disk_inner() {
+        let Some(mount) = std::env::var_os("TIMEVAULT_SMALL_FS") else {
+            return;
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        fs::create_dir_all(tmp.path().join("locks")).unwrap();
+        let lock_dir = crate::util::paths::test_lock_dir::set(&tmp.path().join("locks"));
+        let source = tmp.path().join("source");
+        fs::create_dir_all(&source).unwrap();
+        let disk = PathBuf::from(mount).join("disk");
+        fs::create_dir_all(&disk).unwrap();
+        let f = Full {
+            _tmp: tmp,
+            _lock_dir: lock_dir,
+            source,
+            disk,
+        };
+        let job = |f: &Full| gen_job(&f.source, 1); // copies: 1, so a publish would prune day one
+
+        write(&f.source.join("small.dat"), &"s".repeat(100 * 1024));
+        let first = f.run_jobs(vec![job(&f)], "20260101", false, false);
+        assert_eq!(first[0].status, BackupJobStatus::Success);
+        let history = snapshot(&f.dest().join("20260101"));
+
+        // A new 4 MiB file cannot fit on a 3 MiB filesystem.
+        write(&f.source.join("big.dat"), &"B".repeat(4 * 1024 * 1024));
+        let full = f.run_jobs(vec![job(&f)], "20260102", false, false);
+
+        assert_eq!(full[0].status, BackupJobStatus::Failed);
+        let reason = full[0].failure_reason.clone().unwrap();
+        assert!(reason.contains("out of space"), "{reason}");
+        assert!(
+            reason.contains("no completed generation was deleted"),
+            "{reason}"
+        );
+        // The only completed generation is exactly as it was, even though
+        // copies is 1 and a successful run would have pruned it.
+        assert!(!f.dest().join("20260102").exists());
+        assert_eq!(current_target(&f.dest()).as_deref(), Some("20260101"));
+        assert_eq!(snapshot(&f.dest().join("20260101")), history);
+        assert!(generation::marker_token(&f.dest().join("20260101")).is_some());
+
+        // Free the space the source was using, and the next run succeeds and
+        // only then prunes.
+        fs::remove_file(f.source.join("big.dat")).unwrap();
+        write(&f.source.join("small.dat"), &"t".repeat(100 * 1024));
+        let again = f.run_jobs(vec![job(&f)], "20260103", false, false);
+        assert_eq!(again[0].status, BackupJobStatus::Success);
+        assert_eq!(gen_dirs(&f.dest()), vec!["20260103", "current"]);
+        assert!(!f.dest().join(generation::STAGING_NAME).exists());
+    }
+
+    #[test]
+    fn copies_of_one_keeps_exactly_one_generation_after_each_successful_run() {
+        let r = repo();
+        for (i, day) in ["20260101", "20260102", "20260103", "20260104"]
+            .iter()
+            .enumerate()
+        {
+            write(&r.source.join("a.txt"), &format!("version {i}"));
+            assert_eq!(run_gen(&r.source, &r.dest, day, 1), 0);
+            // The generation just published is kept; the previous one, which
+            // `current` pointed at while pruning, is not kept as an extra.
+            assert_eq!(gen_dirs(&r.dest), vec![*day, "current"], "after {day}");
+        }
+    }
+
+    #[test]
+    fn crash_after_pruning_the_old_current_is_repaired_and_still_links() {
+        let r = repo();
+        write(&r.source.join("keep.txt"), "unchanging");
+        write(&r.source.join("a.txt"), "one");
+        assert_eq!(run_gen(&r.source, &r.dest, "20260101", 1), 0);
+        write(&r.source.join("a.txt"), "two!");
+        {
+            let _crash = generation::failpoint::set("before-current-rename");
+            assert!(try_run_gen(&r.source, &r.dest, "20260102", 1).is_err());
+        }
+        // Day one was pruned, so `current` dangles until it is repaired.
+        assert!(!r.dest.join("20260101").exists());
+        assert!(generation::link_dest_base(&r.dest).is_none());
+        assert!(generation::marker_token(&r.dest.join("20260102")).is_some());
+
+        write(&r.source.join("a.txt"), "three!!");
+        assert_eq!(run_gen(&r.source, &r.dest, "20260103", 1), 0);
+
+        // The next run repaired `current` first, so it linked against day two
+        // instead of copying everything again.
+        assert_eq!(gen_dirs(&r.dest), vec!["20260103", "current"]);
+        assert_eq!(read(&r.dest.join("20260103/a.txt")), "three!!");
+        assert_eq!(read(&r.dest.join("20260103/keep.txt")), "unchanging");
+    }
+
+    #[test]
+    fn a_failed_run_with_copies_of_one_still_deletes_nothing() {
+        let r = repo();
+        write(&r.source.join("a.txt"), "one");
+        assert_eq!(run_gen(&r.source, &r.dest, "20260101", 1), 0);
+        let before = snapshot(&r.dest.join("20260101"));
+        fs::remove_dir_all(&r.source).unwrap();
+
+        assert_ne!(run_gen(&r.source, &r.dest, "20260102", 1), 0);
+
+        assert_eq!(snapshot(&r.dest.join("20260101")), before);
+        assert_eq!(current_target(&r.dest).as_deref(), Some("20260101"));
     }
 }

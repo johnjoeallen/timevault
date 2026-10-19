@@ -19,7 +19,7 @@ Generations are named by day. If a job runs more than once on the same backup da
 ### How pruning works
 
 - After a new generation is published, the oldest generations beyond `copies` are deleted. Names sort by date, so oldest means smallest `YYYYMMDD`.
-- The generation `current` points to is never deleted.
+- The generation that was just published is never deleted, so `copies: 1` keeps exactly the newest generation. (Before 1.18.1 the protected generation was whichever `current` still pointed at, which left `copies: 1` holding two.) If the machine stops after the old generation is pruned but before `current` moves, the next run repoints `current` at the newest finished generation and carries on from there.
 - Pruning runs only after a successful publish. A failed backup deletes nothing.
 - Timevault never deletes completed generations to make room for a backup that is failing. See [Out of space](#out-of-space).
 

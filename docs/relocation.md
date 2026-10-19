@@ -115,8 +115,24 @@ Measured on a local filesystem with a warm cache, 20,000 files of about 4 KiB ea
 Reading the table:
 
 - Relocation costs time on every run, roughly 12 microseconds per file here for the index and the dry-run pass, and about 40 microseconds per moved file for hashing. (These figures are from before the folder-move and size-limit rules; the local numbers are unaffected by them.) With few, large files the saving in copying and disk space dwarfs this; for a tree that never reorganises it is overhead you pay for nothing.
-- These numbers are for a **local** source. The extra dry-run pass over **SSH** was not measured: it adds a file-list exchange with the remote host, which on a large tree over a slow link can take minutes. That is the reason `timeoutSeconds` exists, and why you may want `relocation: false` on slow remote jobs and `true` on local and cascade ones.
+- The extra dry-run pass over **SSH** is measured below. Loopback SSH has no network latency or bandwidth limit, so those figures show the protocol and process cost only; a real link adds the same time to the dry run and to the normal run, since both exchange a file list.
+- `timeoutSeconds` bounds the worst case, and `relocation: false` (globally or per job) opts a slow remote job out.
 - The benchmark is reproducible: `cargo test --release bench_relocation -- --ignored --nocapture`.
+
+### Over SSH
+
+The same workload with the source reached over real SSH to the same machine:
+
+| Change before the next run | Without relocation | With relocation |
+|---|---|---|
+| Nothing | 0.66 s, 0.8 MiB | 1.03 s, 5.3 MiB |
+| Every folder moved | 0.77 s, 157 MiB | 2.56 s, 5.8 MiB |
+| Every file renamed (identical sizes and times) | 0.76 s, 157 MiB | 1.31 s, 162 MiB |
+
+- On a quiet night the extra dry-run pass added about 0.37 s for 20,000 files, roughly **56 %** more run time here. That is less than a doubling in this measurement.
+- A moved folder is the best case: 157 MiB of copying avoided, at the price of about 1.8 s. The folders are trusted as a group, so no file is read on the remote host.
+- The last row shows a **limit**: when thousands of renamed files share the same size and modification time, a remote source cannot tell them apart without reading them, so nothing is paired and nothing is saved (the extra pass was wasted). Real collections rarely have this uniformity; with a local source the same rename is fully recovered by content. The change limit and the time limit bound the cost of such a case.
+- The figures are one machine's loopback; treat them as an estimate of the protocol overhead, and measure on your own link with `TIMEVAULT_TEST_SSH=1 cargo test --release bench_relocation_over_ssh -- --ignored --nocapture --test-threads=1`.
 
 ## When it helps and when it does not
 

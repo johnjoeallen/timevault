@@ -79,6 +79,16 @@ Week 4: A + B connected, C offline
 
 Only one disk changes at each swap, so one disk is always carried over from the previous period.
 
+With daily backups, after the four weeks above (days 1 to 28), each disk holds exactly the days it was connected for, and no more:
+
+| Disk | Days held | Why |
+|---|---|---|
+| A | 1-7 and 15-28 | connected in weeks 1, 3 and 4 |
+| B | 1-14 and 22-28 | connected in weeks 1, 2 and 4 |
+| C | 8-21 | connected in weeks 2 and 3 |
+
+Every day is held by exactly two disks. When A returns on day 15 it links against its own day 7, and when C first appears on day 8 it starts with a full copy and then links normally. The primary is the first connected disk in config order, so it is A in weeks 1, 3 and 4 and B in week 2.
+
 - **Configuration:** enroll all three in config order A, B, C and enable cascade.
 - **Advantages:** two connected repositories receive every backup; one disk stays offline; the carried-over disk holds yesterday's generation; no permanent primary; wear is shared; returning disks resume from their own history; the original source is read once per job.
 - **How a swap works:** going from A+B to B+C, disk B already has recent generations. Disk C has a generation that may be a week old; it receives the current backup through cascade and links against its own old generation. Nothing is copied between disks to bring C's history up to date.

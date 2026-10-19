@@ -44,12 +44,7 @@ pub fn run_rsync(
     args.push(source);
     args.push(backup_dir);
     let mut cmd = Command::new("nice");
-    cmd.arg("-n")
-        .arg("19")
-        .arg("ionice")
-        .arg("-c")
-        .arg("3")
-        .arg("-n7");
+    cmd.arg("-n").arg("19").arg("ionice").arg("-c").arg("3");
     cmd.args(&args);
 
     if run_mode.dry_run {
