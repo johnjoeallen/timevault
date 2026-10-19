@@ -36,7 +36,9 @@ jobs:
       - name: Check user guide covers every CLI option
         run: scripts/check-docs.sh
 
-      - name: Check YAML examples in docs parse
+      - name: Check the docs' YAML examples load and their commands exist
         run: |
           cargo build --locked
           python3 scripts/check-docs-yaml.py
+          python3 scripts/check-docs-commands.py
+          python3 scripts/check-docs-links.py

@@ -577,6 +577,10 @@ fn source_digest(input: &MatchInput<'_>, new: &NewFile) -> Option<SourceDigest> 
     })
 }
 
+/// Old files sharing a size and modification time, with their contents hashed:
+/// the records, and positions in them grouped by hash.
+type KeptGroup = (Vec<FileRecord>, HashMap<String, Vec<usize>>);
+
 /// Hash every record of a group of old files once, in a single transaction,
 /// and index them by hash. Entries are positions in `records`. A file that
 /// changed since it was indexed is left out. Stops early at the deadline.
@@ -699,10 +703,9 @@ pub fn match_changes(
                 stats.rejected += 1;
                 continue;
             };
-            if !gone_groups.contains_key(&key) {
+            if let std::collections::hash_map::Entry::Vacant(slot) = gone_groups.entry(key) {
                 let records: Vec<&FileRecord> = all.iter().map(|&i| &gone[i]).collect();
-                let group = hash_group(input, index, &records, &mut stats.hit_deadline)?;
-                gone_groups.insert(key, group);
+                slot.insert(hash_group(input, index, &records, &mut stats.hit_deadline)?);
             }
             let found = gone_groups
                 .get(&key)
@@ -765,8 +768,7 @@ pub fn match_changes(
     // Copies: the old file still exists, so only identical content justifies
     // sharing it, which needs a local source to read.
     if hash_ok {
-        let mut kept_groups: HashMap<(u64, i64), (Vec<FileRecord>, HashMap<String, Vec<usize>>)> =
-            HashMap::new();
+        let mut kept_groups: HashMap<(u64, i64), KeptGroup> = HashMap::new();
         for (ni, n) in news.iter().enumerate() {
             if paired_new.contains(&ni) || !cfg.may_hash(n.size) {
                 continue;
@@ -776,7 +778,7 @@ pub fn match_changes(
                 break;
             }
             let key = (n.size, n.mtime);
-            if !kept_groups.contains_key(&key) {
+            if let std::collections::hash_map::Entry::Vacant(slot) = kept_groups.entry(key) {
                 let records: Vec<FileRecord> = index
                     .find_by_size(Role::Previous, n.size)?
                     .into_iter()
@@ -788,7 +790,7 @@ pub fn match_changes(
                     let refs: Vec<&FileRecord> = records.iter().collect();
                     hash_group(input, index, &refs, &mut stats.hit_deadline)?
                 };
-                kept_groups.insert(key, (records, group));
+                slot.insert((records, group));
             }
             let (records, group) = &kept_groups[&key];
             if group.is_empty() {

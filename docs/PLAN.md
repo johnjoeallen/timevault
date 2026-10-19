@@ -1,6 +1,6 @@
 # Plan: relocation-aware reuse, disk-local index, safe publication, current-target recreation, rotation docs
 
-Status: approved plan, in progress. Phases 0 to 6 done; Phase 7 (final pass and summary) next. Evolves the existing architecture; it does not replace it.
+Status: approved plan, in progress. All phases are done. The outcome is summarised in [IMPLEMENTATION_SUMMARY.md](IMPLEMENTATION_SUMMARY.md). Evolves the existing architecture; it does not replace it.
 
 This plan is kept current as work proceeds. What was done, decided and learned is recorded in [IMPLEMENTATION_LOG.md](IMPLEMENTATION_LOG.md); every change to the plan itself is noted there too.
 
@@ -13,7 +13,7 @@ This plan is kept current as work proceeds. What was done, decided and learned i
 | 4 Disk-local SQLite index | Done (1.16.0) |
 | 5 Relocation-aware reuse | Done (1.17.0; verification refined in 1.18.0) |
 | 6 Rotation and cascade validation | Done (1.18.1) |
-| 7 Final pass and summary | Not started |
+| 7 Final pass and summary | Done (1.19.0) |
 
 Invariants (from the design brief): completed generations are immutable; each disk is an independent, self-contained repository; the index is an optimisation, never required for restore; retention never deletes completed generations to make room; cascade never consumes an incomplete upstream generation.
 
@@ -130,7 +130,7 @@ Definition of done for every phase:
 - Opt-in benchmark script (not in CI) against plain `--link-dest`: duration, bytes transferred, disk I/O, added space, hash CPU, SQLite overhead, bulk move, mass rename, and a remote job with nothing moved (pure overhead of the extra traversal). Record results honestly, including workloads where relocation does not help.
 - Docs: reconcile rotation and cascade guides with tested behaviour; add limitations found.
 
-### Phase 7: final pass and summary
+### Phase 7: final pass and summary — DONE
 - Full build and tests, `cargo fmt --check`, `cargo check --locked`, `cargo test --locked`, `cargo clippy` if clean on the baseline.
 - Re-read every document against the shipped CLI and config.
 - Write the implementation summary: decisions, trade-offs, test results, remaining limitations.

@@ -1580,10 +1580,7 @@ mod tests {
 
         lab.fill_source(&lab.source, 2);
         let job = lab.job("data", &lab.source, 20);
-        let err = lab
-            .run(2, &["a", "b", "c"], true, vec![job])
-            .err()
-            .expect("the mount error stops the run");
+        let err = lab.run(2, &["a", "b", "c"], true, vec![job]).unwrap_err();
 
         assert!(err.to_string().contains("cannot mount b"));
         // The primary had finished; the disk after the failure was not reached.
@@ -1781,6 +1778,7 @@ fn mount_and_verify(
     Ok((disk_guard, mountpoint))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_backup_checked(
     host: &dyn DiskHost,
     disk_id: String,

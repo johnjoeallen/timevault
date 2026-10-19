@@ -33,14 +33,15 @@ Each published generation also contains a small `.timevault-complete` file at it
 ## How a generation is built
 
 1. **Lock the job.** A per-job lock (`/var/run/timevault.<job>.pid`) stops two runs of the *same* job. Different jobs can run at the same time (see [Parallel jobs](#parallel-jobs)).
-2. **Prepare the source.** Remote jobs wake and inhibit suspend on the remote host if configured, then pre-hooks run.
-2a. **Skip a completed day.** If the backup day already has a completed generation on this disk, the job is reported `already complete` and the steps below do not run, unless `--recreate` was given. This check happens before the remote host is woken. See [Skipping completed days and recreating](recreate.md).
-3. **Pick the link-dest base.** The base is the directory `current` points to *on this disk, for this job*. If there is none, the run is a full initial backup. When recreating the day `current` already points at, the previous generation is the base and the existing day is added as a second, read-only reference.
-4. **Prepare staging.** A leftover `.timevault-staging` is discarded when there is a base (its files could be hard links into completed generations). For an initial backup it is kept and rsync resumes into it.
-5. **Run rsync** into `.timevault-staging` with `-ar --stats`, `--exclude-from`, `--link-dest=<base>`, and, unless `--safe`, `--delete-after --delete-excluded`. It retries up to three times. Exit code 0, or 24 (files vanished during the run), counts as success.
-6. **Finish and publish.** On success the staged data is flushed to disk, `.timevault-complete` is added, and the staging directory is renamed to `<job>/<backup day>`. The rename is atomic on one filesystem, so an incomplete generation is never visible under a generation name, and the marker never exists before the data is on disk. If that day's generation already exists (a same-day re-run), the two directories are swapped in a single step (`renameat2` with `RENAME_EXCHANGE`) where the filesystem supports it, so the day's name never disappears; otherwise the old one is set aside first. The displaced old generation is removed afterwards.
-7. **Retention.** Only after publishing, the oldest generations beyond `copies` are deleted. The generation just published is never deleted.
-8. **Move `current`** to the new generation by renaming a temporary link over it, so `current` is never missing or half-written. Then run post-hooks.
+2. **Skip a completed day.** If the backup day already has a completed generation on this disk, the job is reported `already complete` and nothing below runs, unless `--recreate` was given. This happens before the remote host is woken. See [Skipping completed days and recreating](recreate.md).
+3. **Prepare the source.** Remote jobs wake and inhibit suspend on the remote host if configured, then pre-hooks run.
+4. **Pick the link-dest base.** The base is the directory `current` points to *on this disk, for this job*. If there is none, the run is a full initial backup. When recreating the day `current` already points at, the previous generation is the base and the existing day is added as a second, read-only reference.
+5. **Prepare staging.** A leftover `.timevault-staging` is discarded when there is a base (its files could be hard links into completed generations). For an initial backup it is kept and rsync resumes into it. The [file index](#disk-local-file-index) is brought up to date with the base generation.
+6. **Look for moved or renamed files** (on by default). A read-only dry run of the same rsync command against the base lists what is new and what vanished; matches are hard-linked under `<job>/.timevault-reloc`, which is offered to rsync as one more `--link-dest`. See [Reusing moved and renamed files](relocation.md). If anything goes wrong here, the run simply continues without it.
+7. **Run rsync** into `.timevault-staging` with `-ar --stats`, `--exclude-from`, `--link-dest=<base>` (plus the scratch directory from step 6), and, unless `--safe`, `--delete-after --delete-excluded`. It retries up to three times. Exit code 0, or 24 (files vanished during the run), counts as success. The scratch directory is removed afterwards.
+8. **Finish and publish.** On success the staged data is flushed to disk, `.timevault-complete` is added, the new generation is recorded in the file index, and the staging directory is renamed to `<job>/<backup day>`. The rename is atomic on one filesystem, so an incomplete generation is never visible under a generation name, and the marker never exists before the data is on disk. If that day's generation already exists (a `--recreate`), the two directories are swapped in a single step (`renameat2` with `RENAME_EXCHANGE`) where the filesystem supports it, so the day's name never disappears; otherwise the old one is set aside first. The displaced old generation is removed afterwards. Only then does the file index advance its roles.
+9. **Retention.** Only after publishing, the oldest generations beyond `copies` are deleted. The generation just published is never deleted.
+10. **Move `current`** to the new generation by renaming a temporary link over it, so `current` is never missing or half-written. Then run post-hooks.
 
 At the start of every run, Timevault first finishes or undoes any interrupted replacement, then checks `current`: if it is missing, dangling, or older than the newest generation carrying a completion marker (a run was interrupted after publishing but before moving `current`), it is pointed at that generation. Generations from releases that predate the marker are not chosen by this repair.
 
@@ -50,12 +51,15 @@ If rsync fails, nothing is published, `current` does not move, and nothing is pr
 flowchart TD
     S[Source: local path or user@host:/path] --> L{Job lock free?}
     L -- no --> X[Refuse: job already running]
-    L -- yes --> B[link-dest base = this disk's current for this job]
+    L -- yes --> K{Day already complete on this disk?}
+    K -- "yes, no --recreate" --> AC[Report already complete, change nothing]
+    K -- no --> B[link-dest base = this disk's current for this job]
     B --> ST[.timevault-staging]
-    ST --> R[rsync --link-dest=base]
-    R -- exit 0 or 24 --> P[Rename staging to job/YYYYMMDD]
+    ST --> M[Look for moved or renamed files: shadow link-dest]
+    M --> R[rsync --link-dest=base --link-dest=shadow]
+    R -- exit 0 or 24 --> P[Flush, mark complete, rename staging to job/YYYYMMDD]
     R -- failure --> F[Nothing published, current unchanged, nothing pruned]
-    P --> RT[Prune oldest beyond copies]
+    P --> RT[Prune oldest beyond copies, never the new generation]
     RT --> C[Move current symlink]
     C --> CAS{Cascade enabled?}
     CAS -- yes --> D[Other connected disks copy from primary job/current]

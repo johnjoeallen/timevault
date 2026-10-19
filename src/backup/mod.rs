@@ -3251,6 +3251,7 @@ struct SyncOutcome {
 /// last completed generation, publish it only if rsync succeeded, and prune
 /// expired generations only after that. A failed run leaves every completed
 /// generation untouched.
+#[allow(clippy::too_many_arguments)]
 fn sync_generation(
     job: &Job,
     dest: &Path,

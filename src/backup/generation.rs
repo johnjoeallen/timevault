@@ -58,64 +58,6 @@ pub fn is_internal_name(name: &str) -> bool {
         || name.starts_with(REPLACED_PREFIX)
 }
 
-/// Test-only fail points, used to simulate a crash at a named step by making
-/// that step return an error with no cleanup. Compiled out of release builds.
-#[cfg(test)]
-pub mod failpoint {
-    use std::cell::{Cell, RefCell};
-    use std::io;
-
-    thread_local! {
-        static ACTIVE: RefCell<Option<String>> = const { RefCell::new(None) };
-        static NO_EXCHANGE: Cell<bool> = const { Cell::new(false) };
-    }
-
-    pub struct Guard;
-
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            ACTIVE.with(|a| *a.borrow_mut() = None);
-            NO_EXCHANGE.with(|n| n.set(false));
-        }
-    }
-
-    /// Make the step called `name` fail on this thread until the guard drops.
-    pub fn set(name: &str) -> Guard {
-        ACTIVE.with(|a| *a.borrow_mut() = Some(name.to_string()));
-        Guard
-    }
-
-    /// Pretend the filesystem does not support `RENAME_EXCHANGE`.
-    pub fn disable_exchange() -> Guard {
-        NO_EXCHANGE.with(|n| n.set(true));
-        Guard
-    }
-
-    pub fn exchange_disabled() -> bool {
-        NO_EXCHANGE.with(Cell::get)
-    }
-
-    pub fn hit(name: &str) -> io::Result<()> {
-        ACTIVE.with(|a| match a.borrow().as_deref() {
-            Some(active) if active == name => Err(io::Error::other(format!("failpoint {}", name))),
-            _ => Ok(()),
-        })
-    }
-}
-
-#[cfg(not(test))]
-mod failpoint {
-    use std::io;
-
-    pub fn exchange_disabled() -> bool {
-        false
-    }
-
-    pub fn hit(_name: &str) -> io::Result<()> {
-        Ok(())
-    }
-}
-
 /// Test hook for steps outside this module (retention).
 pub fn failpoint_hit(name: &str) -> io::Result<()> {
     failpoint::hit(name)
@@ -614,4 +556,62 @@ fn publish_by_aside(
     }
     remove_replaced(&replaced, run_mode);
     Ok(())
+}
+
+/// Test-only fail points, used to simulate a crash at a named step by making
+/// that step return an error with no cleanup. Compiled out of release builds.
+#[cfg(test)]
+pub mod failpoint {
+    use std::cell::{Cell, RefCell};
+    use std::io;
+
+    thread_local! {
+        static ACTIVE: RefCell<Option<String>> = const { RefCell::new(None) };
+        static NO_EXCHANGE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            ACTIVE.with(|a| *a.borrow_mut() = None);
+            NO_EXCHANGE.with(|n| n.set(false));
+        }
+    }
+
+    /// Make the step called `name` fail on this thread until the guard drops.
+    pub fn set(name: &str) -> Guard {
+        ACTIVE.with(|a| *a.borrow_mut() = Some(name.to_string()));
+        Guard
+    }
+
+    /// Pretend the filesystem does not support `RENAME_EXCHANGE`.
+    pub fn disable_exchange() -> Guard {
+        NO_EXCHANGE.with(|n| n.set(true));
+        Guard
+    }
+
+    pub fn exchange_disabled() -> bool {
+        NO_EXCHANGE.with(Cell::get)
+    }
+
+    pub fn hit(name: &str) -> io::Result<()> {
+        ACTIVE.with(|a| match a.borrow().as_deref() {
+            Some(active) if active == name => Err(io::Error::other(format!("failpoint {}", name))),
+            _ => Ok(()),
+        })
+    }
+}
+
+#[cfg(not(test))]
+mod failpoint {
+    use std::io;
+
+    pub fn exchange_disabled() -> bool {
+        false
+    }
+
+    pub fn hit(_name: &str) -> io::Result<()> {
+        Ok(())
+    }
 }

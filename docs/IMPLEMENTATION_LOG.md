@@ -189,9 +189,18 @@ Findings recorded rather than changed:
 - Docs: `relocation.md` (on by default, what changes when you upgrade, when to turn it off, 300 s), the User Guide (option text and a behaviour-change note under Backup), README, `architecture.md`, `retention-capacity.md`, `design-rationale.md` and the example config.
 - What users will notice after upgrading: a `.timevault-index` directory on each disk, one walk of the previous generation on the first run, and one extra read-only rsync pass per job per run.
 
-### Phase 7 onwards
+### Phase 7: final quality pass and summary (1.19.0, no behaviour change)
 
-Not started.
+- **Build and tests:** release build, `cargo test --locked` (309 pass), `cargo fmt --check` clean, `cargo deb` builds and contains the new documents, `scripts/compat-smoke.sh` passes.
+- **Static analysis:** `cargo clippy --all-targets` is not clean on the original code and CI does not run it, so pre-existing warnings were left alone. The warnings in code written for this work were fixed: two `contains_key` + `insert` pairs and a complex type in `relocation.rs`, an `.err().expect()` in a test, the test-only fail-point module moved to the end of `generation.rs`, and `#[allow(clippy::too_many_arguments)]` on the two functions that gained a parameter. 13 warnings remain, all in older code (power management, disk commands, `fs_type`, `args.rs`).
+- **Documentation audit.** New mechanical checks, each shown to fail on bad input and now in CI: `scripts/check-docs-commands.py` (every `timevault ...` command and option shown exists; it found no invented ones, only gaps in its own handling of aliases and option values), `scripts/check-docs-links.py` (links and `#anchor` targets). Together with the existing flag and YAML checks, the documentation cannot silently drift from the CLI and config.
+- **Documentation fixes from re-reading:** the lifecycle list and diagram in `architecture.md` now show the skip check before the remote wake, the file index, the moved-file pass and the shadow reference; `recovery.md` no longer says the index exists only with `options.index`; `recreate.md` and `examples.md` mention moved-file detection; the User Guide notes the new files.
+- **Existing script fixed:** `scripts/compat-smoke.sh` failed on `--disk-id` because `grep -q "$1"` parsed it as an option; now `grep -q -- "$1"`. It is not run by CI.
+- **Summary:** `docs/IMPLEMENTATION_SUMMARY.md` lists the decisions and trade-offs, verification results, benchmarks, the 14 acceptance criteria with the test that evidences each (all cited tests were checked to exist), and the remaining limitations.
+
+## Complete
+
+All phases are done. See `docs/IMPLEMENTATION_SUMMARY.md`.
 
 ## Open items
 

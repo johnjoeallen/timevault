@@ -39,7 +39,7 @@ sudo timevault backup --job all --recreate --cascade
 2. rsync links unchanged files against two references: the **previous** generation (the newest completed one older than the target), and the existing target as an extra, read-only source of reusable files. Files that did not change since the previous generation are shared with it; files added or changed on the target day and unchanged since are reused from the old target instead of being stored again.
 3. The result is flushed, stamped with `.timevault-complete`, and swapped with the existing generation in a single step (`renameat2` with `RENAME_EXCHANGE`) where the filesystem supports it, otherwise by setting the old one aside and renaming staging into place.
 4. Only after the swap succeeds is the old generation removed.
-5. Retention and `current` are handled as in a normal run.
+5. Retention and `current` are handled as in a normal run. Moved-file detection also runs, against the previous generation, as in any other run.
 
 ### Guarantees
 

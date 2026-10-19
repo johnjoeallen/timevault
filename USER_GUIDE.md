@@ -446,6 +446,6 @@ Each run builds the next generation with a single `rsync --link-dest` against th
 
 ## Notes
 - Backup disks must contain `/.timevault` and match the configured `diskId` and `fsUuid`.
-- Snapshot structure is `<mount>/<job>/<YYYYMMDD>` with a `current` symlink.
+- Snapshot structure is `<mount>/<job>/<YYYYMMDD>` with a `current` symlink. Each generation also holds a small `.timevault-complete` file, and the disk root holds `.timevault-index/` (the file index) while moved-file detection is on. Neither is needed to restore.
 - `--safe` and `--dry-run` are recommended when validating new configurations.
 - Two `timevault` processes may run different jobs concurrently, even against the same disk (each gets its own mount point and excludes file). A second run of the *same* job is refused with `job <name> is already running` (per-job lock at `/var/run/timevault.<job>.pid`, stale-pid aware).
