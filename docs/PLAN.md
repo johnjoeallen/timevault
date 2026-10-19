@@ -11,7 +11,7 @@ This plan is kept current as work proceeds. What was done, decided and learned i
 | 2 Publication hardening | Done (1.14.4) |
 | 3 Current-target recreation | Done (1.15.0) |
 | 4 Disk-local SQLite index | Done (1.16.0) |
-| 5 Relocation-aware reuse | Done (1.17.0) |
+| 5 Relocation-aware reuse | Done (1.17.0; verification refined in 1.18.0) |
 | 6 Rotation and cascade validation | Not started |
 | 7 Final pass and summary | Not started |
 

@@ -24,6 +24,8 @@ Running record of changes, decisions and findings for the work described in [PLA
 | D16 | Relocation is off by default (`options.relocation`); per-job override `relocation: true/false` | 2026-10-19 | It adds a read-only pass and the file index. The remote cost was not measured, so the conservative default stands; local numbers are in `docs/relocation.md`. |
 | D17 | Candidates come from a dry run of the real rsync command against the previous generation (not against staging) | 2026-10-19 | Against the previous generation rsync reports exactly `>f+++++++++` (new) and `*deleting` (vanished). Against empty staging it would report no deletions at all. |
 | D18 | Unverified (size and mtime) pairings are only made for a unique move where the old path vanished; a file whose old path still exists is a copy and needs content comparison | 2026-10-19 | A same-size, same-mtime, different-content look-alike would otherwise be backed up with the old file's bytes; an end-to-end test showed exactly that when verification was disabled. |
+| D19 | Content comparison is capped by file size (`hashMaxSize`, default 2 GiB, `0` = no limit); above the cap the default tier trusts a unique move and `verify: hash` skips the file | 2026-10-19 | Bounds remote disk I/O without a new remote mechanism; a byte-exact size on a huge file is strong evidence. Suggested after discussing boundary (head/tail) sampling, which was rejected as a gate: it adds a round trip for true moves and is weak on templated files, and rsync cannot read byte ranges. |
+| D20 | For a remote source, a folder move (three or more pairings from one old directory to one new directory) is trusted without reading content; lone files are confirmed with rsync's checksum | 2026-10-19 | Collective evidence is far stronger than a single coincidence. Supersedes the 1.17.0 remote default of trusting any unique move (D18, for remote sources). |
 
 ## Findings about the existing code
 
@@ -141,11 +143,22 @@ Notes and limits:
 - **Docs:** new `docs/relocation.md`; updates to `architecture.md`, `retention-capacity.md`, `cascade.md`, `recovery.md`, `design-rationale.md`, User Guide (options, job key, Snapshot generations), README and the example config. `relocation.md` is in the deb assets.
 
 Notes and limits:
-- The default remote tier trusts a unique move by size and mtime, the same evidence rsync uses to skip a file; `verify: hash` closes the look-alike gap at the cost of a checksum read on the remote.
+- (Changed in 1.18.0, see below.) The 1.17.0 remote default trusted any unique move by size and mtime.
 - Remote duplicates (copies of files that still exist) and ambiguous remote groups are not detected.
 - rsync reports mtimes in whole seconds, so matching is at second resolution, which is also what its own quick check uses.
 - Statistics are logged, not yet in the email report.
 - The index's record-and-commit cost (about 1 s per 100,000 files) applies whenever relocation is on; keying rows by generation and recording only changed files remains a possible optimisation.
+
+### Phase 5 follow-up: verification refinements (1.18.0, feature)
+
+- **Why:** the 1.17.0 remote default accepted any unique move on size and mtime alone, which can be fooled by a look-alike. After discussing cheaper checks (head and tail sampling, ssh `sha256sum`) the agreed changes were a size cap on content comparison and group evidence.
+- **`hashMaxSize` (D19):** content is compared only for files up to this size (default 2 GiB, `0` = unlimited). Applies to local SHA-256 hashing and to remote rsync-checksum confirmation. Above the cap: default tier accepts a unique move without reading; `verify: hash` skips the file.
+- **Folder-move evidence (D20):** for remote sources, pairings are grouped by (old directory, new directory); three or more in a group are trusted without reading. Lone pairings within the cap are confirmed with `rsync -n -c` (one extra rsync run restricted by `--files-from` to just those files). `verify: size-mtime` still trusts everything and reads nothing.
+- **Behaviour change:** the remote default now reads lone candidate files (checksum on the remote host's disk, tiny checksums over the wire) where 1.17.0 read nothing. The look-alike case is now rejected by default; it remains possible only with `verify: size-mtime` or for files above `hashMaxSize`.
+- **Code:** `select_unverified` decides trust versus confirmation; `Pair.verified` records whether content was compared; `confirm_remote` checks only the lone subset; `Stats` gained `group_supported` and `skipped_large`.
+- **Tests (+7; 286 run plus 2 ignored benchmarks):** an isolated remote move is confirmed by default; `size-mtime` reads nothing; a four-file folder move is trusted with no checksum (inode check); two files are not a folder; grouping is by old and new directory together; selection per verify mode and size limit including limit 0; a huge remote file is trusted by default and skipped under `verify: hash`; a huge local file is not read but may be a unique move. The look-alike test now shows the default rejecting it and only `size-mtime` accepting it.
+- **Docs:** verification table and bullets in `docs/relocation.md` rewritten, `hashMaxSize` in the settings block, design rationale and the User Guide updated.
+- **Decision still open:** whether relocation should default to on (at least for local and cascade sources). Raised in discussion, not changed: it stays off. Phase 6 is to measure the SSH overhead before deciding.
 
 ### Phase 6 onwards
 

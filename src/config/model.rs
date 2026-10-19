@@ -113,6 +113,13 @@ pub struct RelocationSettings {
     /// `auto`, `hash` or `size-mtime`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verify: Option<String>,
+    /// Largest file (bytes) whose content is compared; `0` means no limit.
+    #[serde(
+        default,
+        rename = "hashMaxSize",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub hash_max_size: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq, Eq)]

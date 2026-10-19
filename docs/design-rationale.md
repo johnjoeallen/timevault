@@ -54,7 +54,8 @@ Moved and renamed files are offered to rsync as an extra `--link-dest` directory
 - **Why a dry run first:** rsync's own comparison of the source against the previous generation is the cheapest complete list of what is new and what vanished, and it handles arbitrary file names. Pairing a *vanished* old path with a *new* path of the same size and modification time is strong evidence of a move; a file that still exists is a copy and is only shared after its content is compared.
 - **Why bounded, and optional:** the extra pass is real work, especially over SSH. A time limit and a change limit make it fall back to ordinary copying instead of slowing the backup, and it is off until you turn it on.
 - **Why rsync's checksum for remote confirmation:** it needs no code uploaded to, or run as root on, the remote host, and file names never pass through a shell.
-- **Cost:** an extra pass per run, the file index, and a weaker default for remote sources, which rely on a unique move unless `verify: hash` is set.
+- **Why folder moves are trusted but lone files are checked:** unrelated files rarely line up as "everything in folder A is now in folder B", so a folder move is strong evidence without reading anything, while a single file is where a coincidence is most plausible and a checksum is cheapest relative to the risk. Reads are limited to the paired files and capped by size, so a huge file is never read unless you ask.
+- **Cost:** an extra pass per run, the file index, and, for remote sources, a checksum read of each lone candidate up to `hashMaxSize`.
 
 ## A file index on each disk, not a central one
 

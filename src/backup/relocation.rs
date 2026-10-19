@@ -50,6 +50,12 @@ use crate::config::model::RelocationOption;
 pub const DEFAULT_MIN_SIZE: u64 = 64 * 1024;
 pub const DEFAULT_MAX_CHANGES: usize = 200_000;
 pub const DEFAULT_TIMEOUT_SECS: u64 = 900;
+/// Content is compared for files up to this size (2 GiB); larger files are
+/// not read. `0` removes the limit.
+pub const DEFAULT_HASH_MAX_SIZE: u64 = 2 * 1024 * 1024 * 1024;
+/// Pairings that map one old directory to one new directory count as a folder
+/// move once there are this many of them.
+pub const GROUP_MIN: usize = 3;
 /// Largest group of same-size, same-mtime files whose contents are compared.
 /// Bigger groups are left to rsync; the time limit bounds the work anyway.
 const MAX_GROUP: usize = 50_000;
@@ -74,6 +80,15 @@ pub struct RelocationConfig {
     pub max_changes: usize,
     pub timeout_secs: u64,
     pub verify: Verify,
+    /// Largest file whose content is compared; `0` means no limit.
+    pub hash_max_size: u64,
+}
+
+impl RelocationConfig {
+    /// Whether a file of `size` bytes may have its content compared.
+    pub fn may_hash(&self, size: u64) -> bool {
+        self.hash_max_size == 0 || size <= self.hash_max_size
+    }
 }
 
 impl Default for RelocationConfig {
@@ -84,6 +99,7 @@ impl Default for RelocationConfig {
             max_changes: DEFAULT_MAX_CHANGES,
             timeout_secs: DEFAULT_TIMEOUT_SECS,
             verify: Verify::Auto,
+            hash_max_size: DEFAULT_HASH_MAX_SIZE,
         }
     }
 }
@@ -105,6 +121,9 @@ impl RelocationConfig {
                 }
                 if let Some(timeout) = settings.timeout_seconds {
                     cfg.timeout_secs = timeout;
+                }
+                if let Some(limit) = settings.hash_max_size {
+                    cfg.hash_max_size = limit;
                 }
                 if let Some(verify) = settings.verify.as_deref() {
                     cfg.verify = match verify {
@@ -151,6 +170,11 @@ pub struct Stats {
     pub verified: usize,
     /// Candidates left to rsync because the pairing was not unique.
     pub ambiguous: usize,
+    /// Unverified pairings accepted because they form a folder move.
+    pub group_supported: usize,
+    /// Files above `hashMaxSize` that were not read (offered only on the
+    /// strength of a unique move, or skipped under `verify: hash`).
+    pub skipped_large: usize,
     /// Candidates dropped because content or attributes did not match.
     pub rejected: usize,
     /// Links created in the shadow directory.
@@ -498,6 +522,9 @@ pub struct Pair {
     pub new: PathBuf,
     pub old: PathBuf,
     pub size: u64,
+    /// Whether the content was compared (as opposed to a unique move
+    /// accepted on size and modification time).
+    pub verified: bool,
 }
 
 pub struct MatchInput<'a> {
@@ -639,7 +666,19 @@ pub fn match_changes(
         let Some(all) = gone_by_key.get(&key) else {
             continue;
         };
-        let chosen: Option<usize> = if hash_ok {
+        // Content is compared when the source is readable here and the file
+        // is not too large; a file above the limit is trusted as a unique move
+        // only in the default tier, and skipped when content proof is demanded.
+        let use_hash = hash_ok && cfg.may_hash(n.size);
+        let allow_unique = !use_hash && (!hash_ok || cfg.verify != Verify::Hash);
+        if !use_hash && !allow_unique {
+            stats.skipped_large += 1;
+            continue;
+        }
+        if hash_ok && !use_hash {
+            stats.skipped_large += 1;
+        }
+        let chosen: Option<usize> = if use_hash {
             if all.len() > MAX_GROUP {
                 stats.ambiguous += 1;
                 continue;
@@ -710,6 +749,7 @@ pub fn match_changes(
                 new: PathBuf::from(OsStr::from_bytes(&n.path)),
                 old: gone[i].path.clone(),
                 size: n.size,
+                verified: use_hash,
             });
         }
     }
@@ -720,7 +760,7 @@ pub fn match_changes(
         let mut kept_groups: HashMap<(u64, i64), (Vec<FileRecord>, HashMap<String, Vec<usize>>)> =
             HashMap::new();
         for (ni, n) in news.iter().enumerate() {
-            if paired_new.contains(&ni) {
+            if paired_new.contains(&ni) || !cfg.may_hash(n.size) {
                 continue;
             }
             if Instant::now() > input.deadline {
@@ -769,6 +809,7 @@ pub fn match_changes(
                     new: PathBuf::from(OsStr::from_bytes(&n.path)),
                     old: record.path.clone(),
                     size: n.size,
+                    verified: true,
                 });
             }
         }
@@ -818,11 +859,70 @@ pub fn cleanup(dest: &Path) {
     }
 }
 
+/// The directory part of a relative path (empty for a top-level file).
+fn parent_of(path: &Path) -> PathBuf {
+    path.parent().map(Path::to_path_buf).unwrap_or_default()
+}
+
+/// Decide, for pairings made without reading content, which to trust as they
+/// are and which to confirm with rsync's checksum.
+///
+/// - A folder move (at least [`GROUP_MIN`] pairings mapping the same old
+///   directory to the same new directory) is strong collective evidence, so
+///   those pairings are trusted in the default tier.
+/// - A lone pairing is confirmed by checksum when the file is within
+///   `hashMaxSize`.
+/// - A file above the limit is accepted as a unique move in the default tier
+///   (a byte-exact size on a huge file is strong evidence) and skipped under
+///   `verify: hash`, which only offers content-checked files.
+/// - `verify: size-mtime` trusts everything.
+///
+/// Returns the pairings to offer and the new paths among them to confirm.
+fn select_unverified(
+    cfg: &RelocationConfig,
+    pairs: Vec<Pair>,
+    stats: &mut Stats,
+) -> (Vec<Pair>, HashSet<PathBuf>) {
+    let mut group_sizes: HashMap<(PathBuf, PathBuf), usize> = HashMap::new();
+    for pair in pairs.iter().filter(|pair| !pair.verified) {
+        *group_sizes
+            .entry((parent_of(&pair.old), parent_of(&pair.new)))
+            .or_default() += 1;
+    }
+    let mut kept = Vec::with_capacity(pairs.len());
+    let mut confirm = HashSet::new();
+    for pair in pairs {
+        if pair.verified || cfg.verify == Verify::SizeMtime {
+            kept.push(pair);
+            continue;
+        }
+        let grouped = group_sizes
+            .get(&(parent_of(&pair.old), parent_of(&pair.new)))
+            .copied()
+            .unwrap_or(0)
+            >= GROUP_MIN;
+        if cfg.verify == Verify::Auto && grouped {
+            stats.group_supported += 1;
+            kept.push(pair);
+        } else if cfg.may_hash(pair.size) {
+            confirm.insert(pair.new.clone());
+            kept.push(pair);
+        } else if cfg.verify == Verify::Auto {
+            stats.skipped_large += 1;
+            kept.push(pair);
+        } else {
+            stats.skipped_large += 1;
+        }
+    }
+    (kept, confirm)
+}
+
 /// Build the shadow directory for `pairs`, then keep only the links whose
 /// content rsync confirms (by whole-file checksum) is the same as the source.
 fn confirm_remote(
     p: &Prepare<'_>,
     pairs: &[Pair],
+    confirm: &HashSet<PathBuf>,
     deadline: Instant,
     stats: &mut Stats,
 ) -> Result<Option<PathBuf>, String> {
@@ -833,7 +933,7 @@ fn confirm_remote(
     };
     let linked: Vec<&Pair> = pairs
         .iter()
-        .filter(|pair| shadow.join(&pair.new).exists())
+        .filter(|pair| confirm.contains(&pair.new) && shadow.join(&pair.new).exists())
         .collect();
     let paths: Vec<Vec<u8>> = linked
         .iter()
@@ -929,21 +1029,16 @@ pub fn prepare(p: &Prepare<'_>, index: &mut DiskIndex) -> Result<Outcome, IndexE
         deadline,
     };
     let (pairs, mut stats) = match_changes(&input, index, &changes)?;
-    // A remote source cannot be hashed here. With `verify: hash`, every
-    // pairing is confirmed by rsync's own checksum before it is offered.
-    let remote_check = p.local_root.is_none() && p.cfg.verify == Verify::Hash;
-    let shadow = if remote_check {
-        match confirm_remote(p, &pairs, deadline, &mut stats) {
-            Ok(shadow) => shadow,
-            Err(reason) => {
-                cleanup(p.dest);
-                return Ok(Outcome::Skipped(format!(
-                    "could not confirm moved files: {}",
-                    reason
-                )));
-            }
-        }
+    // Pairings made on size and modification time alone (a remote source
+    // cannot be read here) are either trusted as a folder move, confirmed by
+    // rsync's own checksum, or, for files above the size limit, accepted as a
+    // unique move or skipped, depending on `verify`.
+    let (pairs, confirm) = if p.local_root.is_none() {
+        select_unverified(p.cfg, pairs, &mut stats)
     } else {
+        (pairs, HashSet::new())
+    };
+    let shadow = if confirm.is_empty() {
         match build_shadow(p.dest, p.prev_root, &pairs, &mut stats) {
             Ok(shadow) => shadow,
             Err(err) => {
@@ -951,6 +1046,17 @@ pub fn prepare(p: &Prepare<'_>, index: &mut DiskIndex) -> Result<Outcome, IndexE
                     "could not build {}: {}",
                     RELOC_NAME, err
                 )))
+            }
+        }
+    } else {
+        match confirm_remote(p, &pairs, &confirm, deadline, &mut stats) {
+            Ok(shadow) => shadow,
+            Err(reason) => {
+                cleanup(p.dest);
+                return Ok(Outcome::Skipped(format!(
+                    "could not confirm moved files: {}",
+                    reason
+                )));
             }
         }
     };
@@ -1143,10 +1249,22 @@ mod tests {
                 max_changes: Some(5),
                 timeout_seconds: Some(7),
                 verify: Some("hash".into()),
+                hash_max_size: Some(123),
                 ..Default::default()
             })))
             .unwrap();
         assert!(tuned.enabled, "a settings block enables by default");
+        assert_eq!(tuned.hash_max_size, 123);
+        assert_eq!(
+            RelocationConfig::default().hash_max_size,
+            DEFAULT_HASH_MAX_SIZE
+        );
+        let unlimited = RelocationConfig {
+            hash_max_size: 0,
+            ..tuned
+        };
+        assert!(unlimited.may_hash(u64::MAX));
+        assert!(tuned.may_hash(123) && !tuned.may_hash(124));
         assert_eq!(
             (
                 tuned.min_size,
@@ -1261,14 +1379,198 @@ mod tests {
     }
 
     #[test]
-    fn a_remote_move_is_matched_without_hashing_when_the_pairing_is_unique() {
+    fn an_isolated_remote_move_is_confirmed_by_checksum_by_default() {
         let mut w = world(&[("a.bin", "alpha-data"), ("b.bin", "bravo-data!")]);
         fs::rename(w.source.join("a.bin"), w.source.join("moved-a.bin")).unwrap();
 
         let (shadow, stats) = w.planned(&settings(None), false);
 
-        assert_eq!((stats.renamed, stats.verified, stats.linked), (1, 0, 1));
+        assert_eq!(
+            (stats.renamed, stats.verified, stats.linked),
+            (1, 1, 1),
+            "{stats:?}"
+        );
+        assert_eq!(stats.group_supported, 0);
         assert!(shadow.unwrap().join("moved-a.bin").exists());
+    }
+
+    #[test]
+    fn size_mtime_trusts_a_unique_remote_move_without_reading_anything() {
+        let mut w = world(&[("a.bin", "alpha-data"), ("b.bin", "bravo-data!")]);
+        fs::rename(w.source.join("a.bin"), w.source.join("moved-a.bin")).unwrap();
+
+        let (shadow, stats) = w.planned(&settings(Some("size-mtime")), false);
+
+        assert_eq!(
+            (stats.renamed, stats.verified, stats.linked),
+            (1, 0, 1),
+            "{stats:?}"
+        );
+        assert!(shadow.unwrap().join("moved-a.bin").exists());
+    }
+
+    #[test]
+    fn a_remote_folder_move_is_trusted_as_a_group_without_reading_content() {
+        let names: Vec<String> = (0..4).map(|i| format!("album/track{i}.flac")).collect();
+        let texts: Vec<String> = (0..4).map(|i| format!("audio-data-{i}")).collect();
+        let files: Vec<(&str, &str)> = names
+            .iter()
+            .zip(&texts)
+            .map(|(n, t)| (n.as_str(), t.as_str()))
+            .collect();
+        let mut w = world(&files);
+        fs::rename(w.source.join("album"), w.source.join("Music Archive")).unwrap();
+
+        let (shadow, stats) = w.planned(&settings(None), false);
+
+        // Four files from one old folder to one new folder: collective
+        // evidence, so no checksum is needed.
+        assert_eq!(
+            (stats.linked, stats.group_supported, stats.verified),
+            (4, 4, 0),
+            "{stats:?}"
+        );
+        let shadow = shadow.unwrap();
+        for i in 0..4 {
+            assert_eq!(
+                ino(&shadow.join(format!("Music Archive/track{i}.flac"))),
+                ino(&w.prev.join(format!("album/track{i}.flac")))
+            );
+        }
+    }
+
+    #[test]
+    fn two_files_are_not_enough_to_call_it_a_folder_move() {
+        let mut w = world(&[
+            ("album/a.flac", "audio-data-a"),
+            ("album/b.flac", "audio-data-b"),
+        ]);
+        fs::rename(w.source.join("album"), w.source.join("renamed")).unwrap();
+
+        let (_, stats) = w.planned(&settings(None), false);
+
+        assert_eq!(
+            (stats.group_supported, stats.verified, stats.linked),
+            (0, 2, 2),
+            "{stats:?}"
+        );
+    }
+
+    #[test]
+    fn folder_membership_is_by_old_and_new_directory_together() {
+        let pairs: Vec<Pair> = [
+            ("a/1", "x/1"),
+            ("a/2", "x/2"),
+            ("a/3", "y/3"), // same old folder, different new folder
+            ("b/4", "x/4"), // same new folder, different old folder
+        ]
+        .iter()
+        .map(|(old, new)| Pair {
+            new: PathBuf::from(new),
+            old: PathBuf::from(old),
+            size: 10,
+            verified: false,
+        })
+        .collect();
+        let mut stats = Stats::default();
+
+        let (kept, confirm) = select_unverified(&RelocationConfig::default(), pairs, &mut stats);
+
+        // No (old folder, new folder) combination reaches three files.
+        assert_eq!(kept.len(), 4);
+        assert_eq!(confirm.len(), 4);
+        assert_eq!(stats.group_supported, 0);
+    }
+
+    #[test]
+    fn selection_follows_the_verify_mode_and_the_size_limit() {
+        let mk = |old: &str, new: &str, size: u64| Pair {
+            new: PathBuf::from(new),
+            old: PathBuf::from(old),
+            size,
+            verified: false,
+        };
+        let pairs = || {
+            vec![
+                mk("a/small", "b/small", 100),
+                mk("a/huge", "c/huge", 10_000),
+            ]
+        };
+        let limited = |verify| RelocationConfig {
+            hash_max_size: 1000,
+            verify,
+            ..RelocationConfig::default()
+        };
+
+        // Default: confirm the small file, trust the huge unique move.
+        let mut stats = Stats::default();
+        let (kept, confirm) = select_unverified(&limited(Verify::Auto), pairs(), &mut stats);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(confirm, HashSet::from([PathBuf::from("b/small")]));
+        assert_eq!(stats.skipped_large, 1);
+
+        // Verify: hash is verified-or-nothing, so the huge file is dropped.
+        let mut stats = Stats::default();
+        let (kept, confirm) = select_unverified(&limited(Verify::Hash), pairs(), &mut stats);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].new, PathBuf::from("b/small"));
+        assert_eq!(confirm.len(), 1);
+        assert_eq!(stats.skipped_large, 1);
+
+        // size-mtime trusts both and confirms nothing.
+        let mut stats = Stats::default();
+        let (kept, confirm) = select_unverified(&limited(Verify::SizeMtime), pairs(), &mut stats);
+        assert_eq!((kept.len(), confirm.len()), (2, 0));
+
+        // A limit of 0 means no limit: both are confirmed.
+        let mut stats = Stats::default();
+        let unlimited = RelocationConfig {
+            hash_max_size: 0,
+            ..RelocationConfig::default()
+        };
+        let (_, confirm) = select_unverified(&unlimited, pairs(), &mut stats);
+        assert_eq!(confirm.len(), 2);
+    }
+
+    #[test]
+    fn a_huge_remote_file_is_trusted_as_a_unique_move_but_not_under_verify_hash() {
+        let mut w = world(&[("big.bin", "this file counts as huge here")]);
+        fs::rename(w.source.join("big.bin"), w.source.join("renamed.bin")).unwrap();
+        let tiny_limit = |verify: &str| {
+            let mut cfg = settings(Some(verify));
+            cfg.hash_max_size = 5;
+            cfg
+        };
+
+        let (shadow, stats) = w.planned(&tiny_limit("auto"), false);
+        assert_eq!(
+            (stats.linked, stats.verified, stats.skipped_large),
+            (1, 0, 1),
+            "{stats:?}"
+        );
+        assert!(shadow.is_some());
+
+        let (shadow, stats) = w.planned(&tiny_limit("hash"), false);
+        assert!(shadow.is_none());
+        assert_eq!((stats.linked, stats.skipped_large), (0, 1), "{stats:?}");
+    }
+
+    #[test]
+    fn a_huge_local_file_is_not_read_but_may_still_be_a_unique_move() {
+        let mut w = world(&[("big.bin", "this file counts as huge here")]);
+        fs::rename(w.source.join("big.bin"), w.source.join("renamed.bin")).unwrap();
+        let tiny_limit = |verify: &str| {
+            let mut cfg = settings(Some(verify));
+            cfg.hash_max_size = 5;
+            cfg
+        };
+
+        let (_, stats) = w.planned(&tiny_limit("auto"), true);
+        assert_eq!((stats.linked, stats.verified), (1, 0), "{stats:?}");
+
+        let (shadow, stats) = w.planned(&tiny_limit("hash"), true);
+        assert!(shadow.is_none());
+        assert_eq!(stats.linked, 0);
     }
 
     #[test]
@@ -1517,11 +1819,13 @@ mod tests {
                 new: PathBuf::from("n/ok.bin"),
                 old: PathBuf::from("a.bin"),
                 size: 4,
+                verified: false,
             },
             Pair {
                 new: PathBuf::from("n/bad.bin"),
                 old: PathBuf::from("no-such-old-file"),
                 size: 9,
+                verified: false,
             },
         ];
         let mut stats = Stats::default();
@@ -1554,6 +1858,7 @@ mod tests {
             new: PathBuf::from("n/a2.bin"),
             old: PathBuf::from("a.bin"),
             size: 4,
+            verified: false,
         }];
         let mut stats = Stats::default();
         build_shadow(&w.dest, &w.prev, &pairs, &mut stats).unwrap();
@@ -1625,22 +1930,25 @@ mod tests {
     }
 
     #[test]
-    fn a_remote_look_alike_is_rejected_when_checksums_are_compared() {
+    fn a_remote_look_alike_is_rejected_by_default_and_only_size_mtime_is_fooled() {
         let mut w = world(&[("old/a.bin", "alpha-data")]);
         fs::remove_dir_all(w.source.join("old")).unwrap();
         write(&w.source.join("new/a.bin"), "alpha-DATA");
         set_mtime(&w.source.join("new/a.bin"), "2020-05-05 10:00:00");
 
-        // The default remote tier trusts a unique move, so it is fooled ...
+        // An isolated pairing is confirmed by checksum, which catches it.
         let (shadow, stats) = w.planned(&settings(None), false);
-        assert_eq!(stats.linked, 1);
-        assert!(shadow.is_some());
-
-        // ... and comparing checksums is what catches it.
+        assert!(shadow.is_none());
+        assert_eq!((stats.linked, stats.rejected), (0, 1), "{stats:?}");
         let (shadow, stats) = w.planned(&hash_mode(), false);
         assert!(shadow.is_none());
         assert_eq!((stats.linked, stats.rejected), (0, 1), "{stats:?}");
         assert!(!w.dest.join(RELOC_NAME).exists());
+
+        // The explicit weakest tier trusts size and modification time alone.
+        let (shadow, stats) = w.planned(&settings(Some("size-mtime")), false);
+        assert_eq!(stats.linked, 1);
+        assert!(shadow.is_some());
     }
 
     #[test]
