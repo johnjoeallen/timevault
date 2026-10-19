@@ -15,6 +15,7 @@ Running record of changes, decisions and findings for the work described in [PLA
 | D7 | Index is `rusqlite` with `bundled`; hash cache keyed `(dev, ino, size, mtime_ns)`, never `ctime` | 2026-10-19 | Hard-linking bumps `ctime`. |
 | D8 | Index lives at `<disk>/.timevault-index/file-index.sqlite` | 2026-10-19 | `<disk>/.timevault` is the identity file, not a directory, so the originally planned path was impossible. |
 | D9 | User docs describe only shipped behaviour; planned features are listed under "Not available yet" | 2026-10-19 | Checked in CI by `scripts/check-docs.sh` and `scripts/check-docs-yaml.py`. |
+| D10 | A `disabled` disk never receives a cascade; `rotatedOut` is not filtered in the cascade planner | 2026-10-19 | A disk that is unplugged is rotated out by being absent. The `rotatedOut` flag only removes a connected disk from automatic primary selection. |
 
 ## Findings about the existing code
 
@@ -31,7 +32,7 @@ Running record of changes, decisions and findings for the work described in [PLA
 - Without `--cascade`, only each job's primary disk receives a backup; a second connected disk gets nothing.
 - Each job's primary is the first eligible connected disk allowed for it, in `backupDisks` order (not `diskIds` order).
 - rsync exit 24 maps to `Success` (`status_for_rsync_code`); the `Partial` status is currently unused by that path.
-- Suspected bug (read from code, not run): with `--disk-id <id> --cascade`, the cascade targets come from all connected disks and are not filtered for `disabled` or `rotatedOut`, unlike automatic runs. To confirm with a test and fix.
+- Bug (fixed in 1.14.2): with `--disk-id <id> --cascade`, cascade targets came from all connected disks and were not filtered for `disabled`. Decision D10 below.
 - Same-size, same-second edits are invisible to rsync's quick check; tests must change file length or mtime.
 
 ## Change log
@@ -54,6 +55,10 @@ Deviations from the plan: the harness is in-crate test fixtures, not a `tests/` 
 - Coverage figures in the retention page (for example, 20 generations on a daily, two-of-three disk rotation spans about 30 days) were computed by hand from the generations-per-day rate; they are illustrative.
 - Not verified by running: restore commands (`disk mount`, `disk ls <disk>:/path`) were written from the CLI help and User Guide, not executed against a real disk.
 
+### Fix after Phase 1 (1.14.2)
+
+- `plan_cascade` skips `disabled` disks, so `--disk-id <id> --cascade` can no longer write to a disabled disk. Tests: disabled disks are excluded; `rotatedOut` is not filtered by the planner (automatic runs already filter ineligible disks before planning). `docs/cascade.md` states the rule.
+
 ### Phase 2 onwards
 
 Not started.
@@ -62,5 +67,4 @@ Not started.
 
 - Test override for the `$HOME/tmp` excludes location, needed for full `run_backup_for_day` tests.
 - Formatting drift on `main` (`cargo fmt --check` fails); a separate formatting commit is needed before CI is clean.
-- Confirm and fix the `--disk-id --cascade` eligibility gap (a disabled or rotated-out disk may receive a cascade).
 - Verify the pristine helper's handling of unusual file names and file types before reusing it in Phase 5.

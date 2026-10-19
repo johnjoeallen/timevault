@@ -312,7 +312,9 @@ fn plan_cascade(
     let mut by_disk: HashMap<String, Vec<crate::config::model::Job>> = HashMap::new();
     for job in jobs {
         for disk in allowed_disks_for_job(job, connected) {
-            if disk.fs_uuid == primary.fs_uuid {
+            // A disabled disk is never used for backups, so it never receives
+            // a cascade either, even when the primary was chosen with --disk-id.
+            if disk.fs_uuid == primary.fs_uuid || disk.disabled {
                 continue;
             }
             by_disk
@@ -637,6 +639,38 @@ mod tests {
                 ("b".to_string(), vec!["home".to_string()]),
                 ("c".to_string(), vec!["etc".to_string()]),
             ]
+        );
+    }
+
+    #[test]
+    fn cascade_plan_never_includes_a_disabled_disk() {
+        let mut disabled = plan_disk("b");
+        disabled.disabled = true;
+        let connected = vec![plan_disk("a"), disabled, plan_disk("c")];
+        let jobs = vec![plan_job("etc", None)];
+
+        let stages = plan_cascade(&connected[0], &jobs, &connected);
+
+        assert_eq!(
+            stage_summary(&stages),
+            vec![("c".to_string(), vec!["etc".to_string()])]
+        );
+    }
+
+    #[test]
+    fn cascade_plan_does_not_filter_on_rotated_out() {
+        // A disk that is not connected is rotated out by being absent;
+        // the rotatedOut flag only affects automatic selection of the primary.
+        let mut parked = plan_disk("b");
+        parked.rotated_out = true;
+        let connected = vec![plan_disk("a"), parked];
+        let jobs = vec![plan_job("etc", None)];
+
+        let stages = plan_cascade(&connected[0], &jobs, &connected);
+
+        assert_eq!(
+            stage_summary(&stages),
+            vec![("b".to_string(), vec!["etc".to_string()])]
         );
     }
 
