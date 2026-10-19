@@ -1,6 +1,19 @@
 # Plan: relocation-aware reuse, disk-local index, safe publication, current-target recreation, rotation docs
 
-Status: approved plan, no phase started. Evolves the existing architecture; it does not replace it.
+Status: approved plan, in progress. Phase 0 done; Phase 1 next. Evolves the existing architecture; it does not replace it.
+
+This plan is kept current as work proceeds. What was done, decided and learned is recorded in [IMPLEMENTATION_LOG.md](IMPLEMENTATION_LOG.md); every change to the plan itself is noted there too.
+
+| Phase | Status |
+|---|---|
+| 0 Testing seams | Done (`465c5d6`, `84caaf1`) |
+| 1 Docs foundation | Not started |
+| 2 Publication hardening | Not started |
+| 3 Current-target recreation | Not started |
+| 4 Disk-local SQLite index | Not started |
+| 5 Relocation-aware reuse | Not started |
+| 6 Rotation and cascade validation | Not started |
+| 7 Final pass and summary | Not started |
 
 Invariants (from the design brief): completed generations are immutable; each disk is an independent, self-contained repository; the index is an optimisation, never required for restore; retention never deletes completed generations to make room; cascade never consumes an incomplete upstream generation.
 
@@ -46,7 +59,7 @@ Further findings:
 
 **Verification tiers.**
 - Remote sources default to size and mtime only, the same trust level as rsync's own quick check.
-- Optional remote hash tier: extend the pristine helper pattern. A sibling helper reads NUL-delimited candidate paths from stdin and returns `path, size, mtime, sha256`. It reuses the existing upload/SSH code and has a per-host source-side cache keyed by path, size and mtime. Same requirements as `--exclude-pristine` remote analysis (SSH-style sources, root-to-root keys).
+- Optional remote hash tier: extend the pristine helper pattern. A sibling helper reads NUL-delimited candidate paths from stdin and returns `path, size, mtime, sha256`. It reuses the existing upload/SSH code and has a per-host source-side cache keyed by path, size and mtime. Same requirements as `--exclude-pristine` remote analysis (SSH-style sources, root-to-root keys). Remote scratch files use per-run unique names and are removed afterwards, as the pristine helper now does.
 - The helper runs as root on the remote, so it must: take paths from stdin and never interpolate them into a command line; refuse non-regular files and not follow symlinks; stay inside the job's source root; apply a per-file size or time limit; fall back to the size/mtime tier on any helper failure.
 - Local and cascade sources: source hashing is a local read, so full hash verification is the default.
 - Rejected: `rsync --fuzzy` (matches within one directory only) and detect-renamed (needs a patched rsync).
@@ -55,7 +68,7 @@ Further findings:
 
 **Index.** `rusqlite` with the `bundled` feature (no new runtime package dependency for the deb). Location: `<disk>/.timevault/file-index.sqlite`, relative paths only. Only the "previous" and "current" generations are active. Hashing is lazy (SHA-256 via `sha2`). Hard links sharing `(dev, ino)` share a record. A missing, corrupt or stale index is rebuilt silently from the disk's own generations. Restore never touches it.
 
-**Parallel jobs.** Different jobs may run in parallel as separate `timevault` processes, even against the same disk (per-job lock, per-process mounts; already the case today). Users must ensure parallel jobs do not have overlapping source or destination directories. New shared state must be safe under this: the per-disk SQLite index uses WAL mode and a busy timeout, each job writes only its own rows, and a locked database never fails a backup; staging and the relocation shadow directory stay inside the per-job directory; the remote hash cache is per host and written atomically. The existing shared pristine cache (`~/.cache/timevault/pristine-cache.json`) needs checking for concurrent-write safety.
+**Parallel jobs.** Different jobs may run in parallel as separate `timevault` processes, even against the same disk (per-job lock, per-process mounts; already the case today). Users must ensure parallel jobs do not have overlapping source or destination directories. New shared state must be safe under this: the per-disk SQLite index uses WAL mode and a busy timeout, each job writes only its own rows, and a locked database never fails a backup; staging and the relocation shadow directory stay inside the per-job directory; the remote hash cache is per host and written atomically. The pristine cache and remote helper files were made parallel-safe in 1.14.1.
 
 ## 3. Decisions (resolved)
 
@@ -71,10 +84,10 @@ Definition of done for every phase:
 - Docs ship in the same commit and describe only shipped behaviour.
 - Version bump per `AGENTS.md` (features: minor; fixes: patch; build number reset to 0).
 
-### Phase 0: testing seams (no behaviour change; patch)
+### Phase 0: testing seams (no behaviour change) — DONE
 - Inject `backup_day` or a clock into `run_backup`.
 - Extract pure cascade planning out of `run_jobs_for_primary`.
-- Add a `tests/` harness that fakes N disk directories with controlled generation dates, using real rsync.
+- Add a test harness that fakes N disk directories with controlled generation dates, using real rsync. (Done as in-crate test fixtures, not a `tests/` directory: `sync_generation` is private and job locks needed `/var/run`. A thread-local test lock directory was added. Full `run_backup_for_day` tests still need an override for the `$HOME/tmp` excludes location.)
 - Tests: existing suite stays green; previous-generation selection per disk and job with gaps of 1, 7 and 40 days and a job never run on a disk.
 - Docs: none.
 
@@ -83,7 +96,7 @@ Definition of done for every phase:
 - Link from `USER_GUIDE.md` and `README.md`; add `docs/` to the deb assets.
 - Mark honestly what is current: renames are re-copied, there is no index, no recreate. Leave out "rebuild index" and "recreate" until shipped.
 - Add a script check that every global CLI flag in `args.rs` appears in `USER_GUIDE.md`.
-- Architecture review addition: check the shared pristine cache for concurrent-write safety with parallel jobs; document that parallel jobs must not overlap directories; inventory existing remote-execution paths (`run_remote_job_script`, the pristine helper, SSH helpers): transport, privileges, failure modes, cache format, and handling of unusual file names and file types.
+- Architecture review addition: the shared pristine cache and remote helper files were fixed for parallel jobs in 1.14.1 (see log); document that parallel jobs must not overlap directories; inventory existing remote-execution paths (`run_remote_job_script`, the pristine helper, SSH helpers): transport, privileges, failure modes, cache format, and handling of unusual file names and file types.
 - Validation: read each document against the code; every command or option in an example must exist.
 
 ### Phase 2: publication hardening (fix; patch)
