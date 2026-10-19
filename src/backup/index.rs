@@ -675,6 +675,23 @@ impl DiskIndex {
         }
     }
 
+    /// Run `f` inside one write transaction, so many small writes (such as
+    /// storing a batch of hashes) cost one commit. The transaction is rolled
+    /// back if `f` fails.
+    pub fn batch<T>(&mut self, f: impl FnOnce(&mut DiskIndex) -> IResult<T>) -> IResult<T> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        match f(self) {
+            Ok(value) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(value)
+            }
+            Err(err) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(err)
+            }
+        }
+    }
+
     // ---- hashing -----------------------------------------------------------
 
     /// The SHA-256 of a regular file in `generation_root`, computed on first
@@ -704,18 +721,8 @@ impl DiskIndex {
         if let Some(hash) = self.cached_hash(&record)? {
             return Ok(hash);
         }
-        let mut file = fs::File::open(&full)?;
-        let mut hasher = Sha256::new();
-        let mut buffer = vec![0u8; 128 * 1024];
-        loop {
-            let read = file.read(&mut buffer)?;
-            if read == 0 {
-                break;
-            }
-            hasher.update(&buffer[..read]);
-        }
+        let hash = sha256_file(&full)?;
         check_unchanged(&full, &record)?;
-        let hash = format!("{:x}", hasher.finalize());
         self.hashes_computed += 1;
         self.conn.execute(
             "INSERT OR REPLACE INTO hashes(ino, size, mtime_ns, algo, version, hash,
@@ -750,6 +757,21 @@ impl DiskIndex {
             )
             .optional()?)
     }
+}
+
+/// The lowercase hex SHA-256 of a file's contents, streamed.
+pub fn sha256_file(path: &Path) -> io::Result<String> {
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 128 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn check_unchanged(path: &Path, record: &FileRecord) -> IResult<()> {
@@ -792,6 +814,17 @@ impl Session {
 
     pub fn is_active(&self) -> bool {
         self.index.is_some()
+    }
+
+    /// The open index, for lookups by moved-file detection. Callers must treat
+    /// an error from it as "no index": turn it into a skip, never a failure.
+    pub fn index_mut(&mut self) -> Option<&mut DiskIndex> {
+        self.index.as_mut()
+    }
+
+    /// Switch the index off for the rest of the run after a failed lookup.
+    pub fn disable(&mut self, what: &str, err: IndexError) {
+        self.handle::<()>(what, Err(err));
     }
 
     fn handle<T>(&mut self, what: &str, result: IResult<T>) -> Option<T> {

@@ -15,6 +15,7 @@ Timevault is built around a few principles:
 - [Cascade guide](docs/cascade.md): copying one finished backup to other connected disks.
 - [Retention and capacity](docs/retention-capacity.md): `copies` versus calendar days, and how space is used.
 - [Skipping completed days and recreating](docs/recreate.md): why a second run on the same day is skipped, and `--recreate`.
+- [Reusing moved and renamed files](docs/relocation.md): `options.relocation`, how it works, its limits and cost.
 - [Recovery guide](docs/recovery.md): restores, failed backups, replacing a disk, running out of space.
 - [Operational examples](docs/examples.md) and [Design rationale](docs/design-rationale.md).
 
@@ -27,7 +28,8 @@ Timevault reads a YAML config file (default `/etc/timevault.yaml`).
 - `backupDisks`: List of enrolled backup disks (required for backups).
 - `excludes`: Global exclude paths applied to all jobs.
 - `options`: Optional defaults for CLI flags (currently `cascade`, `exclude-pristine`, `verbose`, `safe`, `rsync`). CLI flags still take precedence. `rsync` args from config are prepended to any CLI `--rsync` args.
-- `options.index`: Optional boolean, default `false`. When `true`, Timevault keeps a file index on each backup disk (`<disk>/.timevault-index/file-index.sqlite`) describing the previous and the newly built generation of every job. It is prepared for upcoming moved-file detection and does not change what is backed up. It costs one extra walk of each new generation per run and roughly 0.5 KB of disk per file. It is never required for restoring, and a missing or corrupt index is rebuilt automatically. See [Architecture](docs/architecture.md#disk-local-file-index).
+- `options.index`: Optional boolean, default `false`. When `true`, Timevault keeps a file index on each backup disk (`<disk>/.timevault-index/file-index.sqlite`) describing the previous and the newly built generation of every job. Moved-file detection (`options.relocation`) uses it and switches it on; on its own it does not change what is backed up. It costs one extra walk of each new generation per run and roughly 0.5 KB of disk per file. It is never required for restoring, and a missing or corrupt index is rebuilt automatically. See [Architecture](docs/architecture.md#disk-local-file-index).
+- `options.relocation`: Optional, default off. Reuse files that were moved or renamed instead of storing them again. Either `true`/`false`, or a block with `enabled`, `minSize` (bytes, default 65536), `maxChanges` (default 200000), `timeoutSeconds` (default 900) and `verify` (`auto`, `hash` or `size-mtime`). It runs an extra read-only rsync pass against the previous generation, needs the file index (and switches it on), and never fails a backup: if it gives up, rsync copies the files as before. A job can override it with its own `relocation:`. See [Reusing moved and renamed files](docs/relocation.md).
 - `jobs`: List of backup jobs. Job names must not start with `.timevault`.
 
 ### backupDisks entries
@@ -61,6 +63,7 @@ Each job defines a backup source and retention policy.
 - `includes`: Optional paths to back up for this job even if a global or job exclude covers them (e.g. `/data/docker/volumes` when `/data/docker` is excluded). Paths are anchored at the job `source`. Excluded parent directories stay excluded except for the included path.
 - `diskIds`: Optional list of disk IDs this job is allowed to run on.
 - `remote`: Optional remote power behavior for SSH-style sources.
+- `relocation`: Optional boolean. Overrides `options.relocation` for this job (moved and renamed file reuse). See [Reusing moved and renamed files](docs/relocation.md).
 
 Optional job hooks are discovered by convention:
 - `/etc/timevault/scripts/{jobname}.pre`: Runs before the job starts.
@@ -436,7 +439,7 @@ Each run builds the next generation with a single `rsync --link-dest` against th
 - A leftover `.timevault-staging` is removed on the next run when there is a previous generation to link against, and resumed for an initial backup. Re-running a job on a day that already has a completed generation skips it unless `--recreate` is given; with `--recreate` a fresh generation is built and swapped in (a single atomic exchange where the filesystem supports it, otherwise a rename); an interrupted swap is repaired automatically on the next run (`.timevault-publishing`, `.timevault-replaced-<day>`). See the [Recovery guide](docs/recovery.md).
 - A partial `<YYYYMMDD>` directory left by an earlier release's failed run is replaced the same way, but until then it still counts toward `copies`.
 - Files are linked only when every attribute rsync preserves matches (`-a`: permissions, owner, group, mtime). Adding `--xattrs`, `--acls` or `--numeric-ids` through `rsync` options therefore makes the first run afterwards copy everything.
-- A renamed or moved file is copied again, as before; `--link-dest` matches files by path.
+- A renamed or moved file is copied again, because `--link-dest` matches files by path, unless `options.relocation` is enabled. With it, moved and renamed files are found before the copy and their data is reused from the previous generation through a scratch directory `<job>/.timevault-reloc` that is passed to rsync as an extra read-only `--link-dest`. See [Reusing moved and renamed files](docs/relocation.md).
 - `--safe` still skips every deletion; a stale staging or replaced directory is then left in place.
 - Post-backup scripts receive the final `<YYYYMMDD>` path; after a failed run that directory does not exist.
 

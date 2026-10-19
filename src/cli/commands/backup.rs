@@ -58,6 +58,10 @@ pub fn run_backup_command(
             .options
             .index
             .unwrap_or(crate::backup::index::INDEX_DEFAULT),
+        relocation: crate::backup::relocation::RelocationConfig::from_option(
+            cfg.options.relocation.as_ref(),
+        )
+        .map_err(TimevaultError::message)?,
     };
     let report_options = cfg.options.report.clone();
 
@@ -553,6 +557,7 @@ mod tests {
             includes: Vec::new(),
             disk_ids: None,
             remote: None,
+            relocation: None,
         };
         assert!(!job_requires_disk(&job, "disk-a"));
         let job = crate::config::model::Job {
@@ -565,6 +570,7 @@ mod tests {
             includes: Vec::new(),
             disk_ids: Some(vec!["disk-a".to_string()]),
             remote: None,
+            relocation: None,
         };
         assert!(job_requires_disk(&job, "disk-a"));
         assert!(!job_requires_disk(&job, "disk-b"));
@@ -600,6 +606,7 @@ mod tests {
             includes: Vec::new(),
             disk_ids: Some(vec!["disk-b".to_string()]),
             remote: None,
+            relocation: None,
         };
         let allowed = allowed_disks_for_job(&job, &connected);
         assert_eq!(allowed.len(), 1);
@@ -636,6 +643,7 @@ mod tests {
             includes: Vec::new(),
             disk_ids: None,
             remote: None,
+            relocation: None,
         };
         let allowed = allowed_disks_for_job(&job, &connected);
         assert_eq!(allowed.len(), 2);
@@ -663,6 +671,7 @@ mod tests {
             includes: Vec::new(),
             disk_ids: disk_ids.map(|ids| ids.iter().map(|id| id.to_string()).collect()),
             remote: None,
+            relocation: None,
         }
     }
 

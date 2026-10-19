@@ -90,6 +90,7 @@ No manual repair is needed. At the start of each run for a job, Timevault resolv
 | Interrupted at | State left behind | What the next run does |
 |---|---|---|
 | During rsync | partial `.timevault-staging` | discards it (a first backup resumes it) |
+| While looking for moved files | `.timevault-reloc/` (and `.timevault-reloc.list`) of hard links | removes it; it holds only links, so no data is touched |
 | After rsync, before publishing | complete but unpublished `.timevault-staging` | discards it and builds again |
 | During a `--recreate` (same-day replacement) | `.timevault-publishing`, possibly the old generation under `.timevault-staging` or `.timevault-replaced-<day>` | keeps whichever generation was fully in place, removes the other, deletes the note |
 | After publishing, before `current` moves | `current` points at the previous generation | points `current` at the newest finished generation |

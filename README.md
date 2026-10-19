@@ -15,6 +15,7 @@ Timevault is a safe, rsync-based backup tool built for people who want dependabl
 - Snapshot rotation with date-stamped directories and a stable `current` symlink.
 - Safe, dry-run, and print-order modes for validation before writing.
 - Optional pristine package excludes with separate local and remote-host caches.
+- Optional reuse of moved and renamed files, so reorganising a large collection does not store it again.
 - Manual runs: `timevault backup --job <name|all>`, select disks positionally or with `--disk-id`, or cascade with `--cascade`.
 - Disk commands for registration, listing, mounting, checking, space reporting, rename, enable/disable, inspect, and unregister.
 - Optional HTML backup reports sent through `sendmail`.
@@ -22,5 +23,5 @@ Timevault is a safe, rsync-based backup tool built for people who want dependabl
 
 ## Documentation
 - [User Guide](USER_GUIDE.md): configuration, commands, setup workflow, and systemd usage.
-- [Architecture](docs/architecture.md), [Disk rotation](docs/rotation.md), [Cascade](docs/cascade.md), [Retention and capacity](docs/retention-capacity.md), [Recreating a generation](docs/recreate.md), [Recovery](docs/recovery.md), [Examples](docs/examples.md) and [Design rationale](docs/design-rationale.md).
+- [Architecture](docs/architecture.md), [Disk rotation](docs/rotation.md), [Cascade](docs/cascade.md), [Retention and capacity](docs/retention-capacity.md), [Recreating a generation](docs/recreate.md), [Moved and renamed files](docs/relocation.md), [Recovery](docs/recovery.md), [Examples](docs/examples.md) and [Design rationale](docs/design-rationale.md).
 - [Packaging](PACKAGING.md): build and install instructions for `.deb` and local installs.

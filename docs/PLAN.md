@@ -1,6 +1,6 @@
 # Plan: relocation-aware reuse, disk-local index, safe publication, current-target recreation, rotation docs
 
-Status: approved plan, in progress. Phases 0 to 4 done; Phase 5 next. Evolves the existing architecture; it does not replace it.
+Status: approved plan, in progress. Phases 0 to 5 done; Phase 6 next. Evolves the existing architecture; it does not replace it.
 
 This plan is kept current as work proceeds. What was done, decided and learned is recorded in [IMPLEMENTATION_LOG.md](IMPLEMENTATION_LOG.md); every change to the plan itself is noted there too.
 
@@ -11,7 +11,7 @@ This plan is kept current as work proceeds. What was done, decided and learned i
 | 2 Publication hardening | Done (1.14.4) |
 | 3 Current-target recreation | Done (1.15.0) |
 | 4 Disk-local SQLite index | Done (1.16.0) |
-| 5 Relocation-aware reuse | Not started |
+| 5 Relocation-aware reuse | Done (1.17.0) |
 | 6 Rotation and cascade validation | Not started |
 | 7 Final pass and summary | Not started |
 
@@ -59,8 +59,8 @@ Further findings:
 
 **Verification tiers.**
 - Remote sources default to size and mtime only, the same trust level as rsync's own quick check.
-- Optional remote hash tier: extend the pristine helper pattern. A sibling helper reads NUL-delimited candidate paths from stdin and returns `path, size, mtime, sha256`. It reuses the existing upload/SSH code and has a per-host source-side cache keyed by path, size and mtime. Same requirements as `--exclude-pristine` remote analysis (SSH-style sources, root-to-root keys). Remote scratch files use per-run unique names and are removed afterwards, as the pristine helper now does.
-- The helper runs as root on the remote, so it must: take paths from stdin and never interpolate them into a command line; refuse non-regular files and not follow symlinks; stay inside the job's source root; apply a per-file size or time limit; fall back to the size/mtime tier on any helper failure.
+- Optional remote hash tier (**changed during Phase 5, decision D15**): instead of a helper script run as root on the remote, pairings for a remote source are confirmed with rsync's own whole-file checksum (`rsync -n -c -ii --files-from=... --from0` between the source and the shadow directory). Nothing is uploaded or executed on the remote, and file names never pass through a shell. It confirms only unique-move pairings, and uses rsync's checksum, not SHA-256. The original design was: extend the pristine helper pattern. A sibling helper reads NUL-delimited candidate paths from stdin and returns `path, size, mtime, sha256`. It reuses the existing upload/SSH code and has a per-host source-side cache keyed by path, size and mtime. Same requirements as `--exclude-pristine` remote analysis (SSH-style sources, root-to-root keys). Remote scratch files use per-run unique names and are removed afterwards, as the pristine helper now does.
+- (Superseded by D15; the requirements below applied to the dropped helper.) The helper runs as root on the remote, so it must: take paths from stdin and never interpolate them into a command line; refuse non-regular files and not follow symlinks; stay inside the job's source root; apply a per-file size or time limit; fall back to the size/mtime tier on any helper failure.
 - Local and cascade sources: source hashing is a local read, so full hash verification is the default.
 - Rejected: `rsync --fuzzy` (matches within one directory only) and detect-renamed (needs a patched rsync).
 
@@ -117,7 +117,7 @@ Definition of done for every phase:
 - Tests: two jobs writing the same disk's index concurrently; lifecycle, hash-cache invalidation, corrupt file falls back to rebuild, mismatch with `current` triggers rebuild, restore with the index deleted.
 - Docs: index sections of `architecture.md` and `design-rationale.md`; "rebuild a missing index" in `recovery.md`.
 
-### Phase 5: relocation-aware reuse (feature; minor)
+### Phase 5: relocation-aware reuse (feature; minor) — DONE
 - Implement the pipeline in section 2.
 - Config: relocation on/off, minimum file size, verification tier, and bail-out limits (time limit on the dry-run pass, maximum new-path candidates). Hitting a limit abandons relocation for that run, logs why, and lets plain rsync copy everything.
 - Cost: one extra traversal per remote job. The benchmark gate decides the default; if it costs more than it saves on common workloads, relocation ships off by default for remote sources and on for local and cascade sources.

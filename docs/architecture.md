@@ -19,6 +19,7 @@ Each backup disk is an independent repository. Inside it, every job has its own 
     .timevault-staging/       in-progress generation (exists only during a run)
     .timevault-replaced-<day>/  transient, only during a same-day replacement
     .timevault-publishing     transient note used to finish an interrupted same-day replacement
+    .timevault-reloc/         transient hard links used to reuse moved or renamed files
     .timevault-current.tmp    transient link renamed over `current`
 <disk root>/.timevault-index/file-index.sqlite   optional file index shared by all jobs on the disk
 ```
@@ -70,7 +71,7 @@ Consequences:
 - Unchanged files cost no extra data blocks (they still cost directory entries).
 - A changed file is written as a new file. Older generations keep their old copy.
 - Completed generations are never modified, even when a permission or timestamp changes at the source: that file is simply stored again.
-- A file that is **moved or renamed** is stored again, because the path differs. See [Retention and capacity](retention-capacity.md).
+- A file that is **moved or renamed** is stored again, because the path differs, unless moved-file detection is enabled (`options.relocation`), which finds such files and reuses their data. See [Reusing moved and renamed files](relocation.md) and [Retention and capacity](retention-capacity.md).
 - Hard links cannot cross filesystems, so every disk stores its own copy of the data.
 
 ## Previous generation: per disk and per job
@@ -83,7 +84,7 @@ With `--cascade` (or `options.cascade: true`), a job is first backed up to its *
 
 ## Disk-local file index
 
-With `options.index: true`, each disk keeps a SQLite database describing the files of its generations, at `<disk>/.timevault-index/file-index.sqlite` (off by default; see the [User Guide](../USER_GUIDE.md)). Its purpose is to let later features recognise files that were moved or renamed without reading everything again.
+With `options.index: true`, each disk keeps a SQLite database describing the files of its generations, at `<disk>/.timevault-index/file-index.sqlite` (off by default; see the [User Guide](../USER_GUIDE.md)). Its purpose is to let [moved-file detection](relocation.md) recognise files that were moved or renamed without reading everything again; that feature switches the index on.
 
 - **It belongs to the disk.** The database lives on the backup disk, uses paths relative to a generation (never a mount point), and is built only from that disk's own generations. A disk never needs another disk's index, and rotating a disk in or out needs no synchronisation.
 - **It is not needed to restore.** Generations are ordinary directory trees; the index is an optimisation. If it is missing, stale or corrupt, it is rebuilt from the generations on the disk, and an index problem is reported as a warning and never fails a backup.
@@ -101,6 +102,8 @@ A disk is enrolled by filesystem UUID and carries a `.timevault` identity file. 
 
 Two `timevault` processes may run **different** jobs at the same time, even against the same disk: locks are per job and mounts are per process. Make sure parallel jobs do not have overlapping source or destination directories; Timevault does not check this.
 
-## Not available yet
+## Moved and renamed files
 
-These are planned and are **not** part of the current behaviour: detection of moved or renamed files. The file index exists but nothing uses it yet, so it does not change what is backed up or how much is copied. The plan is in [PLAN.md](PLAN.md).
+With `options.relocation`, files that were moved or renamed since the previous generation are found before the copy and their data is reused. A scratch directory `<job>/.timevault-reloc` of hard links is passed to rsync as an extra read-only `--link-dest`, so rsync can never write through to a completed generation. It is off by default. See [Reusing moved and renamed files](relocation.md).
+
+The plan and its status are in [PLAN.md](PLAN.md).

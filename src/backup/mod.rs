@@ -23,6 +23,7 @@ use crate::util::paths::job_lock_path;
 pub mod generation;
 pub mod index;
 pub mod pristine;
+pub mod relocation;
 pub mod report;
 pub mod rsync;
 
@@ -80,6 +81,8 @@ pub struct BackupOptions {
     pub recreate: bool,
     /// Maintain the disk-local file index (`options.index`).
     pub index: bool,
+    /// Moved and renamed file reuse (`options.relocation`).
+    pub relocation: relocation::RelocationConfig,
 }
 
 struct LockGuard {
@@ -420,6 +423,7 @@ fn run_backup_job(
         run_mode,
         options.recreate,
         options.index,
+        options.relocation.for_job(job.relocation),
     )?;
     let SyncOutcome {
         rc,
@@ -3073,6 +3077,86 @@ fn remote_ssh_source(source: &str) -> Option<RemoteSshSource> {
     })
 }
 
+/// The source as a directory this host can read, or `None` for a remote
+/// source (or one that is not a directory). Local sources can be hashed.
+fn local_source_root(source: &str) -> Option<PathBuf> {
+    if remote_ssh_source(source).is_some() || source.starts_with("rsync://") {
+        return None;
+    }
+    let path = Path::new(source.trim());
+    path.is_dir().then(|| path.to_path_buf())
+}
+
+/// Look for files that were moved or renamed since the previous generation
+/// and build the shadow directory rsync can reuse them from. Returns the
+/// directory to add as a `--link-dest`, or `None`. Never fails the backup.
+#[allow(clippy::too_many_arguments)]
+fn plan_relocation(
+    job: &Job,
+    dest: &Path,
+    excludes_file: &Path,
+    rsync_extra: &[String],
+    prev_root: Option<&PathBuf>,
+    cfg: &relocation::RelocationConfig,
+    run_mode: RunMode,
+    file_index: &mut index::Session,
+) -> Option<PathBuf> {
+    if run_mode.dry_run {
+        crate::pnote!(
+            "{}: dry-run: would look for moved or renamed files",
+            job.name
+        );
+        return None;
+    }
+    // An initial backup has no previous generation to take data from.
+    let prev_root = prev_root?;
+    let local_root = local_source_root(&job.source);
+    let request = relocation::Prepare {
+        cfg,
+        source: &job.source,
+        local_root: local_root.as_deref(),
+        excludes_file,
+        rsync_extra,
+        prev_root,
+        dest,
+    };
+    let Some(index) = file_index.index_mut() else {
+        crate::pnote!(
+            "{}: moved-file detection skipped: the file index is unavailable",
+            job.name
+        );
+        return None;
+    };
+    crate::progress::status(format!("{}: looking for moved files", job.name));
+    match relocation::prepare(&request, index) {
+        Ok(relocation::Outcome::Prepared { shadow, stats }) => {
+            if stats.hit_deadline {
+                crate::pnote!(
+                    "{}: moved-file detection stopped at its time limit; the rest is copied normally",
+                    job.name
+                );
+            }
+            if stats.linked > 0 {
+                crate::pnote!(
+                    "{}: reusing {} moved, renamed or duplicate files ({} bytes) already in the previous generation",
+                    job.name,
+                    stats.linked,
+                    stats.bytes_reused
+                );
+            }
+            shadow
+        }
+        Ok(relocation::Outcome::Skipped(reason)) => {
+            crate::pnote!("{}: moved-file detection skipped: {}", job.name, reason);
+            None
+        }
+        Err(err) => {
+            file_index.disable("moved-file detection", err);
+            None
+        }
+    }
+}
+
 fn create_excludes_file(excludes: &[String], filename: &Path) -> io::Result<()> {
     let mut f = File::create(filename)?;
     for exclude in excludes {
@@ -3158,6 +3242,7 @@ fn sync_generation(
     run_mode: RunMode,
     recreate: bool,
     index_enabled: bool,
+    relocation: relocation::RelocationConfig,
 ) -> Result<SyncOutcome> {
     if !run_mode.dry_run && !dest.exists() {
         fs::create_dir_all(dest)?;
@@ -3175,9 +3260,28 @@ fn sync_generation(
             crate::pnote!("  link-dest: {}", base.display());
         }
     }
-    let mut file_index = index::Session::start(index_enabled, dest, &job.name, run_mode);
+    // Moved-file detection reads the index, so it switches the index on.
+    let mut file_index = index::Session::start(
+        index_enabled || relocation.enabled,
+        dest,
+        &job.name,
+        run_mode,
+    );
     file_index.prepare(link_dests.first().map(PathBuf::as_path));
     let staging = generation::prepare_staging(dest, !link_dests.is_empty(), run_mode)?;
+    let mut rsync_dests = link_dests.clone();
+    if relocation.enabled {
+        rsync_dests.extend(plan_relocation(
+            job,
+            dest,
+            excludes_file,
+            rsync_extra,
+            link_dests.first(),
+            &relocation,
+            run_mode,
+            &mut file_index,
+        ));
+    }
 
     let mut rc = 1;
     let mut attempts = 0;
@@ -3193,7 +3297,7 @@ fn sync_generation(
             &job.source,
             &staging,
             excludes_file,
-            &link_dests,
+            &rsync_dests,
             rsync_extra,
             run_mode,
             &job.name,
@@ -3210,6 +3314,10 @@ fn sync_generation(
                 attempt + 1
             ));
         }
+    }
+
+    if relocation.enabled && !run_mode.dry_run {
+        relocation::cleanup(dest);
     }
 
     if rc == 0 || rc == 24 {
@@ -3344,6 +3452,7 @@ mod tests {
             includes: Vec::new(),
             disk_ids: None,
             remote: None,
+            relocation: None,
         }
     }
 
@@ -4172,6 +4281,7 @@ mod tests {
                 session_seconds_override: None,
                 recreate: false,
                 index: false,
+                relocation: relocation::RelocationConfig::default(),
             },
         )
         .expect("backup report");
@@ -4298,6 +4408,7 @@ mod tests {
                 session_seconds_override: None,
                 recreate: false,
                 index: false,
+                relocation: relocation::RelocationConfig::default(),
             },
             false,
             true,
@@ -4430,6 +4541,7 @@ mod tests {
             run_mode(),
             false,
             false,
+            relocation::RelocationConfig::default(),
         )
         .expect("sync_generation");
         if outcome.rc == 0 || outcome.rc == 24 {
@@ -5027,6 +5139,7 @@ mod tests {
             run_mode(),
             false,
             false,
+            relocation::RelocationConfig::default(),
         )?;
         if outcome.rc == 0 || outcome.rc == 24 {
             generation::update_current(dest, day, run_mode())?;
@@ -5430,22 +5543,80 @@ mod tests {
             recreate: bool,
             index: bool,
         ) -> Vec<BackupJobReport> {
+            self.run_jobs_reloc(
+                jobs,
+                day,
+                recreate,
+                index,
+                relocation::RelocationConfig::default(),
+            )
+        }
+
+        fn run_jobs_reloc(
+            &self,
+            jobs: Vec<Job>,
+            day: &str,
+            recreate: bool,
+            index: bool,
+            relocation: relocation::RelocationConfig,
+        ) -> Vec<BackupJobReport> {
+            self.run_on(
+                &self.disk,
+                jobs,
+                day,
+                recreate,
+                index,
+                relocation,
+                run_mode(),
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn run_on(
+            &self,
+            disk: &Path,
+            jobs: Vec<Job>,
+            day: &str,
+            recreate: bool,
+            index: bool,
+            relocation: relocation::RelocationConfig,
+            mode: RunMode,
+        ) -> Vec<BackupJobReport> {
             run_backup_for_day(
                 jobs,
                 &[],
-                run_mode(),
-                &self.disk,
+                mode,
+                disk,
                 BackupOptions {
                     exclude_pristine: false,
                     exclude_pristine_only: false,
                     session_seconds_override: None,
                     recreate,
                     index,
+                    relocation,
                 },
                 day,
             )
             .expect("backup report")
             .jobs
+        }
+
+        /// Run the standard job with moved-file detection configured.
+        fn run_reloc(
+            &self,
+            day: &str,
+            relocation: relocation::RelocationConfig,
+        ) -> BackupJobReport {
+            self.run_jobs_reloc(
+                vec![gen_job(&self.source, 10)],
+                day,
+                false,
+                false,
+                relocation,
+            )
+            .into_iter()
+            .next()
+            .expect("one job")
         }
 
         fn index(&self, job: &str) -> index::DiskIndex {
@@ -5984,5 +6155,659 @@ mod tests {
             vec!["a.txt", "b.txt"]
         );
         assert_eq!(indexed_paths(&beta, index::Role::Previous), vec!["a.txt"]);
+    }
+
+    // ---- moved and renamed file reuse, end to end ----
+
+    fn reloc_on() -> relocation::RelocationConfig {
+        relocation::RelocationConfig {
+            enabled: true,
+            min_size: 1,
+            ..relocation::RelocationConfig::default()
+        }
+    }
+
+    fn ino_of(path: &Path) -> u64 {
+        fs::metadata(path).unwrap().ino()
+    }
+
+    /// `n` files of distinct content under `<source>/<dir>`, all with the same
+    /// modification time, as a tree that has been left alone for a while.
+    fn populate(f: &Full, dir: &str, n: usize) {
+        for i in 0..n {
+            let path = f.source.join(dir).join(format!("f{i:03}.dat"));
+            write(&path, &format!("payload-{i}-{}", "x".repeat(i)));
+            set_mtime(&path, "2020-05-05 10:00:00");
+        }
+    }
+
+    fn assert_all_share_inodes(f: &Full, old_dir: &str, new_dir: &str, n: usize) {
+        for i in 0..n {
+            let name = format!("f{i:03}.dat");
+            assert_eq!(
+                ino_of(&f.dest().join("20260101").join(old_dir).join(&name)),
+                ino_of(&f.dest().join("20260102").join(new_dir).join(&name)),
+                "{name} should be reused, not copied"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bulk_directory_move_reuses_the_data() {
+        let f = full();
+        populate(&f, "photos", 40);
+        assert_eq!(
+            f.run_reloc("20260101", reloc_on()).status,
+            BackupJobStatus::Success
+        );
+        let history = snapshot(&f.dest().join("20260101"));
+
+        fs::create_dir_all(f.source.join("archive")).unwrap();
+        fs::rename(f.source.join("photos"), f.source.join("archive/2020")).unwrap();
+        assert_eq!(
+            f.run_reloc("20260102", reloc_on()).status,
+            BackupJobStatus::Success
+        );
+
+        assert_all_share_inodes(&f, "photos", "archive/2020", 40);
+        for i in 0..40 {
+            assert_eq!(
+                read(&f.dest().join(format!("20260102/archive/2020/f{i:03}.dat"))),
+                format!("payload-{i}-{}", "x".repeat(i))
+            );
+        }
+        // The old generation is exactly as it was, and nothing is left behind.
+        assert_eq!(snapshot(&f.dest().join("20260101")), history);
+        assert!(!f.dest().join(generation::RELOC_NAME).exists());
+        assert_eq!(gen_dirs(&f.dest()), vec!["20260101", "20260102", "current"]);
+        assert!(!f.dest().join("20260102/photos").exists());
+    }
+
+    #[test]
+    fn without_relocation_a_moved_directory_is_copied_again() {
+        let f = full();
+        populate(&f, "photos", 10);
+        assert_eq!(f.run("20260101", false).status, BackupJobStatus::Success);
+        fs::create_dir_all(f.source.join("archive")).unwrap();
+        fs::rename(f.source.join("photos"), f.source.join("archive/2020")).unwrap();
+        assert_eq!(f.run("20260102", false).status, BackupJobStatus::Success);
+
+        for i in 0..10 {
+            let name = format!("f{i:03}.dat");
+            assert_ne!(
+                ino_of(&f.dest().join("20260101/photos").join(&name)),
+                ino_of(&f.dest().join("20260102/archive/2020").join(&name))
+            );
+        }
+    }
+
+    #[test]
+    fn a_mass_rename_reuses_the_data() {
+        let f = full();
+        populate(&f, "docs", 30);
+        assert_eq!(
+            f.run_reloc("20260101", reloc_on()).status,
+            BackupJobStatus::Success
+        );
+        for i in 0..30 {
+            fs::rename(
+                f.source.join(format!("docs/f{i:03}.dat")),
+                f.source.join(format!("docs/renamed-{i:03}.dat")),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            f.run_reloc("20260102", reloc_on()).status,
+            BackupJobStatus::Success
+        );
+
+        for i in 0..30 {
+            assert_eq!(
+                ino_of(&f.dest().join(format!("20260101/docs/f{i:03}.dat"))),
+                ino_of(&f.dest().join(format!("20260102/docs/renamed-{i:03}.dat")))
+            );
+        }
+        assert!(!f.dest().join("20260102/docs/f000.dat").exists());
+    }
+
+    #[test]
+    fn a_move_combined_with_a_rename_reuses_the_data() {
+        let f = full();
+        populate(&f, "a", 12);
+        assert_eq!(
+            f.run_reloc("20260101", reloc_on()).status,
+            BackupJobStatus::Success
+        );
+        fs::create_dir_all(f.source.join("b/c")).unwrap();
+        for i in 0..12 {
+            fs::rename(
+                f.source.join(format!("a/f{i:03}.dat")),
+                f.source.join(format!("b/c/g{i:03}.dat")),
+            )
+            .unwrap();
+        }
+        fs::remove_dir(f.source.join("a")).unwrap();
+        assert_eq!(
+            f.run_reloc("20260102", reloc_on()).status,
+            BackupJobStatus::Success
+        );
+
+        for i in 0..12 {
+            assert_eq!(
+                ino_of(&f.dest().join(format!("20260101/a/f{i:03}.dat"))),
+                ino_of(&f.dest().join(format!("20260102/b/c/g{i:03}.dat")))
+            );
+        }
+    }
+
+    #[test]
+    fn a_moved_file_with_changed_permissions_gets_its_own_storage_and_history_is_untouched() {
+        let f = full();
+        populate(&f, "d", 2);
+        assert_eq!(
+            f.run_reloc("20260101", reloc_on()).status,
+            BackupJobStatus::Success
+        );
+        let history = snapshot(&f.dest().join("20260101"));
+        let old_inode = ino_of(&f.dest().join("20260101/d/f000.dat"));
+        let old_mode = fs::metadata(f.dest().join("20260101/d/f000.dat"))
+            .unwrap()
+            .mode();
+
+        // Both files move; one also has its permissions changed.
+        fs::create_dir_all(f.source.join("e")).unwrap();
+        fs::rename(f.source.join("d/f000.dat"), f.source.join("e/f000.dat")).unwrap();
+        fs::rename(f.source.join("d/f001.dat"), f.source.join("e/f001.dat")).unwrap();
+        fs::set_permissions(
+            f.source.join("e/f000.dat"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        assert_eq!(
+            f.run_reloc("20260102", reloc_on()).status,
+            BackupJobStatus::Success
+        );
+
+        // The unchanged-attribute file is shared; the other has new storage
+        // with the new mode, and the old generation's inode kept its old mode.
+        assert_eq!(
+            ino_of(&f.dest().join("20260101/d/f001.dat")),
+            ino_of(&f.dest().join("20260102/e/f001.dat"))
+        );
+        let new = fs::metadata(f.dest().join("20260102/e/f000.dat")).unwrap();
+        assert_ne!(new.ino(), old_inode);
+        assert_eq!(new.mode() & 0o777, 0o600);
+        let old = fs::metadata(f.dest().join("20260101/d/f000.dat")).unwrap();
+        assert_eq!(old.mode(), old_mode);
+        assert_eq!(old.ino(), old_inode);
+        assert_eq!(snapshot(&f.dest().join("20260101")), history);
+    }
+
+    #[test]
+    fn a_moved_file_that_was_also_edited_is_stored_fresh() {
+        let f = full();
+        populate(&f, "d", 1);
+        assert_eq!(
+            f.run_reloc("20260101", reloc_on()).status,
+            BackupJobStatus::Success
+        );
+        let history = snapshot(&f.dest().join("20260101"));
+
+        fs::create_dir_all(f.source.join("e")).unwrap();
+        fs::rename(f.source.join("d/f000.dat"), f.source.join("e/f000.dat")).unwrap();
+        write(
+            &f.source.join("e/f000.dat"),
+            "edited after the move, longer now",
+        );
+        assert_eq!(
+            f.run_reloc("20260102", reloc_on()).status,
+            BackupJobStatus::Success
+        );
+
+        assert_eq!(
+            read(&f.dest().join("20260102/e/f000.dat")),
+            "edited after the move, longer now"
+        );
+        assert_eq!(snapshot(&f.dest().join("20260101")), history);
+    }
+
+    #[test]
+    fn a_file_replaced_by_a_look_alike_is_not_confused_with_the_original() {
+        let f = full();
+        write(&f.source.join("old/a.dat"), "original-1");
+        set_mtime(&f.source.join("old/a.dat"), "2020-05-05 10:00:00");
+        assert_eq!(
+            f.run_reloc("20260101", reloc_on()).status,
+            BackupJobStatus::Success
+        );
+        let history = snapshot(&f.dest().join("20260101"));
+
+        // Same name, size and mtime as the vanished original, different bytes.
+        fs::remove_dir_all(f.source.join("old")).unwrap();
+        write(&f.source.join("new/a.dat"), "different!");
+        set_mtime(&f.source.join("new/a.dat"), "2020-05-05 10:00:00");
+        assert_eq!(
+            f.run_reloc("20260102", reloc_on()).status,
+            BackupJobStatus::Success
+        );
+
+        assert_eq!(read(&f.dest().join("20260102/new/a.dat")), "different!");
+        assert_eq!(read(&f.dest().join("20260101/old/a.dat")), "original-1");
+        assert_eq!(snapshot(&f.dest().join("20260101")), history);
+    }
+
+    #[test]
+    fn a_file_changed_between_planning_and_copying_is_still_backed_up_correctly() {
+        let f = full();
+        populate(&f, "d", 3);
+        assert_eq!(
+            f.run_reloc("20260101", reloc_on()).status,
+            BackupJobStatus::Success
+        );
+        fs::create_dir_all(f.source.join("e")).unwrap();
+        for i in 0..3 {
+            fs::rename(
+                f.source.join(format!("d/f{i:03}.dat")),
+                f.source.join(format!("e/f{i:03}.dat")),
+            )
+            .unwrap();
+        }
+        let moved = f.source.join("e/f001.dat");
+        let _hook = relocation::set_test_hook(move || {
+            fs::write(&moved, "rewritten after the plan was made").unwrap();
+        });
+
+        assert_eq!(
+            f.run_reloc("20260102", reloc_on()).status,
+            BackupJobStatus::Success
+        );
+
+        assert_eq!(
+            read(&f.dest().join("20260102/e/f001.dat")),
+            "rewritten after the plan was made"
+        );
+        assert_eq!(read(&f.dest().join("20260101/d/f001.dat")), "payload-1-x");
+        assert_eq!(
+            ino_of(&f.dest().join("20260101/d/f000.dat")),
+            ino_of(&f.dest().join("20260102/e/f000.dat"))
+        );
+    }
+
+    #[test]
+    fn too_many_changes_fall_back_to_copying_normally() {
+        let f = full();
+        populate(&f, "d", 6);
+        assert_eq!(
+            f.run_reloc("20260101", reloc_on()).status,
+            BackupJobStatus::Success
+        );
+        fs::rename(f.source.join("d"), f.source.join("e")).unwrap();
+        let cfg = relocation::RelocationConfig {
+            max_changes: 3,
+            ..reloc_on()
+        };
+
+        assert_eq!(
+            f.run_reloc("20260102", cfg).status,
+            BackupJobStatus::Success
+        );
+
+        for i in 0..6 {
+            assert_eq!(
+                read(&f.dest().join(format!("20260102/e/f{i:03}.dat"))),
+                format!("payload-{i}-{}", "x".repeat(i))
+            );
+        }
+        assert_ne!(
+            ino_of(&f.dest().join("20260101/d/f000.dat")),
+            ino_of(&f.dest().join("20260102/e/f000.dat"))
+        );
+        assert!(!f.dest().join(generation::RELOC_NAME).exists());
+    }
+
+    #[test]
+    fn a_failed_run_removes_the_shadow_directory_and_leaves_history() {
+        let f = full();
+        populate(&f, "d", 3);
+        assert_eq!(
+            f.run_reloc("20260101", reloc_on()).status,
+            BackupJobStatus::Success
+        );
+        let history = snapshot(&f.dest().join("20260101"));
+        fs::rename(f.source.join("d"), f.source.join("e")).unwrap();
+        let source = f.source.clone();
+        let _hook = relocation::set_test_hook(move || {
+            fs::remove_dir_all(&source).unwrap();
+        });
+
+        assert_eq!(
+            f.run_reloc("20260102", reloc_on()).status,
+            BackupJobStatus::Failed
+        );
+
+        assert!(!f.dest().join(generation::RELOC_NAME).exists());
+        assert!(!f.dest().join("20260102").exists());
+        assert_eq!(current_target(&f.dest()).as_deref(), Some("20260101"));
+        assert_eq!(snapshot(&f.dest().join("20260101")), history);
+    }
+
+    #[test]
+    fn a_shadow_directory_left_by_a_crash_is_removed_on_the_next_run() {
+        let f = full();
+        populate(&f, "d", 2);
+        assert_eq!(
+            f.run_reloc("20260101", reloc_on()).status,
+            BackupJobStatus::Success
+        );
+        let history = snapshot(&f.dest().join("20260101"));
+        fs::create_dir_all(f.dest().join(generation::RELOC_NAME)).unwrap();
+        fs::hard_link(
+            f.dest().join("20260101/d/f000.dat"),
+            f.dest().join(generation::RELOC_NAME).join("leftover.dat"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            f.run_reloc("20260102", relocation::RelocationConfig::default())
+                .status,
+            BackupJobStatus::Success
+        );
+
+        assert!(!f.dest().join(generation::RELOC_NAME).exists());
+        assert_eq!(snapshot(&f.dest().join("20260101")).len(), history.len());
+        assert_eq!(read(&f.dest().join("20260101/d/f000.dat")), "payload-0-");
+        assert!(generation::is_internal_name(generation::RELOC_NAME));
+    }
+
+    #[test]
+    fn an_unusable_index_turns_moved_file_detection_off_without_failing_the_backup() {
+        let f = full();
+        populate(&f, "d", 4);
+        assert_eq!(
+            f.run_reloc("20260101", reloc_on()).status,
+            BackupJobStatus::Success
+        );
+        let conn = rusqlite::Connection::open(index::index_path(&f.disk)).unwrap();
+        conn.execute(
+            "UPDATE meta SET value = '99' WHERE key = 'schema_version'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        fs::rename(f.source.join("d"), f.source.join("e")).unwrap();
+
+        assert_eq!(
+            f.run_reloc("20260102", reloc_on()).status,
+            BackupJobStatus::Success
+        );
+
+        assert_eq!(read(&f.dest().join("20260102/e/f002.dat")), "payload-2-xx");
+        assert_ne!(
+            ino_of(&f.dest().join("20260101/d/f000.dat")),
+            ino_of(&f.dest().join("20260102/e/f000.dat"))
+        );
+    }
+
+    #[test]
+    fn the_default_minimum_size_leaves_small_files_alone() {
+        let f = full();
+        write(&f.source.join("d/small.dat"), &"s".repeat(1024));
+        write(&f.source.join("d/large.dat"), &"L".repeat(100 * 1024));
+        set_mtime(&f.source.join("d/small.dat"), "2020-05-05 10:00:00");
+        set_mtime(&f.source.join("d/large.dat"), "2020-05-05 10:00:00");
+        let defaults = relocation::RelocationConfig {
+            enabled: true,
+            ..relocation::RelocationConfig::default()
+        };
+        assert_eq!(
+            f.run_reloc("20260101", defaults).status,
+            BackupJobStatus::Success
+        );
+
+        fs::rename(f.source.join("d"), f.source.join("e")).unwrap();
+        assert_eq!(
+            f.run_reloc("20260102", defaults).status,
+            BackupJobStatus::Success
+        );
+
+        assert_eq!(
+            ino_of(&f.dest().join("20260101/d/large.dat")),
+            ino_of(&f.dest().join("20260102/e/large.dat"))
+        );
+        assert_ne!(
+            ino_of(&f.dest().join("20260101/d/small.dat")),
+            ino_of(&f.dest().join("20260102/e/small.dat"))
+        );
+    }
+
+    #[test]
+    fn a_job_can_turn_moved_file_detection_on_or_off_for_itself() {
+        let f = full();
+        populate(&f, "d", 3);
+        let mut job_on = gen_job(&f.source, 10);
+        job_on.relocation = Some(true);
+        // Global setting off, job setting on.
+        let off = relocation::RelocationConfig::default();
+        assert_eq!(
+            f.run_jobs_reloc(vec![job_on.clone()], "20260101", false, false, off)[0].status,
+            BackupJobStatus::Success
+        );
+        fs::rename(f.source.join("d"), f.source.join("e")).unwrap();
+        assert_eq!(
+            f.run_jobs_reloc(vec![job_on], "20260102", false, false, off)[0].status,
+            BackupJobStatus::Success
+        );
+        // min_size defaults to 64 KiB, so tiny files are not reused: the point
+        // here is only that the job's own switch activated the machinery.
+        assert!(f.disk.join(index::INDEX_DIR).exists());
+
+        // Global setting on, job setting off: nothing is created.
+        let g = full();
+        populate(&g, "d", 3);
+        let mut job_off = gen_job(&g.source, 10);
+        job_off.relocation = Some(false);
+        assert_eq!(
+            g.run_jobs_reloc(vec![job_off], "20260101", false, false, reloc_on())[0].status,
+            BackupJobStatus::Success
+        );
+        assert!(!g.disk.join(index::INDEX_DIR).exists());
+    }
+
+    #[test]
+    fn moved_file_detection_works_in_safe_mode() {
+        let f = full();
+        populate(&f, "d", 5);
+        assert_eq!(
+            f.run_reloc("20260101", reloc_on()).status,
+            BackupJobStatus::Success
+        );
+        fs::rename(f.source.join("d"), f.source.join("e")).unwrap();
+        let safe = RunMode {
+            safe_mode: true,
+            ..run_mode()
+        };
+
+        let reports = f.run_on(
+            &f.disk,
+            vec![gen_job(&f.source, 10)],
+            "20260102",
+            false,
+            false,
+            reloc_on(),
+            safe,
+        );
+
+        assert_eq!(reports[0].status, BackupJobStatus::Success);
+        assert_eq!(
+            ino_of(&f.dest().join("20260101/d/f000.dat")),
+            ino_of(&f.dest().join("20260102/e/f000.dat"))
+        );
+        assert!(!f.dest().join(generation::RELOC_NAME).exists());
+    }
+
+    #[test]
+    fn a_cascade_copy_reuses_moved_files_from_its_own_previous_generation() {
+        let f = full();
+        let disk2 = f._tmp.path().join("disk2");
+        fs::create_dir_all(&disk2).unwrap();
+        let dest2 = disk2.join("test");
+        let from_primary = |f: &Full| gen_job(&f.dest().join("current"), 10);
+        populate(&f, "d", 8);
+
+        // Day one: the source goes to the primary, the primary to the second disk.
+        assert_eq!(
+            f.run_reloc("20260101", reloc_on()).status,
+            BackupJobStatus::Success
+        );
+        let r = f.run_on(
+            &disk2,
+            vec![from_primary(&f)],
+            "20260101",
+            false,
+            false,
+            reloc_on(),
+            run_mode(),
+        );
+        assert_eq!(r[0].status, BackupJobStatus::Success);
+
+        // The source is reorganised, and both disks take day two.
+        fs::rename(f.source.join("d"), f.source.join("moved")).unwrap();
+        assert_eq!(
+            f.run_reloc("20260102", reloc_on()).status,
+            BackupJobStatus::Success
+        );
+        let r = f.run_on(
+            &disk2,
+            vec![from_primary(&f)],
+            "20260102",
+            false,
+            false,
+            reloc_on(),
+            run_mode(),
+        );
+        assert_eq!(r[0].status, BackupJobStatus::Success);
+
+        for i in 0..8 {
+            let name = format!("f{i:03}.dat");
+            // Each disk reused its own data; nothing is shared across disks.
+            assert_eq!(
+                ino_of(&f.dest().join("20260101/d").join(&name)),
+                ino_of(&f.dest().join("20260102/moved").join(&name))
+            );
+            assert_eq!(
+                ino_of(&dest2.join("20260101/d").join(&name)),
+                ino_of(&dest2.join("20260102/moved").join(&name))
+            );
+            assert_ne!(
+                ino_of(&f.dest().join("20260102/moved").join(&name)),
+                ino_of(&dest2.join("20260102/moved").join(&name))
+            );
+        }
+    }
+
+    /// Cost and benefit of moved-file detection on a local tree. Run with:
+    /// `cargo test --release bench_relocation -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_relocation() {
+        fn disk_kib(disk: &Path) -> u64 {
+            let out = Command::new("du").arg("-sk").arg(disk).output().unwrap();
+            String::from_utf8_lossy(&out.stdout)
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap()
+        }
+
+        fn scenario(name: &str, files: usize, size: usize, reloc: bool, mutate: &dyn Fn(&Full)) {
+            let f = full();
+            let body = "x".repeat(size);
+            for i in 0..files {
+                let path = f.source.join(format!("d{:03}/f{:06}.dat", i % 200, i));
+                if i < 200 {
+                    fs::create_dir_all(path.parent().unwrap()).unwrap();
+                }
+                fs::write(&path, format!("{i}:{body}")).unwrap();
+            }
+            let status = Command::new("find")
+                .arg(&f.source)
+                .args([
+                    "-type",
+                    "f",
+                    "-exec",
+                    "touch",
+                    "-d",
+                    "2020-05-05 10:00:00",
+                    "{}",
+                    "+",
+                ])
+                .status()
+                .unwrap();
+            assert!(status.success());
+            let cfg = if reloc {
+                relocation::RelocationConfig {
+                    enabled: true,
+                    min_size: 1,
+                    ..relocation::RelocationConfig::default()
+                }
+            } else {
+                relocation::RelocationConfig::default()
+            };
+            let t = Instant::now();
+            assert_eq!(
+                f.run_reloc("20260101", cfg).status,
+                BackupJobStatus::Success
+            );
+            let first = t.elapsed();
+            let before = disk_kib(&f.disk);
+            mutate(&f);
+            let t = Instant::now();
+            assert_eq!(
+                f.run_reloc("20260102", cfg).status,
+                BackupJobStatus::Success
+            );
+            let second = t.elapsed();
+            let after = disk_kib(&f.disk);
+            eprintln!(
+                "{:<12} {:<10} initial {:>8.2?}  next run {:>8.2?}  extra disk {:>8} KiB",
+                name,
+                if reloc { "relocation" } else { "plain" },
+                first,
+                second,
+                after - before
+            );
+        }
+
+        let files = 20_000;
+        let size = 4096;
+        let nothing: &dyn Fn(&Full) = &|_| {};
+        let bulk_move: &dyn Fn(&Full) = &|f| {
+            fs::create_dir_all(f.source.join("moved")).unwrap();
+            for d in 0..200 {
+                fs::rename(
+                    f.source.join(format!("d{d:03}")),
+                    f.source.join(format!("moved/d{d:03}")),
+                )
+                .unwrap();
+            }
+        };
+        let mass_rename: &dyn Fn(&Full) = &|f| {
+            for i in 0..20_000usize {
+                let from = f.source.join(format!("d{:03}/f{:06}.dat", i % 200, i));
+                let to = f.source.join(format!("d{:03}/r{:06}.dat", i % 200, i));
+                fs::rename(from, to).unwrap();
+            }
+        };
+        eprintln!("{} files of about {} bytes", files, size);
+        for reloc in [false, true] {
+            scenario("no change", files, size, reloc, nothing);
+        }
+        for reloc in [false, true] {
+            scenario("bulk move", files, size, reloc, bulk_move);
+        }
+        for reloc in [false, true] {
+            scenario("mass rename", files, size, reloc, mass_rename);
+        }
     }
 }

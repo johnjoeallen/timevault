@@ -52,6 +52,9 @@ options:
   #   sendmail: "/usr/sbin/sendmail"
   # Keep a per-disk file index (<disk>/.timevault-index). Off by default.
   # index: true
+  # Reuse files that were moved or renamed instead of storing them again.
+  # Off by default; switches the file index on. See docs/relocation.md.
+  # relocation: true
   rsync:
     - "--one-file-system"
 

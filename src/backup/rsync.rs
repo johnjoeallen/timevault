@@ -183,7 +183,7 @@ fn rsync_summary(captured: &str, label: &str) -> Option<String> {
     }
 }
 
-fn normalize_rsync_source(source: &str) -> String {
+pub(crate) fn normalize_rsync_source(source: &str) -> String {
     if source.ends_with('/') {
         return source.to_string();
     }
@@ -193,7 +193,7 @@ fn normalize_rsync_source(source: &str) -> String {
     ensure_trailing_slash(source)
 }
 
-fn ensure_trailing_slash(path: &str) -> String {
+pub(crate) fn ensure_trailing_slash(path: &str) -> String {
     if path.ends_with('/') {
         path.to_string()
     } else {

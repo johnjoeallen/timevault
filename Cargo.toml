@@ -1,6 +1,6 @@
 [package]
 name = "timevault"
-version = "1.16.0"
+version = "1.17.0"
 edition = "2021"
 description = "Safe rsync-based backup tool with mount validation and snapshot rotation"
 license = "GPL-3.0-or-later"
@@ -39,6 +39,7 @@ assets = [
   ["docs/retention-capacity.md", "usr/share/doc/timevault/docs/retention-capacity.md", "644"],
   ["docs/recovery.md", "usr/share/doc/timevault/docs/recovery.md", "644"],
   ["docs/recreate.md", "usr/share/doc/timevault/docs/recreate.md", "644"],
+  ["docs/relocation.md", "usr/share/doc/timevault/docs/relocation.md", "644"],
   ["docs/examples.md", "usr/share/doc/timevault/docs/examples.md", "644"],
   ["docs/design-rationale.md", "usr/share/doc/timevault/docs/design-rationale.md", "644"],
   ["LICENSE", "usr/share/doc/timevault/LICENSE", "644"],

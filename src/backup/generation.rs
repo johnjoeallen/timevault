@@ -35,6 +35,9 @@ pub const COMPLETE_MARKER: &str = ".timevault-complete";
 pub const PUBLISH_INTENT: &str = ".timevault-publishing";
 /// Temporary symlink renamed over `current`, so `current` is replaced atomically.
 pub const CURRENT_TMP: &str = ".timevault-current.tmp";
+/// Scratch directory of hard links used by moved-file detection while a
+/// generation is built. Holds only links, so removing it never touches data.
+pub const RELOC_NAME: &str = ".timevault-reloc";
 
 const RENAME_EXCHANGE: libc::c_uint = 2;
 
@@ -51,6 +54,7 @@ pub fn is_internal_name(name: &str) -> bool {
     name == STAGING_NAME
         || name == PUBLISH_INTENT
         || name == CURRENT_TMP
+        || name.starts_with(RELOC_NAME)
         || name.starts_with(REPLACED_PREFIX)
 }
 
@@ -326,6 +330,18 @@ pub fn recover_interrupted(dest: &Path, run_mode: RunMode) -> io::Result<()> {
         return Ok(());
     }
     recover_exchange(dest)?;
+    // A shadow directory left by an interrupted run holds only hard links to
+    // files that stay referenced elsewhere, so it is always safe to remove.
+    match fs::remove_dir_all(dest.join(RELOC_NAME)) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    match fs::remove_file(dest.join(format!("{}.list", RELOC_NAME))) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
     for entry in fs::read_dir(dest)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().to_string();

@@ -10,7 +10,7 @@ Running record of changes, decisions and findings for the work described in [PLA
 | D2 | Recreate flag is `backup --recreate`, alias `--refresh`; `--force` is not used | 2026-10-19 | `--force` already means something else in `disk register`. |
 | D3 | Cascade stays a star (all other disks copy from the primary's `current`) | 2026-10-19 | Meets the cascade success-dependency rules; a chain would let one failure block later disks. Docs describe the star. |
 | D4 | Relocation uses a shadow `--link-dest` directory, not pre-linking into staging | 2026-10-19 | rsync never writes to `--link-dest` references, so shared historical inodes cannot be mutated. |
-| D5 | Remote hash tier extends the existing pristine helper pattern | 2026-10-19 | Backups already depend on root-to-root SSH keys. Helper input must be NUL-delimited, regular files only, no symlink following. |
+| D5 | Remote hash tier extends the existing pristine helper pattern (superseded by D15) | 2026-10-19 | Backups already depend on root-to-root SSH keys. Helper input must be NUL-delimited, regular files only, no symlink following. |
 | D6 | Different jobs may run in parallel; users keep their directories non-overlapping | 2026-10-19 | Per-job locks already allow it. New shared state (index, caches) must be parallel-safe. |
 | D7 | Index is `rusqlite` with `bundled`; hash cache keyed `(dev, ino, size, mtime_ns)`, never `ctime` | 2026-10-19 | Hard-linking bumps `ctime`. |
 | D8 | Index lives at `<disk>/.timevault-index/file-index.sqlite` | 2026-10-19 | `<disk>/.timevault` is the identity file, not a directory, so the originally planned path was impossible. |
@@ -20,6 +20,10 @@ Running record of changes, decisions and findings for the work described in [PLA
 | D12 | Publication uses a completion marker (`.timevault-complete`, content = per-run token), written by rename after a `syncfs` of the staging filesystem | 2026-10-19 | The marker is atomic with publish and replaced by rename, never rewritten in place, because a cascade source tree can carry its own marker that rsync hard-links from an older generation. |
 | D13 | Same-day replacement uses `renameat2(RENAME_EXCHANGE)` journalled by `.timevault-publishing`; fall back to set-aside where unsupported | 2026-10-19 | Recovery decides by whether the intent's token is now in the final directory. |
 | D14 | The index is off by default (`options.index`, `INDEX_DEFAULT = false`) until Phase 5 uses it and the default is decided from benchmarks | 2026-10-19 | Measured on 100k files: about 1 s per run to record and publish, about 50 MB of database. Nothing consumes the index yet, so enabling it by default would cost without benefit. |
+| D15 | Remote confirmation uses rsync's own checksum (`-c`) against the shadow directory, not a custom helper run as root on the remote | 2026-10-19 | No remote code or scratch files, no shell parsing of file names, and no new privileges. Trade-offs: rsync's checksum is not SHA-256, and only unique-move pairings are confirmed (not copies or ambiguous groups). |
+| D16 | Relocation is off by default (`options.relocation`); per-job override `relocation: true/false` | 2026-10-19 | It adds a read-only pass and the file index. The remote cost was not measured, so the conservative default stands; local numbers are in `docs/relocation.md`. |
+| D17 | Candidates come from a dry run of the real rsync command against the previous generation (not against staging) | 2026-10-19 | Against the previous generation rsync reports exactly `>f+++++++++` (new) and `*deleting` (vanished). Against empty staging it would report no deletions at all. |
+| D18 | Unverified (size and mtime) pairings are only made for a unique move where the old path vanished; a file whose old path still exists is a copy and needs content comparison | 2026-10-19 | A same-size, same-mtime, different-content look-alike would otherwise be backed up with the old file's bytes; an end-to-end test showed exactly that when verification was disabled. |
 
 ## Findings about the existing code
 
@@ -124,7 +128,26 @@ Notes and limits:
 - Timing is for a warm cache on local storage; a cold cache on a spinning disk will be slower, as it is for rsync.
 - Not exercised on a real removable disk or on filesystems without WAL support (the default journal would be used there).
 
-### Phase 5 onwards
+### Phase 5: relocation-aware reuse (1.17.0, feature)
+
+- **Module:** `src/backup/relocation.rs`. Off by default (D16): `options.relocation` is `true`/`false` or a block (`enabled`, `minSize` 65536, `maxChanges` 200000, `timeoutSeconds` 900, `verify` auto|hash|size-mtime); a job can override with `relocation: true|false`. It switches the file index on.
+- **Pipeline (D17):** (1) dry run of the real rsync command (same excludes and user options, plus `--delete --delete-excluded`, `TZ=UTC`, `--out-format=%i|%l|%M|%n`) against the previous generation yields new files (`>f+++++++++`) and vanished files (`*deleting`); names are unescaped from rsync's `\#NNN` form. (2) Pair them using the disk-local index (D18). (3) Hard-link each match at its new path under `<job>/.timevault-reloc`. (4) Run the real rsync with that directory as an extra `--link-dest`. (5) Remove it, also on failure; `recover_interrupted` removes leftovers.
+- **Pairing evidence:** local source (including cascade): files are grouped by size and mtime, each group is hashed once in one transaction, and pairs are made by equal SHA-256 plus equal mode; also finds duplicates of files that still exist. Remote source: only a unique move (vanished old path, one new file of the same size and mtime, unique both ways); with `verify: hash` each pairing is then confirmed by rsync's checksum (D15). Ambiguous groups, too-small files and attribute mismatches are left to rsync.
+- **Safety:** the shadow directory is only ever a read-only reference for rsync, so no inode shared with a completed generation can be written (tested with a moved file whose mode changed: new storage, old mode and inode intact). Never fails a backup: every problem is a "skipped" note; an index error switches the index off for the run.
+- **Bail-outs:** more new+vanished files than `maxChanges`, planning past `timeoutSeconds`, a failing dry run, or an unavailable index all abandon relocation for the run with a log line.
+- **Performance bug found by the benchmark and fixed:** the first matcher tried only 8 candidates per new file. On a mass rename of 20,000 files that share a size class and mtime it took 55.7 s and reused nothing. It now hashes each size+mtime group once and pairs by content: 1.26 s, 9.6 MiB extra instead of 157 MiB. A 300-file regression test pins it.
+- **Benchmark** (`bench_relocation`, ignored test; local FS, warm cache, release, 20,000 files of about 4 KiB): no change 0.30 s plain vs 0.55 s with relocation (0.8 vs 5.3 MiB incl. index); every folder moved 0.36 s, 157 MiB vs 1.24 s, 10.6 MiB; every file renamed 0.37 s, 157 MiB vs 1.26 s, 9.6 MiB. **Not measured:** the extra dry-run pass over SSH, any remote workload, cold caches or spinning disks.
+- **Tests (+46; 279 run plus 2 ignored benchmarks):** parsing of rsync's output (escapes, pipes in names, directories, symlinks); config resolution and YAML forms; matching (moved directory, rename, move plus rename, unique remote move, ambiguous groups decided by content, look-alike rejected, copies shared only when verified, mode mismatch, minimum size, non-UTF-8 names, 300 identical-size files); limits (change limit, expired time limit, failing dry run); shadow construction failures and cleanup; rsync-checksum confirmation (classification, remote move linked, look-alike rejected, mixed set, mode change, hostile file names with spaces, newline, quotes, `$(...)` and non-UTF-8 bytes, failing run); and end to end through `run_backup_for_day` (bulk move, control without relocation, mass rename, move plus rename, permission change keeps history intact, edited after move, look-alike, change between planning and copying, change limit, failed run cleans up, leftover shadow removed, unusable index, default minimum size, per-job override, safe mode, cascade stage). Disabling content verification makes the look-alike tests fail, which shows the data corruption it prevents.
+- **Docs:** new `docs/relocation.md`; updates to `architecture.md`, `retention-capacity.md`, `cascade.md`, `recovery.md`, `design-rationale.md`, User Guide (options, job key, Snapshot generations), README and the example config. `relocation.md` is in the deb assets.
+
+Notes and limits:
+- The default remote tier trusts a unique move by size and mtime, the same evidence rsync uses to skip a file; `verify: hash` closes the look-alike gap at the cost of a checksum read on the remote.
+- Remote duplicates (copies of files that still exist) and ambiguous remote groups are not detected.
+- rsync reports mtimes in whole seconds, so matching is at second resolution, which is also what its own quick check uses.
+- Statistics are logged, not yet in the email report.
+- The index's record-and-commit cost (about 1 s per 100,000 files) applies whenever relocation is on; keying rows by generation and recording only changed files remains a possible optimisation.
+
+### Phase 6 onwards
 
 Not started.
 
