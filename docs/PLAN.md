@@ -1,6 +1,6 @@
 # Plan: relocation-aware reuse, disk-local index, safe publication, current-target recreation, rotation docs
 
-Status: approved plan, in progress. Phases 0 to 3 done; Phase 4 next. Evolves the existing architecture; it does not replace it.
+Status: approved plan, in progress. Phases 0 to 4 done; Phase 5 next. Evolves the existing architecture; it does not replace it.
 
 This plan is kept current as work proceeds. What was done, decided and learned is recorded in [IMPLEMENTATION_LOG.md](IMPLEMENTATION_LOG.md); every change to the plan itself is noted there too.
 
@@ -10,7 +10,7 @@ This plan is kept current as work proceeds. What was done, decided and learned i
 | 1 Docs foundation | Done |
 | 2 Publication hardening | Done (1.14.4) |
 | 3 Current-target recreation | Done (1.15.0) |
-| 4 Disk-local SQLite index | Not started |
+| 4 Disk-local SQLite index | Done (1.16.0) |
 | 5 Relocation-aware reuse | Not started |
 | 6 Rotation and cascade validation | Not started |
 | 7 Final pass and summary | Not started |
@@ -112,7 +112,7 @@ Definition of done for every phase:
 - Tests: failed recreate leaves the old target intact; crash mid-exchange leaves one of the two versions, never neither; skip behaviour; cascade during a recreate never reads half-finished data.
 - Docs: new `docs/recreate.md`; release note and "Backup" section for the behaviour change.
 
-### Phase 4: disk-local SQLite index (feature; minor)
+### Phase 4: disk-local SQLite index (feature; minor) — DONE
 - Implement the index, lifecycle (load or rebuild, populate for staging, validate, publish, advance roles, retire old rows) and rebuild-from-disk.
 - Tests: two jobs writing the same disk's index concurrently; lifecycle, hash-cache invalidation, corrupt file falls back to rebuild, mismatch with `current` triggers rebuild, restore with the index deleted.
 - Docs: index sections of `architecture.md` and `design-rationale.md`; "rebuild a missing index" in `recovery.md`.

@@ -19,6 +19,7 @@ Running record of changes, decisions and findings for the work described in [PLA
 | D11 | `rotatedOut` and `disk rotate-in/rotate-out` are deprecated: still work, print a warning, removed at the next major version | 2026-10-19 | There is no rotation concept in Timevault: users connect or disconnect enrolled disks. To stop writing to a connected disk use `disable`, which still allows mount, inspect, ls and df. |
 | D12 | Publication uses a completion marker (`.timevault-complete`, content = per-run token), written by rename after a `syncfs` of the staging filesystem | 2026-10-19 | The marker is atomic with publish and replaced by rename, never rewritten in place, because a cascade source tree can carry its own marker that rsync hard-links from an older generation. |
 | D13 | Same-day replacement uses `renameat2(RENAME_EXCHANGE)` journalled by `.timevault-publishing`; fall back to set-aside where unsupported | 2026-10-19 | Recovery decides by whether the intent's token is now in the final directory. |
+| D14 | The index is off by default (`options.index`, `INDEX_DEFAULT = false`) until Phase 5 uses it and the default is decided from benchmarks | 2026-10-19 | Measured on 100k files: about 1 s per run to record and publish, about 50 MB of database. Nothing consumes the index yet, so enabling it by default would cost without benefit. |
 
 ## Findings about the existing code
 
@@ -102,7 +103,28 @@ Notes and limits:
 - Not exercised against a real mounted disk or a real SSH source; the tests drive `run_backup_for_day` on directories.
 - `cargo fmt --check` is clean again (the drift on `main` was fixed as a side effect of reformatting `generation.rs` in Phase 2).
 
-### Phase 4 onwards
+### Phase 4: disk-local SQLite index (1.16.0, feature)
+
+- **Module:** `src/backup/index.rs`; dependency `rusqlite` with the `bundled` feature (no new runtime package for the deb). Database at `<disk>/.timevault-index/file-index.sqlite` (D8), relative paths stored as BLOBs so non-UTF-8 names round-trip.
+- **Schema:** `meta` (schema version), `generations` (per job and role: generation name, marker token, file count), `files` (per job, role and path: name, kind, size, mtime_ns, dev, ino, nlink, mode, uid, gid; indexed by name+size, size and inode), `hashes` keyed by `(ino, size, mtime_ns, algo, version)` with provenance (`hashed_at`, `source`). The disk is one filesystem, so the inode alone identifies a file within it; `dev` is stored for information only, because device numbers can change between mounts.
+- **Lifecycle:** `Session` (the only thing the backup path uses) runs `prepare` (reuse or rebuild "previous", clear leftover "current"), `record` (walk the finished staging tree after the marker is written), `commit` (after publish, one transaction: drop old "previous", relabel "current", purge unreferenced hashes) and `abandon` (failed run). Reconciliation after a crash needs no journal: "previous" is trusted only if its generation name, marker token and row count match the reference generation, otherwise it is rebuilt from the disk.
+- **Lookups for Phase 5:** by path, by name and size, by size, by hash (with a different name), all files of a role, hard-link groups, same-inode test.
+- **Hashing:** lazy SHA-256 via the existing `sha2` crate, shared between hard links, trusted only after the file's size, mtime and inode are re-checked (before and after reading); otherwise `Stale`. `ctime` is not used because hard-linking changes it.
+- **Failure policy:** every index step on the backup path is best effort. Errors become warnings and switch the index off for the run; a corrupt database is moved aside (`.corrupt-<n>`, newest kept) and rebuilt; a newer schema is left untouched.
+- **Bug found by repeated test runs and fixed:** with several jobs opening a fresh database together, `PRAGMA journal_mode=WAL` returned `SQLITE_BUSY` immediately without honouring the busy timeout, which would have skipped the index for a run in production. Setup is now retried until the busy timeout passes. 0 failures in 80 full runs and 100 isolated runs after the fix (about 1 in 15 before).
+- **Config:** `options.index` (default false) plumbed to `BackupOptions.index`; example config and User Guide updated. Job names starting with `.timevault` are now rejected so a job cannot collide with files Timevault keeps at the disk root.
+- **Tests (+27; 233 run plus 1 ignored benchmark):** 18 index unit tests (relative paths only, non-UTF-8 names, lookups, lazy and shared hashing, staleness by content, mtime, inode and removal, lifecycle advance, failed run, reuse and rebuild conditions, missing index, corrupt index, newer schema, jobs isolated, four parallel jobs on one database, inert session, unusable index) and 8 end-to-end tests through `run_backup_for_day` (index follows published generations with history bit-identical, failed run, crash between publish and index update then reconciled, deleted index, corrupt index, unusable index, not created unless enabled, recreate, two jobs on one disk) plus the reserved-name test. Two mutations were confirmed caught: disabling the staleness check and skipping the commit.
+- **Benchmark (ignored test `bench_index_100k_files`, release, warm cache, 100,000 files):** full build 0.44 s; reuse check 2 ms; record plus commit 0.96 s; name+size lookup 3.5 ms; bare walk and stat 0.08 s; database 50 MB (about 500 bytes per file).
+- **Docs:** `architecture.md` (new "Disk-local file index" section and layout), `recovery.md` (missing or corrupt index), `retention-capacity.md` (index space), `design-rationale.md`, User Guide (`options.index`, reserved job names), example config.
+
+Notes and limits:
+- Nothing consumes the index yet; enabling it only adds cost until Phase 5.
+- `record` walks the whole new generation and `commit` relabels every row, so cost scales with total files, not changed files. Before Phase 5 enables it by default, consider keying rows by generation (so commit is O(1)) and recording only changed files from rsync's output. The database is about 500 bytes per file; trimming indexes would shrink it.
+- Extended attributes and ACLs are not captured, so Phase 5 must not treat the index as proof that those match.
+- Timing is for a warm cache on local storage; a cold cache on a spinning disk will be slower, as it is for rsync.
+- Not exercised on a real removable disk or on filesystems without WAL support (the default journal would be used there).
+
+### Phase 5 onwards
 
 Not started.
 

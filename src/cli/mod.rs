@@ -55,6 +55,8 @@ pub fn run() -> Result<()> {
         exclude_pristine_only: cli.exclude_pristine_only,
         session_seconds_override: cli.min_session_seconds,
         recreate: cli.recreate,
+        // Set from `options.index` in the config when the backup runs.
+        index: crate::backup::index::INDEX_DEFAULT,
     };
 
     let command = cli.command.clone().unwrap_or(Command::Backup);

@@ -46,6 +46,15 @@ A second run on a day that already has a completed generation does nothing unles
 - **Cost:** a job run several times a day keeps the state of the first run, and refreshing it needs an explicit flag. This reverses the behaviour of releases before 1.15.0.
 - **Safe replacement:** the rebuild happens in staging and replaces the old generation by an atomic swap, so a failed rebuild leaves the old generation in place.
 
+## A file index on each disk, not a central one
+
+The index that lets Timevault recognise moved files is stored on the backup disk it describes.
+
+- **Why:** a disk must stay usable on its own, and an index that lived on the host (or on another disk) would tie it to that machine or disk and go stale whenever disks are rotated. A disk-local index travels with the disk, describes exactly what that disk holds, and can be rebuilt from it.
+- **Why it is an optimisation, not a dependency:** the generations are the truth. Treating the index as disposable means a crash, a corrupt file or a version change can never make backups unreadable, only slower once.
+- **Why hashing is lazy:** hashing every file on every run would cost far more than the savings. Hashes are computed on demand, shared between hard links, and trusted only after the file is re-checked.
+- **Cost:** extra disk space and a walk of each new generation per run, which is why it is off by default until a feature uses it.
+
 ## Completed generations are never modified
 
 - **Why:** a restore from last month must still return last month. Hard links share inodes, so a permission or timestamp change applied in place to a shared file would rewrite that file in every generation that links it. Timevault builds into staging and stores a changed file anew.

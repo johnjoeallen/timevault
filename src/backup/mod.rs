@@ -21,6 +21,7 @@ use crate::util::command::maybe_print_command;
 use crate::util::paths::job_lock_path;
 
 pub mod generation;
+pub mod index;
 pub mod pristine;
 pub mod report;
 pub mod rsync;
@@ -77,6 +78,8 @@ pub struct BackupOptions {
     /// `--recreate`: rebuild the current backup day's generation even if it
     /// is already complete.
     pub recreate: bool,
+    /// Maintain the disk-local file index (`options.index`).
+    pub index: bool,
 }
 
 struct LockGuard {
@@ -416,6 +419,7 @@ fn run_backup_job(
         rsync_extra,
         run_mode,
         options.recreate,
+        options.index,
     )?;
     let SyncOutcome {
         rc,
@@ -3153,6 +3157,7 @@ fn sync_generation(
     rsync_extra: &[String],
     run_mode: RunMode,
     recreate: bool,
+    index_enabled: bool,
 ) -> Result<SyncOutcome> {
     if !run_mode.dry_run && !dest.exists() {
         fs::create_dir_all(dest)?;
@@ -3170,6 +3175,8 @@ fn sync_generation(
             crate::pnote!("  link-dest: {}", base.display());
         }
     }
+    let mut file_index = index::Session::start(index_enabled, dest, &job.name, run_mode);
+    file_index.prepare(link_dests.first().map(PathBuf::as_path));
     let staging = generation::prepare_staging(dest, !link_dests.is_empty(), run_mode)?;
 
     let mut rc = 1;
@@ -3214,14 +3221,18 @@ fn sync_generation(
                 err
             ))
         };
-        generation::finalize_staging(&staging, run_mode).map_err(publish_error)?;
+        let token = generation::finalize_staging(&staging, run_mode).map_err(publish_error)?;
+        file_index.record(&staging, backup_day, &token);
         generation::failpoint_hit("before-publish").map_err(publish_error)?;
         generation::publish(dest, &staging, backup_day, run_mode).map_err(publish_error)?;
         generation::failpoint_hit("after-publish").map_err(publish_error)?;
+        file_index.commit();
         crate::pstatus!("{}: pruning old snapshots", job.name);
         if let Err(err) = expire_old_backups(job, dest, run_mode) {
             crate::pnote!("warning: pruning old snapshots failed: {}", err);
         }
+    } else {
+        file_index.abandon();
     }
     Ok(SyncOutcome {
         rc,
@@ -3241,6 +3252,12 @@ fn resolve_job_dest(job: &Job, disk_mount: &Path) -> Result<PathBuf> {
     if !crate::util::paths::is_safe_name(&job.name) {
         return Err(TimevaultError::message(format!(
             "job {} name must use only letters, digits, '.', '-', '_'",
+            job.name
+        )));
+    }
+    if job.name.starts_with(".timevault") {
+        return Err(TimevaultError::message(format!(
+            "job {} name must not start with '.timevault' (reserved for files Timevault keeps on the disk)",
             job.name
         )));
     }
@@ -4154,6 +4171,7 @@ mod tests {
                 exclude_pristine_only: false,
                 session_seconds_override: None,
                 recreate: false,
+                index: false,
             },
         )
         .expect("backup report");
@@ -4279,6 +4297,7 @@ mod tests {
                 exclude_pristine_only: false,
                 session_seconds_override: None,
                 recreate: false,
+                index: false,
             },
             false,
             true,
@@ -4409,6 +4428,7 @@ mod tests {
             &excludes,
             &[],
             run_mode(),
+            false,
             false,
         )
         .expect("sync_generation");
@@ -5006,6 +5026,7 @@ mod tests {
             &[],
             run_mode(),
             false,
+            false,
         )?;
         if outcome.rc == 0 || outcome.rc == 24 {
             generation::update_current(dest, day, run_mode())?;
@@ -5387,8 +5408,30 @@ mod tests {
         }
 
         fn run(&self, day: &str, recreate: bool) -> BackupJobReport {
-            let report = run_backup_for_day(
-                vec![gen_job(&self.source, 10)],
+            self.run_opts(day, recreate, false)
+        }
+
+        /// Run with the disk-local file index maintained.
+        fn run_indexed(&self, day: &str) -> BackupJobReport {
+            self.run_opts(day, false, true)
+        }
+
+        fn run_opts(&self, day: &str, recreate: bool, index: bool) -> BackupJobReport {
+            self.run_jobs(vec![gen_job(&self.source, 10)], day, recreate, index)
+                .into_iter()
+                .next()
+                .expect("one job")
+        }
+
+        fn run_jobs(
+            &self,
+            jobs: Vec<Job>,
+            day: &str,
+            recreate: bool,
+            index: bool,
+        ) -> Vec<BackupJobReport> {
+            run_backup_for_day(
+                jobs,
                 &[],
                 run_mode(),
                 &self.disk,
@@ -5397,11 +5440,16 @@ mod tests {
                     exclude_pristine_only: false,
                     session_seconds_override: None,
                     recreate,
+                    index,
                 },
                 day,
             )
-            .expect("backup report");
-            report.jobs.into_iter().next().expect("one job")
+            .expect("backup report")
+            .jobs
+        }
+
+        fn index(&self, job: &str) -> index::DiskIndex {
+            index::DiskIndex::open(&self.disk, job).expect("open index")
         }
     }
 
@@ -5617,5 +5665,324 @@ mod tests {
         let refs = generation::link_dest_refs(&r.dest, "20260101", true).unwrap();
 
         assert_eq!(refs, vec![r.dest.join("20260101").canonicalize().unwrap()]);
+    }
+
+    // ---- disk-local file index on the backup path ----
+
+    #[test]
+    fn job_names_cannot_collide_with_timevault_files_on_the_disk() {
+        let disk = Path::new("/mnt/disk");
+        for name in [".timevault", ".timevault-index", ".timevault-anything"] {
+            let mut j = job("/src");
+            j.name = name.to_string();
+            assert!(resolve_job_dest(&j, disk).is_err(), "{name}");
+        }
+        let mut ok = job("/src");
+        ok.name = "timevault".to_string();
+        assert_eq!(resolve_job_dest(&ok, disk).unwrap(), disk.join("timevault"));
+    }
+
+    fn indexed_paths(index: &index::DiskIndex, role: index::Role) -> Vec<String> {
+        let mut found: Vec<String> = index
+            .list_files(role)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.path.to_string_lossy().to_string())
+            .collect();
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn index_follows_each_published_generation_without_touching_history() {
+        let f = full();
+        write(&f.source.join("a.txt"), "one");
+        write(&f.source.join("dir/b.txt"), "bee");
+        assert_eq!(f.run_indexed("20260101").status, BackupJobStatus::Success);
+        let first = snapshot(&f.dest().join("20260101"));
+
+        let index = f.index("test");
+        let row = index
+            .generation_row(index::Role::Previous)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.generation, "20260101");
+        assert_eq!(
+            row.marker_token,
+            generation::marker_token(&f.dest().join("20260101")).unwrap()
+        );
+        assert_eq!(
+            indexed_paths(&index, index::Role::Previous),
+            vec!["a.txt", "dir/b.txt"]
+        );
+        drop(index);
+
+        write(&f.source.join("a.txt"), "two!");
+        write(&f.source.join("c.txt"), "see");
+        assert_eq!(f.run_indexed("20260102").status, BackupJobStatus::Success);
+
+        let index = f.index("test");
+        assert_eq!(
+            index
+                .generation_row(index::Role::Previous)
+                .unwrap()
+                .unwrap()
+                .generation,
+            "20260102"
+        );
+        assert_eq!(
+            indexed_paths(&index, index::Role::Previous),
+            vec!["a.txt", "c.txt", "dir/b.txt"]
+        );
+        let a = index
+            .find_by_path(index::Role::Previous, Path::new("a.txt"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.size, 4);
+        // The unchanged file is the same inode in both generations, and the
+        // index says so without hashing anything.
+        assert!(same_inode(
+            &f.dest().join("20260101/dir/b.txt"),
+            &f.dest().join("20260102/dir/b.txt")
+        ));
+        assert_eq!(index.stats().unwrap().current_files, 0);
+        assert_eq!(snapshot(&f.dest().join("20260101")), first);
+    }
+
+    #[test]
+    fn a_failed_run_leaves_the_index_on_the_last_published_generation() {
+        let f = full();
+        write(&f.source.join("a.txt"), "one");
+        assert_eq!(f.run_indexed("20260101").status, BackupJobStatus::Success);
+
+        fs::remove_dir_all(&f.source).unwrap();
+        assert_eq!(f.run_indexed("20260102").status, BackupJobStatus::Failed);
+
+        let index = f.index("test");
+        let stats = index.stats().unwrap();
+        assert_eq!(
+            index
+                .generation_row(index::Role::Previous)
+                .unwrap()
+                .unwrap()
+                .generation,
+            "20260101"
+        );
+        assert_eq!((stats.previous_files, stats.current_files), (1, 0));
+    }
+
+    #[test]
+    fn crash_between_publish_and_index_update_is_reconciled_next_run() {
+        let f = full();
+        write(&f.source.join("a.txt"), "one");
+        assert_eq!(f.run_indexed("20260101").status, BackupJobStatus::Success);
+        write(&f.source.join("a.txt"), "two!");
+        {
+            let _crash = generation::failpoint::set("after-publish");
+            assert_eq!(f.run_indexed("20260102").status, BackupJobStatus::Failed);
+        }
+        // 20260102 is published, but the index still describes 20260101.
+        assert!(generation::marker_token(&f.dest().join("20260102")).is_some());
+        assert_eq!(
+            f.index("test")
+                .generation_row(index::Role::Previous)
+                .unwrap()
+                .unwrap()
+                .generation,
+            "20260101"
+        );
+
+        write(&f.source.join("a.txt"), "three!!");
+        assert_eq!(f.run_indexed("20260103").status, BackupJobStatus::Success);
+
+        // The next run rebuilt the reference from the disk (20260102), then
+        // advanced to 20260103.
+        let index = f.index("test");
+        assert_eq!(
+            index
+                .generation_row(index::Role::Previous)
+                .unwrap()
+                .unwrap()
+                .generation,
+            "20260103"
+        );
+        assert_eq!(
+            index
+                .find_by_path(index::Role::Previous, Path::new("a.txt"))
+                .unwrap()
+                .unwrap()
+                .size,
+            7
+        );
+    }
+
+    #[test]
+    fn a_deleted_index_never_blocks_a_backup_and_is_rebuilt() {
+        let f = full();
+        write(&f.source.join("a.txt"), "one");
+        assert_eq!(f.run_indexed("20260101").status, BackupJobStatus::Success);
+        let first = snapshot(&f.dest().join("20260101"));
+
+        fs::remove_dir_all(f.disk.join(index::INDEX_DIR)).unwrap();
+        // Restoring needs nothing from the index.
+        assert_eq!(read(&f.dest().join("20260101/a.txt")), "one");
+
+        write(&f.source.join("a.txt"), "two!");
+        assert_eq!(f.run_indexed("20260102").status, BackupJobStatus::Success);
+
+        assert_eq!(snapshot(&f.dest().join("20260101")), first);
+        let index = f.index("test");
+        assert_eq!(
+            index
+                .generation_row(index::Role::Previous)
+                .unwrap()
+                .unwrap()
+                .generation,
+            "20260102"
+        );
+        assert_eq!(indexed_paths(&index, index::Role::Previous), vec!["a.txt"]);
+    }
+
+    #[test]
+    fn a_corrupt_index_never_blocks_a_backup_or_a_restore() {
+        let f = full();
+        write(&f.source.join("a.txt"), "one");
+        assert_eq!(f.run_indexed("20260101").status, BackupJobStatus::Success);
+        fs::write(
+            index::index_path(&f.disk),
+            b"garbage garbage garbage garbage",
+        )
+        .unwrap();
+        assert_eq!(read(&f.dest().join("20260101/a.txt")), "one");
+
+        write(&f.source.join("a.txt"), "two!");
+        assert_eq!(f.run_indexed("20260102").status, BackupJobStatus::Success);
+
+        assert_eq!(read(&f.dest().join("20260102/a.txt")), "two!");
+        let index = f.index("test");
+        assert_eq!(
+            index
+                .generation_row(index::Role::Previous)
+                .unwrap()
+                .unwrap()
+                .generation,
+            "20260102"
+        );
+    }
+
+    #[test]
+    fn an_unusable_index_does_not_fail_the_backup() {
+        let f = full();
+        write(&f.source.join("a.txt"), "one");
+        assert_eq!(f.run_indexed("20260101").status, BackupJobStatus::Success);
+        let conn = rusqlite::Connection::open(index::index_path(&f.disk)).unwrap();
+        conn.execute(
+            "UPDATE meta SET value = '99' WHERE key = 'schema_version'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        write(&f.source.join("a.txt"), "two!");
+        let report = f.run_indexed("20260102");
+
+        assert_eq!(report.status, BackupJobStatus::Success);
+        assert_eq!(read(&f.dest().join("20260102/a.txt")), "two!");
+        assert_eq!(current_target(&f.dest()).as_deref(), Some("20260102"));
+    }
+
+    #[test]
+    fn the_index_is_not_created_unless_enabled() {
+        let f = full();
+        write(&f.source.join("a.txt"), "one");
+        assert_eq!(f.run("20260101", false).status, BackupJobStatus::Success);
+        assert!(!f.disk.join(index::INDEX_DIR).exists());
+    }
+
+    #[test]
+    fn recreating_the_day_replaces_the_indexed_generation() {
+        let f = full();
+        write(&f.source.join("a.txt"), "one");
+        assert_eq!(f.run_indexed("20260101").status, BackupJobStatus::Success);
+        let old_token = f
+            .index("test")
+            .generation_row(index::Role::Previous)
+            .unwrap()
+            .unwrap()
+            .marker_token;
+
+        write(&f.source.join("a.txt"), "rebuilt");
+        assert_eq!(
+            f.run_opts("20260101", true, true).status,
+            BackupJobStatus::Success
+        );
+
+        let index = f.index("test");
+        let row = index
+            .generation_row(index::Role::Previous)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.generation, "20260101");
+        assert_ne!(row.marker_token, old_token);
+        assert_eq!(
+            row.marker_token,
+            generation::marker_token(&f.dest().join("20260101")).unwrap()
+        );
+        assert_eq!(
+            index
+                .find_by_path(index::Role::Previous, Path::new("a.txt"))
+                .unwrap()
+                .unwrap()
+                .size,
+            7
+        );
+    }
+
+    #[test]
+    fn jobs_on_one_disk_keep_separate_index_rows() {
+        let f = full();
+        write(&f.source.join("a.txt"), "one");
+        let mut alpha = gen_job(&f.source, 10);
+        alpha.name = "alpha".to_string();
+        let mut beta = gen_job(&f.source, 10);
+        beta.name = "beta".to_string();
+
+        let reports = f.run_jobs(vec![alpha, beta], "20260101", false, true);
+        assert!(reports.iter().all(|r| r.status == BackupJobStatus::Success));
+        write(&f.source.join("b.txt"), "bee");
+        let reports = f.run_jobs(
+            vec![{
+                let mut j = gen_job(&f.source, 10);
+                j.name = "alpha".to_string();
+                j
+            }],
+            "20260102",
+            false,
+            true,
+        );
+        assert_eq!(reports[0].status, BackupJobStatus::Success);
+
+        let alpha = f.index("alpha");
+        let beta = f.index("beta");
+        assert_eq!(
+            alpha
+                .generation_row(index::Role::Previous)
+                .unwrap()
+                .unwrap()
+                .generation,
+            "20260102"
+        );
+        assert_eq!(
+            beta.generation_row(index::Role::Previous)
+                .unwrap()
+                .unwrap()
+                .generation,
+            "20260101"
+        );
+        assert_eq!(
+            indexed_paths(&alpha, index::Role::Previous),
+            vec!["a.txt", "b.txt"]
+        );
+        assert_eq!(indexed_paths(&beta, index::Role::Previous), vec!["a.txt"]);
     }
 }

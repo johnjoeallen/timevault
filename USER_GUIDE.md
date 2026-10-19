@@ -27,7 +27,8 @@ Timevault reads a YAML config file (default `/etc/timevault.yaml`).
 - `backupDisks`: List of enrolled backup disks (required for backups).
 - `excludes`: Global exclude paths applied to all jobs.
 - `options`: Optional defaults for CLI flags (currently `cascade`, `exclude-pristine`, `verbose`, `safe`, `rsync`). CLI flags still take precedence. `rsync` args from config are prepended to any CLI `--rsync` args.
-- `jobs`: List of backup jobs.
+- `options.index`: Optional boolean, default `false`. When `true`, Timevault keeps a file index on each backup disk (`<disk>/.timevault-index/file-index.sqlite`) describing the previous and the newly built generation of every job. It is prepared for upcoming moved-file detection and does not change what is backed up. It costs one extra walk of each new generation per run and roughly 0.5 KB of disk per file. It is never required for restoring, and a missing or corrupt index is rebuilt automatically. See [Architecture](docs/architecture.md#disk-local-file-index).
+- `jobs`: List of backup jobs. Job names must not start with `.timevault`.
 
 ### backupDisks entries
 Each entry identifies a backup disk by UUID.

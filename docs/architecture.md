@@ -20,6 +20,7 @@ Each backup disk is an independent repository. Inside it, every job has its own 
     .timevault-replaced-<day>/  transient, only during a same-day replacement
     .timevault-publishing     transient note used to finish an interrupted same-day replacement
     .timevault-current.tmp    transient link renamed over `current`
+<disk root>/.timevault-index/file-index.sqlite   optional file index shared by all jobs on the disk
 ```
 
 Each published generation also contains a small `.timevault-complete` file at its top level. It is written just before the generation is published and holds a random token, so its presence means the generation was finished and published by Timevault. It appears when you browse or restore a generation and can be ignored.
@@ -80,6 +81,18 @@ The "previous" generation is always the one `current` points to on **the disk be
 
 With `--cascade` (or `options.cascade: true`), a job is first backed up to its *primary* disk from the original source. Every other eligible connected disk then copies that job's `current` from the primary instead of going back to the original source. Each of those disks still uses its own `current` as the link-dest base. See [Cascade](cascade.md).
 
+## Disk-local file index
+
+With `options.index: true`, each disk keeps a SQLite database describing the files of its generations, at `<disk>/.timevault-index/file-index.sqlite` (off by default; see the [User Guide](../USER_GUIDE.md)). Its purpose is to let later features recognise files that were moved or renamed without reading everything again.
+
+- **It belongs to the disk.** The database lives on the backup disk, uses paths relative to a generation (never a mount point), and is built only from that disk's own generations. A disk never needs another disk's index, and rotating a disk in or out needs no synchronisation.
+- **It is not needed to restore.** Generations are ordinary directory trees; the index is an optimisation. If it is missing, stale or corrupt, it is rebuilt from the generations on the disk, and an index problem is reported as a warning and never fails a backup.
+- **What it holds.** For each job, two sets of rows: the **previous** generation (the last completed one, used as the reference) and the **current** one (being built). For each regular file or symlink: relative path, name, size, modification time to the nanosecond, inode, link count, mode, owner and group. Older generations are not indexed.
+- **Lifecycle per run.** (1) Load the previous rows, or rebuild them if the stored generation name or completion token differs from the reference, or the row count does not match. (2) Walk the finished staging tree into the current rows. (3) After the generation is published, in one transaction make "current" the new "previous" and drop the old rows. A failed run drops the current rows and leaves "previous" alone. If the process dies between publishing and step 3, the next run notices the mismatch and rebuilds, so the filesystem is always authoritative.
+- **Contents are hashed lazily.** Nothing is hashed during a backup. A SHA-256 is computed only when something asks for it, and is stored keyed by inode, size and modification time, so hard-linked copies share one hash. A stored hash is used only after the file's current size, modification time and inode are checked against the record; a file that changed (or changes while being read) is reported stale instead of being given a hash of unknown provenance. Size and modification time alone are never treated as proof of identity. Inode change time is deliberately not used, because hard-linking a file into a new generation changes it.
+- **Parallel jobs.** All jobs on a disk share one database in WAL mode with a busy timeout; each job reads and writes only its own rows.
+- **Cost.** Measured on 100,000 files (release build, warm cache): a full build takes about 0.4 s, recording and publishing a new generation about 1 s, a no-change reuse check about 2 ms, a lookup a few milliseconds, and the database about 50 MB. Expect it to grow with the number of files and the length of their paths.
+
 ## Disk identity
 
 A disk is enrolled by filesystem UUID and carries a `.timevault` identity file. Before use, Timevault mounts the disk and checks the identity against the config. Disks are mounted only for the duration of a run, at a private per-process mount point.
@@ -90,4 +103,4 @@ Two `timevault` processes may run **different** jobs at the same time, even agai
 
 ## Not available yet
 
-These are planned and are **not** part of the current behaviour: a disk-local content index and detection of moved or renamed files. The plan is in [PLAN.md](PLAN.md).
+These are planned and are **not** part of the current behaviour: detection of moved or renamed files. The file index exists but nothing uses it yet, so it does not change what is backed up or how much is copied. The plan is in [PLAN.md](PLAN.md).

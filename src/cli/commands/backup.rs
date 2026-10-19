@@ -54,6 +54,10 @@ pub fn run_backup_command(
         exclude_pristine_only: options.exclude_pristine_only,
         session_seconds_override: options.session_seconds_override,
         recreate: options.recreate,
+        index: cfg
+            .options
+            .index
+            .unwrap_or(crate::backup::index::INDEX_DEFAULT),
     };
     let report_options = cfg.options.report.clone();
 

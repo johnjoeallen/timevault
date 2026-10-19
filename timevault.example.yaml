@@ -50,6 +50,8 @@ options:
   #   emailTo: "admin@example.com"
   #   emailFrom: "timevault@example.com"
   #   sendmail: "/usr/sbin/sendmail"
+  # Keep a per-disk file index (<disk>/.timevault-index). Off by default.
+  # index: true
   rsync:
     - "--one-file-system"
 

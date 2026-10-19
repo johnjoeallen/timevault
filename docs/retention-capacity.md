@@ -69,6 +69,10 @@ Matching is by relative path. If you move a large tree or rename many files, rsy
 
 A disk returning after a week does not need a full backup. It needs room for what changed, was added or was removed at the source since its last generation. A longer absence can mean a larger single increment.
 
+### The file index
+
+If you enable `options.index`, the disk also holds `.timevault-index/file-index.sqlite`. Plan for about half a kilobyte per file in the generation being indexed (roughly 50 MB per 100,000 files, more with long paths), plus a similar amount while a new generation is being recorded. It is not shared with hard links, so it counts fully against the disk.
+
 ### Headroom
 
 Keep free space for:
