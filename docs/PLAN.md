@@ -55,6 +55,8 @@ Further findings:
 
 **Index.** `rusqlite` with the `bundled` feature (no new runtime package dependency for the deb). Location: `<disk>/.timevault/file-index.sqlite`, relative paths only. Only the "previous" and "current" generations are active. Hashing is lazy (SHA-256 via `sha2`). Hard links sharing `(dev, ino)` share a record. A missing, corrupt or stale index is rebuilt silently from the disk's own generations. Restore never touches it.
 
+**Parallel jobs.** Different jobs may run in parallel as separate `timevault` processes, even against the same disk (per-job lock, per-process mounts; already the case today). Users must ensure parallel jobs do not have overlapping source or destination directories. New shared state must be safe under this: the per-disk SQLite index uses WAL mode and a busy timeout, each job writes only its own rows, and a locked database never fails a backup; staging and the relocation shadow directory stay inside the per-job directory; the remote hash cache is per host and written atomically. The existing shared pristine cache (`~/.cache/timevault/pristine-cache.json`) needs checking for concurrent-write safety.
+
 ## 3. Decisions (resolved)
 
 1. **Skip by default.** A completed generation for the day is skipped and reported as `AlreadyComplete` unless the recreate flag is passed. Users who run a job more than once a day will see later runs skipped; this is called out in release notes and the "Backup" section of `USER_GUIDE.md`.
@@ -81,7 +83,7 @@ Definition of done for every phase:
 - Link from `USER_GUIDE.md` and `README.md`; add `docs/` to the deb assets.
 - Mark honestly what is current: renames are re-copied, there is no index, no recreate. Leave out "rebuild index" and "recreate" until shipped.
 - Add a script check that every global CLI flag in `args.rs` appears in `USER_GUIDE.md`.
-- Architecture review addition: inventory existing remote-execution paths (`run_remote_job_script`, the pristine helper, SSH helpers): transport, privileges, failure modes, cache format, and handling of unusual file names and file types.
+- Architecture review addition: check the shared pristine cache for concurrent-write safety with parallel jobs; document that parallel jobs must not overlap directories; inventory existing remote-execution paths (`run_remote_job_script`, the pristine helper, SSH helpers): transport, privileges, failure modes, cache format, and handling of unusual file names and file types.
 - Validation: read each document against the code; every command or option in an example must exist.
 
 ### Phase 2: publication hardening (fix; patch)
@@ -99,7 +101,7 @@ Definition of done for every phase:
 
 ### Phase 4: disk-local SQLite index (feature; minor)
 - Implement the index, lifecycle (load or rebuild, populate for staging, validate, publish, advance roles, retire old rows) and rebuild-from-disk.
-- Tests: lifecycle, hash-cache invalidation, corrupt file falls back to rebuild, mismatch with `current` triggers rebuild, restore with the index deleted.
+- Tests: two jobs writing the same disk's index concurrently; lifecycle, hash-cache invalidation, corrupt file falls back to rebuild, mismatch with `current` triggers rebuild, restore with the index deleted.
 - Docs: index sections of `architecture.md` and `design-rationale.md`; "rebuild a missing index" in `recovery.md`.
 
 ### Phase 5: relocation-aware reuse (feature; minor)
