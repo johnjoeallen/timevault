@@ -292,6 +292,51 @@ fn allowed_disks_for_job(
     }
 }
 
+/// One downstream disk in a cascade run and the jobs it is allowed to receive.
+#[derive(Debug, Clone)]
+struct CascadeStage {
+    disk: BackupDiskConfig,
+    jobs: Vec<crate::config::model::Job>,
+}
+
+/// Downstream cascade stages for a primary disk, in connected-disk order.
+/// Every stage copies from the primary (star topology), so a stage depends
+/// only on the primary's result for each job, never on another stage. Pure:
+/// whether a job actually cascades also depends on the primary's per-job
+/// status, checked by [`cascade_job_eligible`].
+fn plan_cascade(
+    primary: &BackupDiskConfig,
+    jobs: &[crate::config::model::Job],
+    connected: &[BackupDiskConfig],
+) -> Vec<CascadeStage> {
+    let mut by_disk: HashMap<String, Vec<crate::config::model::Job>> = HashMap::new();
+    for job in jobs {
+        for disk in allowed_disks_for_job(job, connected) {
+            if disk.fs_uuid == primary.fs_uuid {
+                continue;
+            }
+            by_disk
+                .entry(disk.disk_id.clone())
+                .or_default()
+                .push(job.clone());
+        }
+    }
+    connected
+        .iter()
+        .filter_map(|disk| {
+            by_disk.remove(&disk.disk_id).map(|jobs| CascadeStage {
+                disk: disk.clone(),
+                jobs,
+            })
+        })
+        .collect()
+}
+
+/// A job may cascade only if its primary backup produced a snapshot this run.
+fn cascade_job_eligible(primary_status: Option<BackupJobStatus>) -> bool {
+    primary_status.is_some_and(BackupJobStatus::produced_snapshot)
+}
+
 fn disk_is_eligible_for_automatic_backup(disk: &BackupDiskConfig) -> bool {
     !disk.disabled && !disk.rotated_out
 }
@@ -339,29 +384,14 @@ fn run_jobs_for_primary(
             })
             .unwrap_or_default();
 
-        let mut cascades: HashMap<String, Vec<crate::config::model::Job>> = HashMap::new();
-        for job in &jobs {
-            let allowed = allowed_disks_for_job(job, connected);
-            for disk in allowed {
-                if disk.fs_uuid == primary_disk.fs_uuid {
-                    continue;
-                }
-                cascades
-                    .entry(disk.disk_id.clone())
-                    .or_default()
-                    .push(job.clone());
-            }
-        }
-
-        for disk in connected {
-            let Some(job_list) = cascades.get(&disk.disk_id) else {
-                continue;
-            };
+        for stage in plan_cascade(primary_disk, &jobs, connected) {
+            let disk = &stage.disk;
             let (guard, mountpoint) = mount_and_verify(disk, mount_base, run_mode)?;
             let mut cascaded_jobs = Vec::new();
-            for job in job_list {
-                match primary_statuses.get(&job.name).copied() {
-                    Some(status) if status.produced_snapshot() => {}
+            for job in &stage.jobs {
+                let primary_status = primary_statuses.get(&job.name).copied();
+                match primary_status {
+                    status if cascade_job_eligible(status) => {}
                     other => {
                         crate::pnote!(
                             "cascade skipped for job {} on disk {}: primary backup {}",
@@ -522,6 +552,110 @@ mod tests {
         };
         let allowed = allowed_disks_for_job(&job, &connected);
         assert_eq!(allowed.len(), 2);
+    }
+
+    fn plan_disk(id: &str) -> BackupDiskConfig {
+        BackupDiskConfig {
+            disk_id: id.to_string(),
+            fs_uuid: format!("uuid-{id}"),
+            label: None,
+            mount_options: None,
+            disabled: false,
+            rotated_out: false,
+        }
+    }
+
+    fn plan_job(name: &str, disk_ids: Option<&[&str]>) -> crate::config::model::Job {
+        crate::config::model::Job {
+            name: name.to_string(),
+            description: None,
+            source: "/".to_string(),
+            copies: 1,
+            run_policy: RunPolicy::Auto,
+            excludes: Vec::new(),
+            includes: Vec::new(),
+            disk_ids: disk_ids.map(|ids| ids.iter().map(|id| id.to_string()).collect()),
+            remote: None,
+        }
+    }
+
+    fn stage_summary(stages: &[CascadeStage]) -> Vec<(String, Vec<String>)> {
+        stages
+            .iter()
+            .map(|stage| {
+                (
+                    stage.disk.disk_id.clone(),
+                    stage.jobs.iter().map(|job| job.name.clone()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cascade_plan_is_a_star_from_the_primary_in_connected_order() {
+        let connected = vec![plan_disk("a"), plan_disk("b"), plan_disk("c")];
+        let jobs = vec![plan_job("etc", None), plan_job("home", None)];
+
+        let stages = plan_cascade(&connected[0], &jobs, &connected);
+
+        assert_eq!(
+            stage_summary(&stages),
+            vec![
+                ("b".to_string(), vec!["etc".to_string(), "home".to_string()]),
+                ("c".to_string(), vec!["etc".to_string(), "home".to_string()]),
+            ]
+        );
+    }
+
+    #[test]
+    fn cascade_plan_uses_whichever_disk_is_primary() {
+        // Rotation: with b and c connected and b first, b is the primary.
+        let connected = vec![plan_disk("b"), plan_disk("c")];
+        let jobs = vec![plan_job("etc", None)];
+
+        let stages = plan_cascade(&connected[0], &jobs, &connected);
+
+        assert_eq!(
+            stage_summary(&stages),
+            vec![("c".to_string(), vec!["etc".to_string()])]
+        );
+    }
+
+    #[test]
+    fn cascade_plan_respects_job_disk_allowlists() {
+        let connected = vec![plan_disk("a"), plan_disk("b"), plan_disk("c")];
+        let jobs = vec![
+            plan_job("etc", Some(&["a", "c"])),
+            plan_job("home", Some(&["a", "b"])),
+        ];
+
+        let stages = plan_cascade(&connected[0], &jobs, &connected);
+
+        assert_eq!(
+            stage_summary(&stages),
+            vec![
+                ("b".to_string(), vec!["home".to_string()]),
+                ("c".to_string(), vec!["etc".to_string()]),
+            ]
+        );
+    }
+
+    #[test]
+    fn cascade_plan_is_empty_with_a_single_connected_disk() {
+        let connected = vec![plan_disk("a")];
+        let jobs = vec![plan_job("etc", None)];
+
+        assert!(plan_cascade(&connected[0], &jobs, &connected).is_empty());
+    }
+
+    #[test]
+    fn only_jobs_whose_primary_backup_produced_a_snapshot_cascade() {
+        assert!(cascade_job_eligible(Some(BackupJobStatus::Success)));
+        assert!(cascade_job_eligible(Some(BackupJobStatus::Partial)));
+        assert!(!cascade_job_eligible(Some(BackupJobStatus::Failed)));
+        assert!(!cascade_job_eligible(Some(BackupJobStatus::Offline)));
+        assert!(!cascade_job_eligible(Some(BackupJobStatus::Skipped)));
+        assert!(!cascade_job_eligible(None));
     }
 
     #[test]

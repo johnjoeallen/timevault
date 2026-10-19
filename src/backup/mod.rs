@@ -141,12 +141,39 @@ pub fn print_job_details(job: &Job) {
     crate::pnote!("  disks: {}", disk_ids);
 }
 
+/// Generation name for a run starting now: the previous calendar day.
+pub fn backup_day_now() -> String {
+    (Local::now() - Duration::days(1))
+        .format("%Y%m%d")
+        .to_string()
+}
+
 pub fn run_backup(
     jobs: Vec<Job>,
     rsync_extra: &[String],
     run_mode: RunMode,
     disk_mount: &Path,
     options: BackupOptions,
+) -> Result<BackupRunReport> {
+    run_backup_for_day(
+        jobs,
+        rsync_extra,
+        run_mode,
+        disk_mount,
+        options,
+        &backup_day_now(),
+    )
+}
+
+/// [`run_backup`] with the generation name supplied by the caller, so tests
+/// can simulate runs on arbitrary dates.
+pub fn run_backup_for_day(
+    jobs: Vec<Job>,
+    rsync_extra: &[String],
+    run_mode: RunMode,
+    disk_mount: &Path,
+    options: BackupOptions,
+    backup_day: &str,
 ) -> Result<BackupRunReport> {
     let started_at = Local::now();
     let mut report = BackupRunReport {
@@ -164,12 +191,9 @@ pub fn run_backup(
     let total = jobs.len();
     for (index, job) in jobs.into_iter().enumerate() {
         crate::pstatus!("job {}/{}: {}", index + 1, total, job.name);
-        let backup_day = (Local::now() - Duration::days(1))
-            .format("%Y%m%d")
-            .to_string();
         match run_backup_job(
             &job,
-            &backup_day,
+            backup_day,
             rsync_extra,
             run_mode,
             disk_mount,
@@ -182,7 +206,7 @@ pub fn run_backup(
                 report.jobs.push(failed_job_report(
                     &job,
                     disk_mount,
-                    &backup_day,
+                    backup_day,
                     run_mode,
                     err.to_string(),
                 ));
@@ -4417,7 +4441,10 @@ mod tests {
 
         let (d1, d2) = (r.dest.join("20260101"), r.dest.join("20260102"));
         assert!(same_inode(&d1.join("same.txt"), &d2.join("same.txt")));
-        assert!(!same_inode(&d1.join("changed.txt"), &d2.join("changed.txt")));
+        assert!(!same_inode(
+            &d1.join("changed.txt"),
+            &d2.join("changed.txt")
+        ));
         assert_eq!(read(&d1.join("changed.txt")), "v1");
         assert_eq!(read(&d2.join("changed.txt")), "version-two");
         assert!(!d1.join("new.txt").exists());
@@ -4480,7 +4507,11 @@ mod tests {
                 .mode()
                 & 0o777
         };
-        let mtime = |day: &str| fs::metadata(r.dest.join(day).join("f.txt")).unwrap().mtime();
+        let mtime = |day: &str| {
+            fs::metadata(r.dest.join(day).join("f.txt"))
+                .unwrap()
+                .mtime()
+        };
         assert_eq!(mode("20260101"), 0o644);
         assert_eq!(mode("20260102"), 0o600);
         assert_eq!(mtime("20260101"), mtime("20260102"));
@@ -4535,7 +4566,10 @@ mod tests {
             .enumerate()
         {
             // Distinct sizes: same-size writes within one second look unchanged to rsync.
-            write(&r.source.join("day.txt"), &format!("{day}{}", "x".repeat(i)));
+            write(
+                &r.source.join("day.txt"),
+                &format!("{day}{}", "x".repeat(i)),
+            );
             run_gen(&r.source, &r.dest, day, 2);
         }
 
@@ -4609,7 +4643,10 @@ mod tests {
         let r = repo();
         write(&r.source.join("a.txt"), "a");
         run_gen(&r.source, &r.dest, "20260101", 3);
-        write(&r.dest.join(generation::STAGING_NAME).join("junk.txt"), "junk");
+        write(
+            &r.dest.join(generation::STAGING_NAME).join("junk.txt"),
+            "junk",
+        );
 
         run_gen(&r.source, &r.dest, "20260102", 3);
 
@@ -4632,7 +4669,10 @@ mod tests {
         run_gen(&r.source, &r.dest, "20260101", 3);
 
         // Already-complete file kept as is; the rest completed.
-        assert_eq!(fs::metadata(r.dest.join("20260101/a.txt")).unwrap().ino(), ino);
+        assert_eq!(
+            fs::metadata(r.dest.join("20260101/a.txt")).unwrap().ino(),
+            ino
+        );
         assert_eq!(read(&r.dest.join("20260101/b.txt")), "b");
     }
 
@@ -4695,5 +4735,151 @@ mod tests {
         fs::remove_file(r.dest.join("current")).unwrap();
         fs::create_dir_all(r.dest.join("current")).unwrap();
         assert!(generation::link_dest_base(&r.dest).is_none());
+    }
+
+    // ---- rotation: previous generation is per disk and per job ----
+
+    /// Independent backup disks sharing one source tree. Each "disk" is a
+    /// directory holding `<job>/<day>` generations, as on a mounted disk.
+    struct Disks {
+        _tmp: tempfile::TempDir,
+        source: PathBuf,
+        roots: Vec<PathBuf>,
+    }
+
+    fn disks(count: usize) -> Disks {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let source = tmp.path().join("source");
+        fs::create_dir_all(&source).expect("source");
+        let roots = (0..count)
+            .map(|i| {
+                let root = tmp.path().join(format!("disk{i}"));
+                fs::create_dir_all(&root).expect("disk root");
+                root
+            })
+            .collect();
+        Disks {
+            _tmp: tmp,
+            source,
+            roots,
+        }
+    }
+
+    impl Disks {
+        fn job_dir(&self, disk: usize, job: &str) -> PathBuf {
+            self.roots[disk].join(job)
+        }
+
+        /// Back up the shared source to one disk as `day`; returns rsync's code.
+        fn backup(&self, disk: usize, job: &str, day: &str, copies: usize) -> i32 {
+            let dest = self.job_dir(disk, job);
+            fs::create_dir_all(&dest).expect("job dir");
+            run_gen(&self.source, &dest, day, copies)
+        }
+
+        /// Name of the generation `current` selects on this disk and job.
+        fn previous(&self, disk: usize, job: &str) -> Option<String> {
+            generation::link_dest_base(&self.job_dir(disk, job)).map(|base| {
+                base.file_name()
+                    .expect("generation name")
+                    .to_string_lossy()
+                    .to_string()
+            })
+        }
+    }
+
+    #[test]
+    fn previous_generation_ignores_the_age_of_the_last_backup() {
+        let d = disks(1);
+        write(&d.source.join("keep.txt"), "same");
+        assert_eq!(d.backup(0, "etc", "20260901", 5), 0);
+        // The disk is rotated out for 41 days; its previous generation stays
+        // 20260901 and is the link-dest base for the next run.
+        assert_eq!(d.previous(0, "etc").as_deref(), Some("20260901"));
+        assert_eq!(d.backup(0, "etc", "20261012", 5), 0);
+
+        assert_eq!(d.previous(0, "etc").as_deref(), Some("20261012"));
+        assert!(same_inode(
+            &d.job_dir(0, "etc").join("20260901/keep.txt"),
+            &d.job_dir(0, "etc").join("20261012/keep.txt"),
+        ));
+    }
+
+    #[test]
+    fn previous_generation_is_not_taken_from_another_disk() {
+        let d = disks(2);
+        write(&d.source.join("keep.txt"), "same");
+        assert_eq!(d.backup(0, "etc", "20261012", 5), 0);
+        // Disk 1 is newer, but disk 0's previous generation stays its own.
+        assert_eq!(d.backup(1, "etc", "20261018", 5), 0);
+        assert_eq!(d.previous(0, "etc").as_deref(), Some("20261012"));
+        assert_eq!(d.previous(1, "etc").as_deref(), Some("20261018"));
+
+        assert_eq!(d.backup(0, "etc", "20261019", 5), 0);
+        assert_eq!(
+            gen_dirs(&d.job_dir(0, "etc")),
+            vec!["20261012", "20261019", "current"]
+        );
+        assert_eq!(gen_dirs(&d.job_dir(1, "etc")), vec!["20261018", "current"]);
+        // Hard links never span disks: each disk has its own inode.
+        assert!(!same_inode(
+            &d.job_dir(0, "etc").join("20261019/keep.txt"),
+            &d.job_dir(1, "etc").join("20261018/keep.txt"),
+        ));
+    }
+
+    #[test]
+    fn previous_generation_is_tracked_per_job_on_a_disk() {
+        let d = disks(1);
+        write(&d.source.join("keep.txt"), "same");
+        assert_eq!(d.backup(0, "etc", "20261005", 5), 0);
+        assert_eq!(d.backup(0, "home", "20261012", 5), 0);
+
+        assert_eq!(d.previous(0, "etc").as_deref(), Some("20261005"));
+        assert_eq!(d.previous(0, "home").as_deref(), Some("20261012"));
+        // A job that never ran on this disk has no previous generation.
+        assert_eq!(d.previous(0, "srv"), None);
+    }
+
+    #[test]
+    fn disk_with_no_history_for_a_job_makes_a_full_initial_backup() {
+        let d = disks(2);
+        write(&d.source.join("a.txt"), "data");
+        assert_eq!(d.backup(0, "etc", "20261012", 5), 0);
+
+        // Disk 1 has never backed up this job, even though disk 0 has.
+        assert_eq!(d.backup(1, "etc", "20261019", 5), 0);
+        assert_eq!(d.previous(1, "etc").as_deref(), Some("20261019"));
+        assert_eq!(read(&d.job_dir(1, "etc").join("20261019/a.txt")), "data");
+        assert_eq!(gen_dirs(&d.job_dir(1, "etc")), vec!["20261019", "current"]);
+    }
+
+    #[test]
+    fn rotated_disk_keeps_history_independent_of_other_disks() {
+        // Weekly A/B rotation, daily backups: each disk holds only the days
+        // it was connected, with a gap while it was offline.
+        let d = disks(2);
+        write(&d.source.join("a.txt"), "v1");
+        for day in ["20261001", "20261002", "20261003"] {
+            assert_eq!(d.backup(0, "etc", day, 10), 0);
+        }
+        write(&d.source.join("a.txt"), "v22");
+        for day in ["20261008", "20261009"] {
+            assert_eq!(d.backup(1, "etc", day, 10), 0);
+        }
+        write(&d.source.join("a.txt"), "v333");
+        assert_eq!(d.backup(0, "etc", "20261015", 10), 0);
+
+        assert_eq!(
+            gen_dirs(&d.job_dir(0, "etc")),
+            vec!["20261001", "20261002", "20261003", "20261015", "current"]
+        );
+        assert_eq!(
+            gen_dirs(&d.job_dir(1, "etc")),
+            vec!["20261008", "20261009", "current"]
+        );
+        // Earlier generations on the returning disk are unchanged.
+        assert_eq!(read(&d.job_dir(0, "etc").join("20261003/a.txt")), "v1");
+        assert_eq!(read(&d.job_dir(0, "etc").join("20261015/a.txt")), "v333");
     }
 }
