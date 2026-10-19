@@ -35,7 +35,7 @@ Each entry identifies a backup disk by UUID.
 - `label`: Optional human label.
 - `mountOptions`: Optional mount options for backups. Default: `rw,nodev,nosuid,noexec`.
 - `disabled`: Optional boolean. If `true`, Timevault will not use the disk for backups, including explicit `--disk-id` runs.
-- `rotatedOut`: Optional boolean. If `true`, Timevault skips the disk for automatic backup selection, but explicit `--disk-id <id>` runs still work.
+- `rotatedOut`: **Deprecated; will be removed.** Optional boolean. If `true`, Timevault skips the disk for automatic backup selection, but explicit `--disk-id <id>` runs still work. Timevault prints a warning when it is set. To stop backing up to a disk, use `disabled: true` (`timevault disk disable <disk>`), or simply unplug the disk.
 
 Example:
 ```yaml
@@ -310,15 +310,16 @@ By default Timevault uses `/usr/sbin/sendmail -t`; set `options.report.sendmail`
 - `timevault disk enable <disk>`
 - `timevault disk disable <disk>`
 - Compatibility: `--disk-id <id>` or `--fs-uuid <uuid>` may be used instead of the positional selector.
-- `disable` keeps the disk enrolled but prevents all backup use, including explicit `--disk-id` runs.
+- `disable` keeps the disk enrolled but prevents all backup use, including explicit `--disk-id` runs and cascade. A disabled disk can still be listed, mounted and inspected for restores.
 - `enable` clears that state.
 
-### Disk rotation
+### Disk rotation (deprecated)
+Rotation is something you manage by connecting and disconnecting disks: enrolled disks that are not connected are ignored. These commands only set or clear the deprecated `rotatedOut` flag, print a deprecation warning, and will be removed. Use `timevault disk disable <disk>` instead.
 - `timevault disk rotate-in <disk>`
 - `timevault disk rotate-out <disk>`
 - Compatibility: `--disk-id <id>` or `--fs-uuid <uuid>` may be used instead of the positional selector.
-- `rotate-out` keeps the disk enrolled but removes it from automatic backup selection and cascade planning.
-- `rotate-in` returns the disk to automatic rotation.
+- `rotate-out` removes the disk from automatic backup selection and cascade planning.
+- `rotate-in` clears the flag.
 
 ### Disk inspect
 - `timevault disk inspect [<disk>]`
@@ -341,7 +342,7 @@ By default Timevault uses `/usr/sbin/sendmail -t`; set `options.report.sendmail`
 - Without `--disk-id`, Timevault chooses the first eligible connected disk (in `backupDisks` order) that appears in that list as the primary and, with cascade, cascades to the other connected disks in the list.
 - With `--disk-id`, only jobs that include that disk in `diskIds` will run.
 - Disks with `disabled: true` are never used for backups.
-- Disks with `rotatedOut: true` are skipped by automatic selection and cascade planning, but can still be targeted with `--disk-id`.
+- Disks with the deprecated `rotatedOut: true` are skipped by automatic selection and cascade planning, but can still be targeted with `--disk-id`.
 
 ## Typical setup workflow
 1) Create a test config in your home directory:

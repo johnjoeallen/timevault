@@ -15,6 +15,7 @@ Running record of changes, decisions and findings for the work described in [PLA
 | D7 | Index is `rusqlite` with `bundled`; hash cache keyed `(dev, ino, size, mtime_ns)`, never `ctime` | 2026-10-19 | Hard-linking bumps `ctime`. |
 | D8 | Index lives at `<disk>/.timevault-index/file-index.sqlite` | 2026-10-19 | `<disk>/.timevault` is the identity file, not a directory, so the originally planned path was impossible. |
 | D9 | User docs describe only shipped behaviour; planned features are listed under "Not available yet" | 2026-10-19 | Checked in CI by `scripts/check-docs.sh` and `scripts/check-docs-yaml.py`. |
+| D11 | `rotatedOut` and `disk rotate-in/rotate-out` are deprecated: still work, print a warning, removed at the next major version | 2026-10-19 | There is no rotation concept in Timevault: users connect or disconnect enrolled disks. To stop writing to a connected disk use `disable`, which still allows mount, inspect, ls and df. |
 | D10 | A `disabled` disk never receives a cascade; `rotatedOut` is not filtered in the cascade planner | 2026-10-19 | A disk that is unplugged is rotated out by being absent. The `rotatedOut` flag only removes a connected disk from automatic primary selection. |
 
 ## Findings about the existing code
@@ -58,6 +59,12 @@ Deviations from the plan: the harness is in-crate test fixtures, not a `tests/` 
 ### Fix after Phase 1 (1.14.2)
 
 - `plan_cascade` skips `disabled` disks, so `--disk-id <id> --cascade` can no longer write to a disabled disk. Tests: disabled disks are excluded; `rotatedOut` is not filtered by the planner (automatic runs already filter ineligible disks before planning). `docs/cascade.md` states the rule.
+
+### Deprecation of `rotatedOut` (1.14.3)
+
+- Config entries with `rotatedOut` and the `disk rotate-in` / `rotate-out` commands print a deprecation warning pointing to `disk disable`; behaviour is unchanged. `--help` marks both commands deprecated. README, User Guide and the new docs no longer present rotation as a Timevault setting.
+- Tests: warning text, planner does not filter on `rotatedOut`, and a disabled disk can still be selected for mounting (`select_disk_from_connected`).
+- Removal is left to the next major version, which is managed manually.
 
 ### Phase 2 onwards
 

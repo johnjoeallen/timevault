@@ -22,7 +22,7 @@ Cascade is shaped like a star, not a chain: disk B and disk C both copy from the
 
 Without cascade, only the primary disk receives each job's backup.
 
-Cascade never writes to a disk marked `disabled: true`. Automatic runs also skip `rotatedOut` disks; a disk that is simply unplugged is not connected and is ignored.
+Cascade never writes to a disk marked `disabled: true`. A disk that is simply unplugged is not connected and is ignored. (Automatic runs also skip disks with the deprecated `rotatedOut` flag.)
 
 ## What happens on each downstream disk
 

@@ -123,11 +123,19 @@ pub fn run() -> Result<()> {
                 }
             }
             DiskCommand::RotateIn(args) => {
+                eprintln!(
+                    "{}",
+                    crate::cli::commands::backup::rotate_command_deprecation_warning("rotate-in")
+                );
                 if let Err(err) = disk_add::run_set_rotated_out(&config_path, args, false) {
                     exit_for_error(&err);
                 }
             }
             DiskCommand::RotateOut(args) => {
+                eprintln!(
+                    "{}",
+                    crate::cli::commands::backup::rotate_command_deprecation_warning("rotate-out")
+                );
                 if let Err(err) = disk_add::run_set_rotated_out(&config_path, args, true) {
                     exit_for_error(&err);
                 }
@@ -294,8 +302,8 @@ fn print_help() {
     println!("  rename                 Rename a disk id");
     println!("  enable                 Allow the disk to be used for backups again");
     println!("  disable                Prevent the disk from being used for backups");
-    println!("  rotate-in              Return the disk to automatic backup rotation");
-    println!("  rotate-out             Exclude the disk from automatic backup rotation");
+    println!("  rotate-in              Deprecated: clear the rotatedOut flag (use enable/disable instead)");
+    println!("  rotate-out             Deprecated: set the rotatedOut flag (use disable instead)");
 }
 
 fn needs_backup_selection_help(command: Option<&Command>, jobs: &[String]) -> bool {

@@ -5,12 +5,13 @@ Timevault does not require any particular rotation scheme. Each disk is an indep
 ## How Timevault chooses disks
 
 - **Connected disks** are enrolled disks whose filesystem UUID is present on the machine. Disks that are enrolled but not plugged in are ignored; nothing fails.
-- **Eligible disks** are connected disks that are not `disabled: true` and not `rotatedOut: true`.
+- **Eligible disks** are connected disks that are not `disabled: true`. (The deprecated `rotatedOut: true` flag also makes a disk ineligible for automatic runs.)
 - **Order** is the order of `backupDisks` in the config file.
 - **Primary disk, per job:** without `--disk-id`, each job's primary disk is the first eligible connected disk allowed for that job (see `diskIds` in the [User Guide](../USER_GUIDE.md)). There is no fixed primary: whichever eligible disk is first in config order and is plugged in becomes primary. Rotating the physical disks therefore moves the primary automatically.
 - **Without `--cascade`, only the primary disk receives a backup.** Other connected disks are left untouched. To have two connected disks both receive each backup, enable cascade (`--cascade` or `options.cascade: true`).
-- **`rotatedOut: true`** (set with `timevault disk rotate-out <disk>`) is for a disk that stays connected but should be skipped by automatic runs. You do **not** need it when you physically unplug a disk; an unplugged disk is simply not connected.
-- **`disabled: true`** (set with `timevault disk disable <disk>`) is a hard stop for backups.
+- **Rotation is something you manage.** There is no rotation setting: you enroll N disks and connect some of them. A disk that is not connected is ignored.
+- **`disabled: true`** (set with `timevault disk disable <disk>`) is a hard stop for backups, including cascade. Use it for a disk that stays connected but must not be written. A disabled disk can still be listed, mounted and inspected for restores.
+- **`rotatedOut`** and `disk rotate-in` / `rotate-out` are deprecated and will be removed. They still work and print a warning; use `disable` instead.
 
 ### What "previous generation" means after rotation
 
@@ -123,5 +124,5 @@ Week 3: A + B
 ## Practical notes
 
 - Swapping disks needs no Timevault command. Run `timevault disk ls` to see which enrolled disks are connected.
-- To keep a disk physically connected but out of automatic runs, use `timevault disk rotate-out <disk>`, and `rotate-in` to bring it back.
+- To keep a disk connected but out of backups, use `timevault disk disable <disk>` and `timevault disk enable <disk>` to bring it back.
 - `timevault disk df` shows free space per enrolled disk. Capacities do not need to match.

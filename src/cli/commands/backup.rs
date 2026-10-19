@@ -37,6 +37,9 @@ pub fn run_backup_command(
     let cfg = load_config(config_path.to_string_lossy().as_ref())?;
     let jobs = cfg.jobs.clone();
     let backup_disks = cfg.backup_disks.clone();
+    for disk in backup_disks.iter().filter(|disk| disk.rotated_out) {
+        crate::pnote!("{}", rotated_out_deprecation_warning(&disk.disk_id));
+    }
     let mount_base = std::path::PathBuf::from(cfg.mount_base.clone());
     let mut rsync_extra = cfg.options.rsync.clone();
     rsync_extra.extend(rsync_extra_cli.iter().cloned());
@@ -337,6 +340,25 @@ fn plan_cascade(
 /// A job may cascade only if its primary backup produced a snapshot this run.
 fn cascade_job_eligible(primary_status: Option<BackupJobStatus>) -> bool {
     primary_status.is_some_and(BackupJobStatus::produced_snapshot)
+}
+
+/// Warning for a disk still carrying the deprecated `rotatedOut` flag.
+pub fn rotated_out_deprecation_warning(disk_id: &str) -> String {
+    format!(
+        "warning: backupDisks entry {} sets rotatedOut, which is deprecated and will be removed; \
+         to stop backing up to a disk use `timevault disk disable {}`, or unplug it",
+        disk_id, disk_id
+    )
+}
+
+/// Warning for the deprecated `disk rotate-in` / `disk rotate-out` commands.
+pub fn rotate_command_deprecation_warning(command: &str) -> String {
+    format!(
+        "warning: `timevault disk {}` is deprecated and will be removed; \
+         to stop backing up to a disk use `timevault disk disable <disk>` (it can still be mounted \
+         and inspected), or unplug it",
+        command
+    )
 }
 
 fn disk_is_eligible_for_automatic_backup(disk: &BackupDiskConfig) -> bool {
@@ -655,6 +677,16 @@ mod tests {
             stage_summary(&stages),
             vec![("c".to_string(), vec!["etc".to_string()])]
         );
+    }
+
+    #[test]
+    fn deprecation_warnings_point_to_disable() {
+        let flag = rotated_out_deprecation_warning("usb-a");
+        assert!(flag.contains("usb-a") && flag.contains("deprecated"));
+        assert!(flag.contains("timevault disk disable usb-a"));
+        let command = rotate_command_deprecation_warning("rotate-out");
+        assert!(command.contains("disk rotate-out") && command.contains("deprecated"));
+        assert!(command.contains("timevault disk disable <disk>"));
     }
 
     #[test]

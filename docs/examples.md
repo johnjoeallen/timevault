@@ -118,7 +118,7 @@ backupDisks:
     fsUuid: "REPLACE-4"
 ```
 
-Keep two disks connected and swap one every week or two: d1+d2, d2+d3, d3+d4, d4+d1. Each swap keeps one disk that has recent generations. To park a disk without unplugging it, use `sudo timevault disk rotate-out d3` and later `rotate-in d3`.
+Keep two disks connected and swap one every week or two: d1+d2, d2+d3, d3+d4, d4+d1. Each swap keeps one disk that has recent generations. To keep a disk connected but stop writing to it, use `sudo timevault disk disable d3` and later `sudo timevault disk enable d3`.
 
 ## 8. Mixed schedules and retention
 
