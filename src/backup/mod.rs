@@ -4737,6 +4737,30 @@ mod tests {
         assert!(generation::link_dest_base(&r.dest).is_none());
     }
 
+    // ---- job locks in unit tests ----
+
+    #[test]
+    fn job_lock_uses_the_test_lock_dir_and_refuses_a_second_holder() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _dir = crate::util::paths::test_lock_dir::set(tmp.path());
+
+        let first = acquire_lock_for_job("etc", run_mode())
+            .expect("lock")
+            .expect("guard");
+        assert!(tmp.path().join("timevault.etc.pid").exists());
+
+        let err = acquire_lock_for_job("etc", run_mode())
+            .err()
+            .expect("second holder refused");
+        assert_eq!(err.to_string(), "job etc is already running");
+        // A different job is independent.
+        assert!(acquire_lock_for_job("home", run_mode()).is_ok());
+
+        drop(first);
+        assert!(!tmp.path().join("timevault.etc.pid").exists());
+        assert!(acquire_lock_for_job("etc", run_mode()).is_ok());
+    }
+
     // ---- rotation: previous generation is per disk and per job ----
 
     /// Independent backup disks sharing one source tree. Each "disk" is a
