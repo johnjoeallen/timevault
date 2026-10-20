@@ -129,7 +129,7 @@ fn check_registered_disk(disk: &BackupDiskConfig, candidate: Option<&DiskCandida
             fs_uuid: disk.fs_uuid.clone(),
             status: "online".to_string(),
             identity: "missing".to_string(),
-            details: "expected .timevault identity".to_string(),
+            details: "expected .timevault/identity".to_string(),
             ok: false,
         };
     };

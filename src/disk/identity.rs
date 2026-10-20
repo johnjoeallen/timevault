@@ -19,8 +19,45 @@ pub struct DiskIdentity {
     pub created: String,
 }
 
+/// Everything Timevault keeps on a disk outside the job directories lives in
+/// this directory. Earlier releases kept the identity in a file of this name.
+pub const META_DIR: &str = ".timevault";
+pub const IDENTITY_FILE: &str = "identity";
+const MIGRATING_IDENTITY: &str = ".timevault-identity.old";
+
+/// Where the identity is read from: `.timevault/identity`, or the old
+/// `.timevault` file on a disk that has not been migrated yet (for example one
+/// mounted read-only).
 pub fn identity_path(root: &std::path::Path) -> std::path::PathBuf {
-    root.join(".timevault")
+    let meta = root.join(META_DIR);
+    if meta.is_file() {
+        meta
+    } else {
+        meta.join(IDENTITY_FILE)
+    }
+}
+
+/// Move an old `.timevault` identity file to `.timevault/identity`. Safe to
+/// repeat and safe to interrupt: a crash between the renames leaves the file as
+/// `.timevault-identity.old`, which the next call completes. Needs a writable
+/// disk.
+pub fn migrate_layout(root: &std::path::Path) -> std::io::Result<()> {
+    use std::fs;
+    let meta = root.join(META_DIR);
+    let parked = root.join(MIGRATING_IDENTITY);
+    if meta.is_file() {
+        fs::rename(&meta, &parked)?;
+    }
+    if parked.is_file() {
+        fs::create_dir_all(&meta)?;
+        let target = meta.join(IDENTITY_FILE);
+        if target.exists() {
+            fs::remove_file(&parked)?;
+        } else {
+            fs::rename(&parked, &target)?;
+        }
+    }
+    Ok(())
 }
 
 pub fn read_identity(path: &std::path::Path) -> Result<DiskIdentity> {
@@ -36,6 +73,10 @@ pub fn read_identity(path: &std::path::Path) -> Result<DiskIdentity> {
 pub fn write_identity(path: &std::path::Path, identity: &DiskIdentity) -> Result<()> {
     let data = serde_yaml::to_string(identity)
         .map_err(|e| TimevaultError::message(format!("encode identity: {}", e)))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| TimevaultError::message(format!("create {}: {}", parent.display(), e)))?;
+    }
     let mut file = std::fs::File::create(path)
         .map_err(|e| TimevaultError::message(format!("create {}: {}", path.display(), e)))?;
     file.write_all(data.as_bytes())
@@ -76,7 +117,7 @@ mod tests {
     #[test]
     fn identity_roundtrip() {
         let dir = TempDir::new().expect("tempdir");
-        let path = dir.path().join(".timevault");
+        let path = identity_path(dir.path());
         let identity = DiskIdentity {
             version: IDENTITY_VERSION,
             disk_id: "disk1".to_string(),
@@ -88,5 +129,31 @@ mod tests {
         let loaded = read_identity(&path).expect("read");
         verify_identity(&loaded, "disk1", "uuid-1").expect("verify");
         assert_eq!(loaded.disk_id, "disk1");
+    }
+
+    #[test]
+    fn migrates_legacy_identity_file() {
+        let dir = TempDir::new().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(root.join(".timevault"), "version: 1\n").unwrap();
+        assert_eq!(identity_path(root), root.join(".timevault"));
+        migrate_layout(root).unwrap();
+        assert_eq!(identity_path(root), root.join(".timevault/identity"));
+        assert!(root.join(".timevault/identity").is_file());
+        migrate_layout(root).unwrap();
+        assert!(root.join(".timevault/identity").is_file());
+    }
+
+    #[test]
+    fn migration_completes_after_interruption() {
+        let dir = TempDir::new().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(root.join(".timevault-identity.old"), "kept").unwrap();
+        migrate_layout(root).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join(".timevault/identity")).unwrap(),
+            "kept"
+        );
+        assert!(!root.join(".timevault-identity.old").exists());
     }
 }

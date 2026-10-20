@@ -3,7 +3,7 @@
 ## Philosophy
 Timevault is built around a few principles:
 - Safe by default: disks stay offline, mounts are short-lived, and destructive actions are explicit.
-- Identifiable media: backup disks carry a `.timevault` identity tied to filesystem UUIDs.
+- Identifiable media: backup disks carry a `.timevault/identity` file tied to filesystem UUIDs.
 - Repeatable results: snapshots are rotated consistently, and `current` points to the latest snapshot.
 - Minimal moving parts: it is just rsync, mount, and a small config file.
 
@@ -261,7 +261,7 @@ By default Timevault uses `/usr/sbin/sendmail -t`; set `options.report.sendmail`
 - `--fs-uuid` picks a disk by filesystem UUID; `--device` uses a block device path (alias `--block-id`).
 - `--label` sets a human-friendly label in the config.
 - `--mount-options` overrides the mount options stored for this disk (default `rw,nodev,nosuid,noexec`).
-- If the disk already contains a `.timevault` identity, `<id>` is optional.
+- If the disk already contains a `.timevault` identity (an older bare `.timevault` file is moved to `.timevault/identity` automatically), `<id>` is optional.
 - `--force` reinitializes an existing identity or non-empty disk.
 
 ### Disk ls
@@ -283,8 +283,8 @@ By default Timevault uses `/usr/sbin/sendmail -t`; set `options.report.sendmail`
 ### Disk check
 - `timevault disk check [<disk>]`
 - Compatibility: `--disk-id <id>` or `--fs-uuid <uuid>` may be used instead of the positional selector.
-- Scans configured disks, reports whether they are online or offline, and verifies connected `.timevault` identities against config.
-- Fails if a connected disk is missing its identity, has a mismatched `diskId`, or has a `.timevault` `fsUuid` that differs from the actual filesystem UUID.
+- Scans configured disks, reports whether they are online or offline, and verifies connected `.timevault/identity` files against config.
+- Fails if a connected disk is missing its identity, has a mismatched `diskId`, or has a `.timevault/identity` `fsUuid` that differs from the actual filesystem UUID.
 
 ### Disk du
 - `timevault disk du [du options] <disk>:/path`
@@ -323,7 +323,7 @@ By default Timevault uses `/usr/sbin/sendmail -t`; set `options.report.sendmail`
 - `timevault disk unregister <disk>`
 - Aliases: `timevault disk un-register <disk>`, `timevault disk unenroll <disk>`, `timevault disk de-register <disk>`
 - Compatibility: `--disk-id <id>` or `--fs-uuid <uuid>` may be used instead of the positional selector.
-- Removes the disk from config (does not delete `.timevault`).
+- Removes the disk from config (does not delete `.timevault/`).
 
 ### Disk rename
 - `timevault disk rename <old-disk> <new-id>`
@@ -430,7 +430,7 @@ Each run builds the next generation with a single `rsync --link-dest` against th
 - Post-backup scripts receive the final `<YYYYMMDD>` path; after a failed run that directory does not exist.
 
 ## Notes
-- Backup disks must contain `/.timevault` and match the configured `diskId` and `fsUuid`.
+- Backup disks must contain `/.timevault/identity` and match the configured `diskId` and `fsUuid`.
 - Snapshot structure is `<mount>/<job>/<YYYYMMDD>` with a `current` symlink.
 - `--safe` and `--dry-run` are recommended when validating new configurations.
 - Two `timevault` processes may run different jobs concurrently, even against the same disk (each gets its own mount point and excludes file). A second run of the *same* job is refused with `job <name> is already running` (per-job lock at `/var/run/timevault.<job>.pid`, stale-pid aware).

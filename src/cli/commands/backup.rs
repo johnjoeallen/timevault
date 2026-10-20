@@ -12,7 +12,7 @@ use crate::cli::commands::exit_for_disk_error;
 use crate::config::load::load_config;
 use crate::config::model::BackupDiskConfig;
 use crate::disk::fs_type::detect_fs_type;
-use crate::disk::identity::{identity_path, read_identity, verify_identity};
+use crate::disk::identity::{identity_path, migrate_layout, read_identity, verify_identity};
 use crate::disk::{
     connected_disks_in_order, device_path_for_uuid, mount_disk_for_backup,
     mount_options_for_backup, select_first_connected, sweep_stale_run_mounts,
@@ -575,6 +575,7 @@ fn mount_and_verify(
     };
 
     if !run_mode.dry_run {
+        let _ = migrate_layout(&mountpoint);
         let identity_path = identity_path(&mountpoint);
         if !identity_path.exists() {
             drop(disk_guard);

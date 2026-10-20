@@ -11,7 +11,7 @@ use crate::config::save::save_config;
 use crate::disk::discovery::list_candidates;
 use crate::disk::fs_type::detect_fs_type;
 use crate::disk::identity::{
-    identity_path, read_identity, write_identity, DiskIdentity, IDENTITY_VERSION,
+    identity_path, migrate_layout, read_identity, write_identity, DiskIdentity, IDENTITY_VERSION,
 };
 use crate::disk::{
     device_path_for_uuid, disk_matches_selector, ensure_disk_not_mounted, mount_disk_guarded,
@@ -85,6 +85,7 @@ pub fn run_enroll(config_path: &Path, disk_id: Option<&str>, args: DiskAddArgs) 
     mount_device(&device, &mountpoint, "rw,nodev,nosuid,noexec")?;
     let guard = MountGuard::new(mountpoint.clone(), false);
 
+    let _ = migrate_layout(&mountpoint);
     let identity_file = identity_path(&mountpoint);
     let (disk_id_raw, existing_identity) = if identity_file.exists() {
         let identity = read_identity(&identity_file)?;
