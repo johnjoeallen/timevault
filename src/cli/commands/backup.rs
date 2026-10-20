@@ -880,6 +880,7 @@ mod tests {
                     failure_reason: None,
                     power: None,
                     power_diagnostics: None,
+                    relocation: None,
                 })
                 .collect(),
         }
@@ -1727,6 +1728,7 @@ fn mount_and_verify(
     };
 
     if !run_mode.dry_run {
+        let _ = crate::disk::identity::migrate_layout(&mountpoint);
         let identity_path = identity_path(&mountpoint);
         if !identity_path.exists() {
             drop(disk_guard);

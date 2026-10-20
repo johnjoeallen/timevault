@@ -13,7 +13,7 @@ options:
 
 ### What changes when you upgrade
 
-- A `.timevault-index` directory appears on each backup disk. On the first run after the upgrade, the previous generation of every job is walked once to build it.
+- a `.timevault/` directory appears on each backup disk. On the first run after the upgrade, the previous generation of every job is walked once to build it.
 - Every run does one extra read-only rsync pass against the previous generation, and one walk of the new generation to keep the index current. On a quiet night this is the main cost: roughly 0.25 s per 20,000 files locally and 0.37 s over SSH (see [Cost and benefit](#cost-and-benefit)).
 - The index uses about half a kilobyte of disk per file of the indexed generation (about 50 MB per 100,000 files).
 - Initial backups, and runs on a disk with no previous generation for the job, are unaffected: there is nothing to take data from.
@@ -59,14 +59,14 @@ A pairing is made on size and modification time (moving or renaming a file keeps
 | Source | `verify: auto` (default) | `verify: hash` | `verify: size-mtime` |
 |---|---|---|---|
 | **Local** (including a cascade source on another disk) | Content compared by SHA-256, up to `hashMaxSize`. Also finds duplicates of files that still exist. A file above the limit is not read; it is accepted only as a unique move. | Same, but a file above the limit is skipped: only content-checked files are offered. | No content comparison; unique moves only. |
-| **Remote** (`user@host:/path`) | A **folder move** (three or more files going from one old folder to one new folder) is trusted without reading anything. A lone file within `hashMaxSize` is confirmed by rsync's own checksum. A lone file above the limit is accepted as a unique move. | Every pairing within `hashMaxSize` is confirmed by rsync's checksum; larger files are skipped. | Unique moves are trusted; nothing is read. |
+| **Remote** (`user@host:/path`) | Content compared by the checksum the source's rsync reports (SHA-1), up to `hashMaxSize`, for every new file whose size matches an old file. Also finds duplicates of files that still exist. A file above the limit is not read and is **not** offered. | Same. | No content comparison; unique moves only. |
 
-- A **move** means the old path no longer exists at the source. A file that still exists at its old path is a **copy**, and a copy is only ever linked after its content has been compared, which needs a local source.
-- If several candidates look alike (many files with the same size and modification time), they are told apart by content when the source is local. Otherwise they are left alone and rsync copies them.
-- **Folder moves** are a trust decision, not a proof. It takes several coincidences at once for unrelated files to line up as "everything in folder A is now in folder B", so the default does not read them; but a different file with the same size and modification time inside a moved folder would be accepted. Size and modification time are never proof of identical content, however unique the pairing. A single file, where a coincidence is most plausible, is checked by checksum.
-- **Proof for any set of vanished and new files needs the content hash of the remote files.** rsync can supply those without a script on the remote, which would remove every unverified case above; this is designed but not yet implemented. See [Remote content hashing](remote-hashing.md).
-- **Checksums are limited to the suspects.** Confirmation reads only the files that were paired, never the whole tree, and only up to `hashMaxSize` each (default 2 GiB; `0` removes the limit). A moved file is read on the remote host's disk, with only tiny checksums crossing the network. Remote confirmation uses the rsync already required on the remote: nothing is uploaded or run as root there, and file names never pass through a shell. rsync's checksum (xxHash or MD5, depending on version) is not SHA-256; it is meant to catch accidental look-alikes.
-- **Huge files** are the other place content is not compared by default. A file above `hashMaxSize` whose size matches an old vanished file to the byte, with the same modification time to the second, is accepted as a move. That is a trust decision, not a proof. If you want proof for those too, raise or remove the limit; if you want only proven pairings, use `verify: hash` and they are skipped.
+- A **move** means the old path no longer exists at the source. A file that still exists at its old path is a **copy**, and a copy is only ever linked after its content has been compared.
+- If several candidates look alike (many files with the same size and modification time), they are told apart by content, for local and remote sources alike, so the work grows with the number of files, not with the square of the number that look alike.
+- **Remote sources are proven by content.** Size and modification time are never proof of identical content, however unique the pairing, so they only choose which files are worth reading: a new file is read only if some old file has the same size. Timevault asks the source's own rsync to print the SHA-1 of those files (`rsync -n -c --checksum-choice=sha1 --out-format=%C|%l|%B|%n`, a read-only run against an empty directory), asks the local rsync to do the same for the old files, and pairs a new file with an old one only when size, checksum and permission bits all agree. A look-alike inside a moved folder is therefore rejected, and a folder move is no longer taken on trust. Nothing is uploaded or run as root on the source, file names never pass through a shell, and only the checksums cross the network. The source host reads each candidate file once on its own disk. See [Remote content hashing](remote-hashing.md).
+- **Requirement: rsync 3.5.0 or newer.** The local rsync's version is checked. The source's version cannot be read, so the source is judged by whether it answers with checksums. If either end is too old, or the request fails, Timevault says so in the log and the report and falls back to the weaker evidence: a folder move of three or more files is trusted as a group, a lone file within `hashMaxSize` is confirmed by rsync's pairwise checksum comparison, a lone file above the limit is accepted as a unique move (skipped under `verify: hash`), and look-alike groups are left to rsync. That fallback is a trust decision, not a proof.
+- **Reads are limited to the suspects.** Only new files that have an old file of the same size are read, only up to `hashMaxSize` each (default 2 GiB; `0` removes the limit), and no more than 32 GiB of new files per run. The old files are read once, locally. Each is read again every run; the checksums are not cached yet.
+- **Huge files** are never read by default, so they are not offered. Raise or remove `hashMaxSize` to have them compared, or choose `verify: size-mtime`, which trusts a size and modification time that match to the byte and the second.
 - The weakest setting, `size-mtime`, is open to a mix-up: if a file vanishes and a *different* file with the same size and modification time appears in the same run, they can be confused. It is there for sources you cannot afford to read from.
 
 Things that are not compared by Timevault itself (extended attributes, ACLs) are compared by rsync when it decides whether to link, so a mismatch there leads to a copy, not to wrong data.
@@ -113,7 +113,10 @@ photos: reusing 1840 moved, renamed or duplicate files (9437184000 bytes) alread
 photos: moved-file detection skipped: more than 200000 new or vanished files
 photos: moved-file detection stopped at its time limit; the rest is copied normally
 photos: moved-file detection skipped: the file index is unavailable
+photos: the source's checksums could not be used (rsync 3.5.0 or newer is needed to hash remote files ...); weaker evidence was used instead
 ```
+
+The result for each job is also in the emailed and Markdown report, under **Moved-file reuse**: how many files were reused (moved, renamed, duplicate), how much data that saved, how many look-alikes were rejected, how much was read at the source to compare, and anything that was skipped or fell back.
 
 Relocation never fails a backup. Any problem becomes a "skipped" line and the backup proceeds as before.
 
@@ -123,9 +126,9 @@ Measured on a local filesystem with a warm cache, 20,000 files of about 4 KiB ea
 
 | Change before the next run | Without relocation | With relocation |
 |---|---|---|
-| Nothing | 0.30 s, 0.8 MiB | 0.55 s, 5.3 MiB (includes the index) |
-| Every folder moved | 0.36 s, 157 MiB | 1.24 s, 10.6 MiB |
-| Every file renamed (identical sizes and times) | 0.37 s, 157 MiB | 1.26 s, 9.6 MiB |
+| Nothing | 0.31 s, 0.8 MiB | 0.48 s, 4.9 MiB (includes the index) |
+| Every folder moved | 0.37 s, 157 MiB | 1.17 s, 10.0 MiB |
+| Every file renamed (identical sizes and times) | 0.37 s, 157 MiB | 1.18 s, 9.2 MiB |
 
 Reading the table:
 
@@ -140,13 +143,14 @@ The same workload with the source reached over real SSH to the same machine:
 
 | Change before the next run | Without relocation | With relocation |
 |---|---|---|
-| Nothing | 0.66 s, 0.8 MiB | 1.03 s, 5.3 MiB |
-| Every folder moved | 0.77 s, 157 MiB | 2.56 s, 5.8 MiB |
-| Every file renamed (identical sizes and times) | 0.76 s, 157 MiB | 1.31 s, 162 MiB |
+| Nothing | 0.66 s, 0.8 MiB | 1.06 s, 5.3 MiB |
+| Every folder moved | 0.77 s, 157 MiB | 3.11 s, 5.8 MiB |
+| Every file renamed (identical sizes and times) | 0.75 s, 157 MiB | 3.99 s, 5.2 MiB |
 
-- On a quiet night the extra dry-run pass added about 0.37 s for 20,000 files, roughly **56 %** more run time here. That is less than a doubling in this measurement.
-- A moved folder is the best case: 157 MiB of copying avoided, at the price of about 1.8 s. The folders are trusted as a group, so no file is read on the remote host.
-- The last row shows a **limit**: when thousands of renamed files share the same size and modification time, a remote source cannot tell them apart without their content hashes, so nothing is paired and nothing is saved (the extra pass was wasted). [Remote content hashing](remote-hashing.md) describes how rsync can provide those hashes. Real collections rarely have this uniformity; with a local source the same rename is fully recovered by content. The change limit and the time limit bound the cost of such a case.
+- On a quiet night the extra dry-run pass added about 0.4 s for 20,000 files, roughly **60 %** more run time here. That is less than a doubling in this measurement.
+- A moved folder is the best case: 157 MiB of copying avoided, at the price of about 2.3 s. Every moved file is read once on the source host (80 MB here) and once locally, and each is proven by its checksum.
+- The last row is the hardest case: 20,000 renamed files with identical size and modification time cannot be told apart by anything but content. Before remote hashing (1.19.0) nothing was paired and all 157 MiB were copied; now each is paired with its own original by checksum, for about 3.2 s more.
+- The figures are one machine's loopback; treat them as an estimate of the protocol overhead, and measure on your own link with `TIMEVAULT_TEST_SSH=1 cargo test --release bench_relocation_over_ssh -- --ignored --nocapture --test-threads=1`. On a real link the checksums are small, but the source host's disk and CPU do the reading.
 - The figures are one machine's loopback; treat them as an estimate of the protocol overhead, and measure on your own link with `TIMEVAULT_TEST_SSH=1 cargo test --release bench_relocation_over_ssh -- --ignored --nocapture --test-threads=1`.
 
 ## When it helps and when it does not

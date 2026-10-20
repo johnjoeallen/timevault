@@ -73,7 +73,7 @@ A disk returning after a week does not need a full backup. It needs room for wha
 
 ### The file index
 
-Because moved-file detection is on by default, the disk also holds `.timevault-index/file-index.sqlite` (unless you set `options.relocation: false`). Plan for about half a kilobyte per file in the generation being indexed (roughly 50 MB per 100,000 files, more with long paths), plus a similar amount while a new generation is being recorded. It is not shared with hard links, so it counts fully against the disk.
+Because moved-file detection is on by default, the disk also holds `.timevault/index/file-index.sqlite` (unless you set `options.relocation: false`). Plan for about half a kilobyte per file in the generation being indexed (roughly 50 MB per 100,000 files, more with long paths), plus a similar amount while a new generation is being recorded. It is not shared with hard links, so it counts fully against the disk.
 
 ### Headroom
 

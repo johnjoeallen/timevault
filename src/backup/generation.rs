@@ -284,6 +284,11 @@ pub fn recover_interrupted(dest: &Path, run_mode: RunMode) -> io::Result<()> {
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
         Err(err) => return Err(err),
     }
+    match fs::remove_dir_all(dest.join(format!("{}.empty", RELOC_NAME))) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
     for entry in fs::read_dir(dest)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().to_string();

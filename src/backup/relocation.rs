@@ -55,6 +55,16 @@ pub const RELOCATION_DEFAULT: bool = true;
 /// Content is compared for files up to this size (2 GiB); larger files are
 /// not read. `0` removes the limit.
 pub const DEFAULT_HASH_MAX_SIZE: u64 = 2 * 1024 * 1024 * 1024;
+/// Checksum rsync is asked to report for remote files.
+const HASH_ALGO: &str = "sha1";
+/// Oldest rsync whose checksum reporting (`--checksum-choice`, `%C`) has been
+/// verified. The remote side is judged by whether it answers, since rsync does
+/// not tell a client the version of its peer.
+pub const MIN_RSYNC: (u32, u32, u32) = (3, 5, 0);
+/// Most bytes of new files read at a remote source for hashing in one run.
+const REMOTE_HASH_BUDGET: u64 = 32 * 1024 * 1024 * 1024;
+/// Name of the empty directory used as the target of a hashing run.
+const EMPTY_NAME: &str = ".timevault-reloc.empty";
 /// Pairings that map one old directory to one new directory count as a folder
 /// move once there are this many of them.
 pub const GROUP_MIN: usize = 3;
@@ -84,6 +94,9 @@ pub struct RelocationConfig {
     pub verify: Verify,
     /// Largest file whose content is compared; `0` means no limit.
     pub hash_max_size: u64,
+    /// Ask rsync for content hashes of a remote source. Internal switch: on
+    /// everywhere except in tests of the weaker evidence tiers it falls back to.
+    pub remote_hash: bool,
 }
 
 impl RelocationConfig {
@@ -105,6 +118,7 @@ impl Default for RelocationConfig {
             timeout_secs: DEFAULT_TIMEOUT_SECS,
             verify: Verify::Auto,
             hash_max_size: DEFAULT_HASH_MAX_SIZE,
+            remote_hash: true,
         }
     }
 }
@@ -192,11 +206,85 @@ pub struct Stats {
     pub bytes_reused: u64,
     /// Matching stopped early because the time limit passed.
     pub hit_deadline: bool,
+    /// Bytes read at the source to hash candidate files (remote sources).
+    pub bytes_hashed: u64,
+    /// Why content hashes of a remote source were not used, if they were not.
+    pub hash_fallback: Option<String>,
 }
 
 impl Stats {
     pub fn matched(&self) -> usize {
         self.moved + self.renamed + self.copies
+    }
+
+    /// One line for the report, or `None` when the pass found nothing to say.
+    pub fn summary(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if self.linked > 0 {
+            let mut kinds = Vec::new();
+            for (count, label) in [
+                (self.moved, "moved"),
+                (self.renamed, "renamed"),
+                (self.copies, "duplicate"),
+            ] {
+                if count > 0 {
+                    kinds.push(format!("{} {}", count, label));
+                }
+            }
+            let detail = if kinds.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", kinds.join(", "))
+            };
+            parts.push(format!(
+                "reused {} files{}, {} not copied again",
+                self.linked,
+                detail,
+                human_bytes(self.bytes_reused)
+            ));
+        }
+        if self.rejected > 0 {
+            parts.push(format!("{} look-alikes rejected", self.rejected));
+        }
+        if self.bytes_hashed > 0 {
+            parts.push(format!(
+                "{} read at the source to compare",
+                human_bytes(self.bytes_hashed)
+            ));
+        }
+        if self.skipped_large > 0 {
+            parts.push(format!(
+                "{} files over the size limit left to rsync",
+                self.skipped_large
+            ));
+        }
+        if self.hit_deadline {
+            parts.push("stopped at its time limit".to_string());
+        }
+        if let Some(reason) = &self.hash_fallback {
+            parts.push(format!("source hashes unavailable ({})", reason));
+        }
+        (!parts.is_empty()).then(|| parts.join("; "))
+    }
+}
+
+/// Decimal size, like `1.5 GB`.
+fn human_bytes(bytes: u64) -> String {
+    let units = ["B", "KB", "MB", "GB", "TB", "PB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1000.0 && unit + 1 < units.len() {
+        value /= 1000.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} B", bytes)
+    } else if value < 10.0 {
+        format!("{:.2} {}", value, units[unit])
+    } else if value < 100.0 {
+        format!("{:.1} {}", value, units[unit])
+    } else {
+        format!("{:.0} {}", value, units[unit])
     }
 }
 
@@ -522,6 +610,338 @@ fn verify_with_rsync(
     });
     let _ = fs::remove_file(list_file);
     result.map(|()| verdicts)
+}
+
+/// Parse the version out of `rsync --version`'s first line
+/// (`rsync  version 3.5.0  protocol version 32`).
+pub fn parse_rsync_version(text: &str) -> Option<(u32, u32, u32)> {
+    let rest = text.split("version").nth(1)?.trim_start();
+    let token = rest.split_whitespace().next()?;
+    let mut parts = token.split('.').map(|part| {
+        part.chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>()
+            .parse::<u32>()
+            .ok()
+    });
+    let major = parts.next()??;
+    let minor = parts.next()??;
+    let patch = parts.next().flatten().unwrap_or(0);
+    Some((major, minor, patch))
+}
+
+/// Whether the rsync on this machine is new enough to report checksums.
+fn local_rsync_supports_hashing() -> Result<(), String> {
+    static CHECKED: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    CHECKED
+        .get_or_init(|| {
+            let output = Command::new("rsync")
+                .arg("--version")
+                .output()
+                .map_err(|e| format!("could not run rsync: {}", e))?;
+            let text = String::from_utf8_lossy(&output.stdout);
+            let first = text.lines().next().unwrap_or("");
+            match parse_rsync_version(first) {
+                Some(found) if found >= MIN_RSYNC => Ok(()),
+                _ => Err(format!(
+                    "rsync {}.{}.{} or newer is needed to hash remote files (found: {})",
+                    MIN_RSYNC.0,
+                    MIN_RSYNC.1,
+                    MIN_RSYNC.2,
+                    first.trim()
+                )),
+            }
+        })
+        .clone()
+}
+
+/// A file's content hash and permission bits as reported by rsync.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Hashed {
+    hash: String,
+    size: u64,
+    perm: u32,
+}
+
+/// Permission bits from rsync's `%B` (`rwxr-xr-x`, with `s`, `S`, `t`, `T`).
+fn parse_perm(text: &[u8]) -> Option<u32> {
+    if text.len() != 9 {
+        return None;
+    }
+    let mut mode = 0;
+    for (i, b) in text.iter().enumerate() {
+        let class = i / 3;
+        let place = i % 3;
+        let bit = 1u32 << (8 - i);
+        let special = match class {
+            0 => 0o4000,
+            1 => 0o2000,
+            _ => 0o1000,
+        };
+        match (place, *b) {
+            (0, b'r') | (1, b'w') | (2, b'x') => mode |= bit,
+            (2, b's') | (2, b't') => mode |= bit | special,
+            (2, b'S') | (2, b'T') => mode |= special,
+            (_, b'-') => {}
+            _ => return None,
+        }
+    }
+    Some(mode)
+}
+
+/// Parse one `--out-format=%C|%l|%B|%n` line. Directories and anything
+/// without a full checksum give `None`.
+fn parse_hash_line(line: &[u8]) -> Option<(Vec<u8>, Hashed)> {
+    let mut fields = line.splitn(4, |b| *b == b'|');
+    let (hash, size, perm, name) = (
+        fields.next()?,
+        fields.next()?,
+        fields.next()?,
+        fields.next()?,
+    );
+    if hash.len() != 40 || !hash.iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    let size = std::str::from_utf8(size).ok()?.trim().parse::<u64>().ok()?;
+    Some((
+        unescape_name(name),
+        Hashed {
+            hash: String::from_utf8_lossy(hash).to_ascii_lowercase(),
+            size,
+            perm: parse_perm(perm)?,
+        },
+    ))
+}
+
+/// Ask rsync to read `paths` under `source` and report each file's checksum
+/// (a read-only run: `-n -c` against an empty directory). For a remote source
+/// the checksums are computed on the remote host by the rsync already required
+/// there; only the checksums cross the link, nothing is run through a shell.
+fn rsync_hashes(
+    source: &str,
+    scratch: &Path,
+    paths: &[Vec<u8>],
+    deadline: Instant,
+) -> Result<HashMap<Vec<u8>, Hashed>, String> {
+    let list_file = scratch.join(format!("{}.list", RELOC_NAME));
+    let empty = scratch.join(EMPTY_NAME);
+    let mut list = Vec::new();
+    for path in paths {
+        list.extend_from_slice(path);
+        list.push(0);
+    }
+    fs::write(&list_file, &list)
+        .map_err(|e| format!("could not write the candidate list: {}", e))?;
+    let outcome = (|| {
+        fs::create_dir_all(&empty)
+            .map_err(|e| format!("could not create {}: {}", EMPTY_NAME, e))?;
+        let files_from = format!("--files-from={}", list_file.display());
+        let checksum = format!("--checksum-choice={}", HASH_ALGO);
+        let source = normalize_rsync_source(source);
+        let target = format!("{}/", empty.display());
+        let fixed = [
+            "-n",
+            "-c",
+            checksum.as_str(),
+            "--from0",
+            files_from.as_str(),
+            "--out-format=%C|%l|%B|%n",
+            source.as_str(),
+            target.as_str(),
+        ];
+        let args: Vec<&OsStr> = fixed.iter().map(|a| OsStr::new(*a)).collect();
+        let mut hashes = HashMap::new();
+        stream_lines(rsync_command(&args), deadline, |line| {
+            if let Some((name, hashed)) = parse_hash_line(line) {
+                hashes.insert(name, hashed);
+            }
+            Ok(())
+        })?;
+        Ok(hashes)
+    })();
+    let _ = fs::remove_file(&list_file);
+    let _ = fs::remove_dir_all(&empty);
+    outcome
+}
+
+/// Result of matching by content hashes reported through rsync.
+pub enum RemoteMatch {
+    /// Hashes could not be used; the reason is for the log.
+    Unavailable(String),
+    Matched(Vec<Pair>, Stats),
+}
+
+/// Pair new files with old ones by content for a source that cannot be read
+/// here, using hashes rsync reports (see [`rsync_hashes`]). Size and
+/// modification time only choose *which* files are worth reading; a pairing is
+/// made only when the checksum and permissions of the new and old file are
+/// equal, so a look-alike is never linked and nothing depends on the pairing
+/// being unique. Copies of files that still exist are found too.
+pub fn match_by_remote_hash(
+    p: &Prepare<'_>,
+    index: &mut DiskIndex,
+    changes: &Changes,
+    deadline: Instant,
+) -> Result<RemoteMatch, IndexError> {
+    let cfg = p.cfg;
+    if let Err(reason) = local_rsync_supports_hashing() {
+        return Ok(RemoteMatch::Unavailable(reason));
+    }
+    let mut stats = Stats::default();
+
+    let mut vanished: HashSet<PathBuf> = HashSet::new();
+    for path in &changes.deleted {
+        let rel = Path::new(OsStr::from_bytes(path));
+        if let Some(record) = index.find_by_path(Role::Previous, rel)? {
+            if record.kind == 'f' && record.size >= cfg.min_size {
+                vanished.insert(record.path);
+            }
+        }
+    }
+    stats.vanished_files = vanished.len();
+
+    let mut news: Vec<&NewFile> = changes
+        .new
+        .iter()
+        .filter(|n| n.size >= cfg.min_size && safe_relative(&n.path))
+        .collect();
+    news.sort_by(|a, b| a.path.cmp(&b.path));
+    stats.new_files = news.len();
+
+    // Old files that could match, by size.
+    let mut olds: HashMap<u64, Vec<FileRecord>> = HashMap::new();
+    let mut candidates: Vec<&NewFile> = Vec::new();
+    let mut budget = REMOTE_HASH_BUDGET;
+    for n in &news {
+        if !cfg.may_hash(n.size) {
+            stats.skipped_large += 1;
+            continue;
+        }
+        if let std::collections::hash_map::Entry::Vacant(slot) = olds.entry(n.size) {
+            let records: Vec<FileRecord> = index
+                .find_by_size(Role::Previous, n.size)?
+                .into_iter()
+                .filter(|r| r.kind == 'f')
+                .collect();
+            slot.insert(if records.len() > MAX_GROUP {
+                Vec::new()
+            } else {
+                records
+            });
+        }
+        if olds[&n.size].is_empty() {
+            continue;
+        }
+        if n.size > budget {
+            stats.skipped_large += 1;
+            continue;
+        }
+        budget -= n.size;
+        candidates.push(n);
+    }
+    if candidates.is_empty() {
+        return Ok(RemoteMatch::Matched(Vec::new(), stats));
+    }
+
+    let new_paths: Vec<Vec<u8>> = candidates.iter().map(|n| n.path.clone()).collect();
+    let new_hashes = match rsync_hashes(p.source, p.dest, &new_paths, deadline) {
+        Ok(hashes) => hashes,
+        Err(reason) => return Ok(RemoteMatch::Unavailable(reason)),
+    };
+    if new_hashes.is_empty() {
+        return Ok(RemoteMatch::Unavailable(format!(
+            "the source's rsync reported no checksums (it needs rsync {}.{}.{} or newer)",
+            MIN_RSYNC.0, MIN_RSYNC.1, MIN_RSYNC.2
+        )));
+    }
+    stats.bytes_hashed = candidates.iter().map(|n| n.size).sum();
+
+    // Hash, with the same algorithm, the old files of the sizes that remain.
+    let sizes: HashSet<u64> = candidates
+        .iter()
+        .filter(|n| new_hashes.contains_key(&n.path))
+        .map(|n| n.size)
+        .collect();
+    let mut old_records: Vec<&FileRecord> = Vec::new();
+    for size in &sizes {
+        old_records.extend(olds[size].iter());
+    }
+    old_records.sort_by(|a, b| a.path.cmp(&b.path));
+    let old_paths: Vec<Vec<u8>> = old_records
+        .iter()
+        .map(|r| r.path.as_os_str().as_bytes().to_vec())
+        .collect();
+    let prev_source = format!("{}/", p.prev_root.display());
+    let old_hashes = match rsync_hashes(&prev_source, p.dest, &old_paths, deadline) {
+        Ok(hashes) => hashes,
+        Err(reason) => return Ok(RemoteMatch::Unavailable(reason)),
+    };
+    let mut by_content: HashMap<(u64, String), Vec<&FileRecord>> = HashMap::new();
+    for record in &old_records {
+        if let Some(h) = old_hashes.get(record.path.as_os_str().as_bytes()) {
+            if h.size == record.size {
+                by_content
+                    .entry((h.size, h.hash.clone()))
+                    .or_default()
+                    .push(record);
+            }
+        }
+    }
+
+    let mut pairs: Vec<Pair> = Vec::new();
+    let mut claimed: HashSet<&Path> = HashSet::new();
+    for n in &candidates {
+        if Instant::now() > deadline {
+            stats.hit_deadline = true;
+            break;
+        }
+        let Some(h) = new_hashes.get(&n.path) else {
+            continue;
+        };
+        if h.size != n.size {
+            stats.rejected += 1; // changed while it was being read
+            continue;
+        }
+        let name = file_name_bytes(&n.path);
+        let best = by_content
+            .get(&(h.size, h.hash.clone()))
+            .into_iter()
+            .flatten()
+            .filter(|r| r.mode & 0o7777 == h.perm)
+            .min_by_key(|r| {
+                let moved = vanished.contains(&r.path) && !claimed.contains(r.path.as_path());
+                let rank = match (moved, r.name == name) {
+                    (true, true) => 0,
+                    (true, false) => 1,
+                    (false, true) => 2,
+                    (false, false) => 3,
+                };
+                (rank, r.path.clone())
+            });
+        let Some(old) = best else {
+            stats.rejected += 1;
+            continue;
+        };
+        let first_claim = vanished.contains(&old.path) && !claimed.contains(old.path.as_path());
+        if first_claim {
+            claimed.insert(old.path.as_path());
+            if old.name == name {
+                stats.moved += 1;
+            } else {
+                stats.renamed += 1;
+            }
+        } else {
+            stats.copies += 1;
+        }
+        stats.verified += 1;
+        pairs.push(Pair {
+            new: PathBuf::from(OsStr::from_bytes(&n.path)),
+            old: old.path.clone(),
+            size: n.size,
+            verified: true,
+        });
+    }
+    Ok(RemoteMatch::Matched(pairs, stats))
 }
 
 /// A pairing of a new path with the old file whose data it can reuse.
@@ -1038,12 +1458,32 @@ pub fn prepare(p: &Prepare<'_>, index: &mut DiskIndex) -> Result<Outcome, IndexE
         prev_root: p.prev_root,
         deadline,
     };
-    let (pairs, mut stats) = match_changes(&input, index, &changes)?;
+    // A remote source is matched by content hashes reported through rsync
+    // when they are available, and by the weaker evidence below when not.
+    let mut fallback = None;
+    let hashed = if p.local_root.is_none() && p.cfg.remote_hash && p.cfg.verify != Verify::SizeMtime
+    {
+        match match_by_remote_hash(p, index, &changes, deadline)? {
+            RemoteMatch::Matched(pairs, stats) => Some((pairs, stats)),
+            RemoteMatch::Unavailable(reason) => {
+                fallback = Some(reason);
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let proven = hashed.is_some();
+    let (pairs, mut stats) = match hashed {
+        Some(found) => found,
+        None => match_changes(&input, index, &changes)?,
+    };
+    stats.hash_fallback = fallback;
     // Pairings made on size and modification time alone (a remote source
     // cannot be read here) are either trusted as a folder move, confirmed by
     // rsync's own checksum, or, for files above the size limit, accepted as a
     // unique move or skipped, depending on `verify`.
-    let (pairs, confirm) = if p.local_root.is_none() {
+    let (pairs, confirm) = if p.local_root.is_none() && !proven {
         select_unverified(p.cfg, pairs, &mut stats)
     } else {
         (pairs, HashSet::new())
@@ -1106,6 +1546,14 @@ mod tests {
             ..Default::default()
         })))
         .unwrap()
+    }
+
+    /// Settings that use only the evidence available without remote hashes.
+    fn tiers(verify: Option<&str>) -> RelocationConfig {
+        RelocationConfig {
+            remote_hash: false,
+            ..settings(verify)
+        }
     }
 
     /// A source tree and its previous generation (a faithful copy), with the
@@ -1398,7 +1846,7 @@ mod tests {
         let mut w = world(&[("a.bin", "alpha-data"), ("b.bin", "bravo-data!")]);
         fs::rename(w.source.join("a.bin"), w.source.join("moved-a.bin")).unwrap();
 
-        let (shadow, stats) = w.planned(&settings(None), false);
+        let (shadow, stats) = w.planned(&tiers(None), false);
 
         assert_eq!(
             (stats.renamed, stats.verified, stats.linked),
@@ -1425,7 +1873,7 @@ mod tests {
     }
 
     #[test]
-    fn a_remote_folder_move_is_trusted_as_a_group_without_reading_content() {
+    fn without_remote_hashes_a_folder_move_is_trusted_as_a_group() {
         let names: Vec<String> = (0..4).map(|i| format!("album/track{i}.flac")).collect();
         let texts: Vec<String> = (0..4).map(|i| format!("audio-data-{i}")).collect();
         let files: Vec<(&str, &str)> = names
@@ -1436,7 +1884,7 @@ mod tests {
         let mut w = world(&files);
         fs::rename(w.source.join("album"), w.source.join("Music Archive")).unwrap();
 
-        let (shadow, stats) = w.planned(&settings(None), false);
+        let (shadow, stats) = w.planned(&tiers(None), false);
 
         // Four files from one old folder to one new folder: collective
         // evidence, so no checksum is needed.
@@ -1548,11 +1996,11 @@ mod tests {
     }
 
     #[test]
-    fn a_huge_remote_file_is_trusted_as_a_unique_move_but_not_under_verify_hash() {
+    fn without_remote_hashes_a_huge_file_is_trusted_as_a_unique_move_but_not_under_verify_hash() {
         let mut w = world(&[("big.bin", "this file counts as huge here")]);
         fs::rename(w.source.join("big.bin"), w.source.join("renamed.bin")).unwrap();
         let tiny_limit = |verify: &str| {
-            let mut cfg = settings(Some(verify));
+            let mut cfg = tiers(Some(verify));
             cfg.hash_max_size = 5;
             cfg
         };
@@ -1596,9 +2044,16 @@ mod tests {
         fs::rename(w.source.join("b.bin"), w.source.join("n2.bin")).unwrap();
 
         // Without a way to compare content nothing is guessed.
-        let (shadow, stats) = w.planned(&settings(None), false);
+        let (shadow, stats) = w.planned(&tiers(None), false);
         assert!(shadow.is_none());
         assert_eq!((stats.linked, stats.ambiguous), (0, 2));
+
+        // With hashes reported by the source's rsync, content decides too.
+        let (shadow, stats) = w.planned(&settings(None), false);
+        let shadow = shadow.expect("shadow");
+        assert_eq!((stats.linked, stats.verified, stats.ambiguous), (2, 2, 0));
+        assert_eq!(ino(&shadow.join("n1.bin")), ino(&w.prev.join("a.bin")));
+        assert_eq!(ino(&shadow.join("n2.bin")), ino(&w.prev.join("b.bin")));
 
         // With a local source, content pairs each file with its own original.
         let (shadow, stats) = w.planned(&settings(None), true);
@@ -1645,9 +2100,23 @@ mod tests {
             );
         }
         // Without content to compare, none of them can be told apart.
-        let (shadow, stats) = w.planned(&settings(None), false);
+        let (shadow, stats) = w.planned(&tiers(None), false);
         assert!(shadow.is_none());
         assert_eq!(stats.linked, 0);
+
+        // With the source's rsync reporting hashes, all of them can.
+        let (shadow, stats) = w.planned(&settings(None), false);
+        let shadow = shadow.expect("shadow");
+        assert_eq!(
+            (stats.linked, stats.verified, stats.rejected),
+            (300, 300, 0)
+        );
+        for i in 0..300 {
+            assert_eq!(
+                ino(&shadow.join(format!("dir/renamed-{:04}.dat", 299 - i))),
+                ino(&w.prev.join(format!("dir/f{i:04}.dat")))
+            );
+        }
     }
 
     #[test]
@@ -1680,9 +2149,16 @@ mod tests {
         .unwrap();
 
         // Without hashing, a file whose original still exists is just a new file.
-        let (shadow, stats) = w.planned(&settings(None), false);
+        let (shadow, stats) = w.planned(&tiers(None), false);
         assert!(shadow.is_none());
         assert_eq!(stats.copies, 0);
+        // With hashes reported by a remote source it is found too.
+        let (shadow, stats) = w.planned(&settings(None), false);
+        assert_eq!((stats.copies, stats.verified), (1, 1), "{stats:?}");
+        assert_eq!(
+            ino(&shadow.unwrap().join("copy/dup.bin")),
+            ino(&w.prev.join("orig.bin"))
+        );
         let (shadow, _) = w.planned(&settings(Some("size-mtime")), true);
         assert!(shadow.is_none());
 
@@ -1919,135 +2395,304 @@ mod tests {
         assert!(parse_verdict(b"noise").is_none());
     }
 
-    fn hash_mode() -> RelocationConfig {
-        settings(Some("hash"))
+    /// A remote source is judged by content, once from hashes its rsync
+    /// reports and once by asking rsync to compare pairings. Both must agree.
+    fn remote_modes() -> [RelocationConfig; 2] {
+        [settings(Some("hash")), tiers(Some("hash"))]
     }
 
     #[test]
     fn a_remote_move_confirmed_by_checksum_is_linked() {
-        let mut w = world(&[("a.bin", "alpha-data")]);
-        fs::create_dir_all(w.source.join("n")).unwrap();
-        fs::rename(w.source.join("a.bin"), w.source.join("n/a.bin")).unwrap();
+        for cfg in remote_modes() {
+            let mut w = world(&[("a.bin", "alpha-data")]);
+            fs::create_dir_all(w.source.join("n")).unwrap();
+            fs::rename(w.source.join("a.bin"), w.source.join("n/a.bin")).unwrap();
 
-        // `local = false` makes the source behave like a remote one.
-        let (shadow, stats) = w.planned(&hash_mode(), false);
+            // `local = false` makes the source behave like a remote one.
+            let (shadow, stats) = w.planned(&cfg, false);
 
-        assert_eq!(
-            (stats.linked, stats.verified, stats.rejected),
-            (1, 1, 0),
-            "{stats:?}"
-        );
-        assert_eq!(
-            ino(&shadow.unwrap().join("n/a.bin")),
-            ino(&w.prev.join("a.bin"))
-        );
-        assert!(!w.dest.join(format!("{}.list", RELOC_NAME)).exists());
+            assert_eq!(
+                (stats.linked, stats.verified, stats.rejected),
+                (1, 1, 0),
+                "{stats:?}"
+            );
+            assert_eq!(
+                ino(&shadow.unwrap().join("n/a.bin")),
+                ino(&w.prev.join("a.bin"))
+            );
+            assert!(!w.dest.join(format!("{}.list", RELOC_NAME)).exists());
+        }
     }
 
     #[test]
     fn a_remote_look_alike_is_rejected_by_default_and_only_size_mtime_is_fooled() {
-        let mut w = world(&[("old/a.bin", "alpha-data")]);
-        fs::remove_dir_all(w.source.join("old")).unwrap();
-        write(&w.source.join("new/a.bin"), "alpha-DATA");
-        set_mtime(&w.source.join("new/a.bin"), "2020-05-05 10:00:00");
+        for cfg in remote_modes() {
+            let mut w = world(&[("old/a.bin", "alpha-data")]);
+            fs::remove_dir_all(w.source.join("old")).unwrap();
+            write(&w.source.join("new/a.bin"), "alpha-DATA");
+            set_mtime(&w.source.join("new/a.bin"), "2020-05-05 10:00:00");
 
-        // An isolated pairing is confirmed by checksum, which catches it.
-        let (shadow, stats) = w.planned(&settings(None), false);
-        assert!(shadow.is_none());
-        assert_eq!((stats.linked, stats.rejected), (0, 1), "{stats:?}");
-        let (shadow, stats) = w.planned(&hash_mode(), false);
-        assert!(shadow.is_none());
-        assert_eq!((stats.linked, stats.rejected), (0, 1), "{stats:?}");
-        assert!(!w.dest.join(RELOC_NAME).exists());
+            // An isolated pairing is confirmed by checksum, which catches it.
+            let (shadow, stats) = w.planned(
+                &RelocationConfig {
+                    verify: Verify::Auto,
+                    ..cfg
+                },
+                false,
+            );
+            assert!(shadow.is_none());
+            assert_eq!((stats.linked, stats.rejected), (0, 1), "{stats:?}");
+            let (shadow, stats) = w.planned(&cfg, false);
+            assert!(shadow.is_none());
+            assert_eq!((stats.linked, stats.rejected), (0, 1), "{stats:?}");
+            assert!(!w.dest.join(RELOC_NAME).exists());
 
-        // The explicit weakest tier trusts size and modification time alone.
-        let (shadow, stats) = w.planned(&settings(Some("size-mtime")), false);
-        assert_eq!(stats.linked, 1);
-        assert!(shadow.is_some());
+            // The explicit weakest tier trusts size and modification time alone.
+            let (shadow, stats) = w.planned(
+                &RelocationConfig {
+                    verify: Verify::SizeMtime,
+                    ..cfg
+                },
+                false,
+            );
+            assert_eq!(stats.linked, 1);
+            assert!(shadow.is_some());
+        }
     }
 
     #[test]
     fn only_the_confirmed_pairings_stay_in_the_shadow_directory() {
-        let mut w = world(&[
-            ("a/one.bin", "content-one"),
-            ("a/two.bin", "content-two"),
-            ("a/three.bin", "content-3.."),
-        ]);
-        fs::remove_dir_all(w.source.join("a")).unwrap();
-        for (name, text) in [
-            ("one", "content-one"),
-            ("two", "content-two"),
-            ("three", "CONTENT-3.."),
-        ] {
-            write(&w.source.join(format!("b/{name}.bin")), text);
-            set_mtime(
-                &w.source.join(format!("b/{name}.bin")),
-                "2020-05-05 10:00:00",
+        for cfg in remote_modes() {
+            let mut w = world(&[
+                ("a/one.bin", "content-one"),
+                ("a/two.bin", "content-two"),
+                ("a/three.bin", "content-3.."),
+            ]);
+            fs::remove_dir_all(w.source.join("a")).unwrap();
+            for (name, text) in [
+                ("one", "content-one"),
+                ("two", "content-two"),
+                ("three", "CONTENT-3.."),
+            ] {
+                write(&w.source.join(format!("b/{name}.bin")), text);
+                set_mtime(
+                    &w.source.join(format!("b/{name}.bin")),
+                    "2020-05-05 10:00:00",
+                );
+            }
+
+            let (shadow, stats) = w.planned(&cfg, false);
+
+            let shadow = shadow.expect("shadow");
+            assert_eq!(
+                (stats.linked, stats.rejected, stats.verified),
+                (2, 1, 2),
+                "{stats:?}"
             );
+            assert!(shadow.join("b/one.bin").exists());
+            assert!(shadow.join("b/two.bin").exists());
+            assert!(!shadow.join("b/three.bin").exists());
+            assert_eq!(stats.bytes_reused, 22);
         }
-
-        let (shadow, stats) = w.planned(&hash_mode(), false);
-
-        let shadow = shadow.expect("shadow");
-        assert_eq!(
-            (stats.linked, stats.rejected, stats.verified),
-            (2, 1, 2),
-            "{stats:?}"
-        );
-        assert!(shadow.join("b/one.bin").exists());
-        assert!(shadow.join("b/two.bin").exists());
-        assert!(!shadow.join("b/three.bin").exists());
-        assert_eq!(stats.bytes_reused, 22);
     }
 
     #[test]
     fn a_remote_move_with_changed_permissions_is_not_offered() {
-        let mut w = world(&[("a.bin", "alpha-data")]);
-        fs::rename(w.source.join("a.bin"), w.source.join("b.bin")).unwrap();
-        fs::set_permissions(w.source.join("b.bin"), fs::Permissions::from_mode(0o600)).unwrap();
+        for cfg in remote_modes() {
+            let mut w = world(&[("a.bin", "alpha-data")]);
+            fs::rename(w.source.join("a.bin"), w.source.join("b.bin")).unwrap();
+            fs::set_permissions(w.source.join("b.bin"), fs::Permissions::from_mode(0o600)).unwrap();
 
-        let (shadow, stats) = w.planned(&hash_mode(), false);
+            let (shadow, stats) = w.planned(&cfg, false);
 
-        assert!(shadow.is_none());
-        assert_eq!((stats.linked, stats.rejected), (0, 1));
+            assert!(shadow.is_none());
+            assert_eq!((stats.linked, stats.rejected), (0, 1));
+        }
     }
 
     #[test]
     fn hostile_file_names_never_reach_a_shell() {
-        // Spaces, a leading dash, a newline, quotes, glob characters and a
-        // non-UTF-8 byte: the names go to rsync through --files-from.
-        let names: [&[u8]; 4] = [
-            b"-dash and space.bin",
-            b"line\nbreak.bin",
-            b"quo'te \"x\" $(touch pwned) *.bin",
-            b"caf\xe9; rm -rf.bin",
-        ];
-        let mut w = world(&[]);
-        for (i, name) in names.iter().enumerate() {
-            let old = w.prev.join(OsStr::from_bytes(name));
-            fs::write(&old, format!("content-{i}")).unwrap();
-            set_mtime(&old, "2020-05-05 10:00:00");
-            let new = w.source.join("moved").join(OsStr::from_bytes(name));
-            fs::create_dir_all(new.parent().unwrap()).unwrap();
-            fs::write(&new, format!("content-{i}")).unwrap();
-            set_mtime(&new, "2020-05-05 10:00:00");
-            fs::set_permissions(&new, fs::metadata(&old).unwrap().permissions()).unwrap();
+        for cfg in remote_modes() {
+            // Spaces, a leading dash, a newline, quotes, glob characters and a
+            // non-UTF-8 byte: the names go to rsync through --files-from.
+            let names: [&[u8]; 4] = [
+                b"-dash and space.bin",
+                b"line\nbreak.bin",
+                b"quo'te \"x\" $(touch pwned) *.bin",
+                b"caf\xe9; rm -rf.bin",
+            ];
+            let mut w = world(&[]);
+            for (i, name) in names.iter().enumerate() {
+                let old = w.prev.join(OsStr::from_bytes(name));
+                fs::write(&old, format!("content-{i}")).unwrap();
+                set_mtime(&old, "2020-05-05 10:00:00");
+                let new = w.source.join("moved").join(OsStr::from_bytes(name));
+                fs::create_dir_all(new.parent().unwrap()).unwrap();
+                fs::write(&new, format!("content-{i}")).unwrap();
+                set_mtime(&new, "2020-05-05 10:00:00");
+                fs::set_permissions(&new, fs::metadata(&old).unwrap().permissions()).unwrap();
+            }
+            w.index.ensure_previous(None).unwrap();
+            w.index.ensure_previous(Some(&w.prev)).unwrap();
+
+            let (shadow, stats) = w.planned(&cfg, false);
+
+            let shadow = shadow.expect("shadow");
+            assert_eq!((stats.linked, stats.rejected), (4, 0), "{stats:?}");
+            for name in names {
+                assert_eq!(
+                    ino(&shadow.join("moved").join(OsStr::from_bytes(name))),
+                    ino(&w.prev.join(OsStr::from_bytes(name)))
+                );
+            }
+            assert!(!w.source.join("pwned").exists());
+            assert!(!Path::new("pwned").exists());
         }
-        w.index.ensure_previous(None).unwrap();
-        w.index.ensure_previous(Some(&w.prev)).unwrap();
+    }
 
-        let (shadow, stats) = w.planned(&hash_mode(), false);
+    // ---- remote hashes reported by rsync ----
 
+    #[test]
+    fn the_summary_line_says_what_was_reused_and_what_was_not() {
+        assert_eq!(Stats::default().summary(), None);
+        let stats = Stats {
+            linked: 5,
+            moved: 3,
+            renamed: 1,
+            copies: 1,
+            bytes_reused: 1_500_000_000,
+            rejected: 2,
+            bytes_hashed: 20_000_000,
+            ..Stats::default()
+        };
+        assert_eq!(
+            stats.summary().unwrap(),
+            "reused 5 files (3 moved, 1 renamed, 1 duplicate), 1.50 GB not copied again; \
+             2 look-alikes rejected; 20.0 MB read at the source to compare"
+        );
+        let fallback = Stats {
+            hash_fallback: Some("rsync too old".to_string()),
+            ..Stats::default()
+        };
+        assert_eq!(
+            fallback.summary().unwrap(),
+            "source hashes unavailable (rsync too old)"
+        );
+    }
+
+    #[test]
+    fn rsync_versions_and_hash_lines_are_parsed() {
+        assert_eq!(
+            parse_rsync_version("rsync  version 3.5.0  protocol version 32"),
+            Some((3, 5, 0))
+        );
+        assert_eq!(
+            parse_rsync_version("rsync  version 3.2.7pre1  protocol version 31"),
+            Some((3, 2, 7))
+        );
+        assert_eq!(parse_rsync_version("openrsync: protocol version 29"), None);
+        assert!((3, 2, 7) < MIN_RSYNC && (3, 5, 0) >= MIN_RSYNC);
+
+        assert_eq!(parse_perm(b"rw-r--r--"), Some(0o644));
+        assert_eq!(parse_perm(b"rwxr-xr-x"), Some(0o755));
+        assert_eq!(parse_perm(b"rwsr-sr-t"), Some(0o7755));
+        assert_eq!(parse_perm(b"rwSr-Sr-T"), Some(0o7644));
+        assert_eq!(parse_perm(b"rw-r--"), None);
+        assert_eq!(parse_perm(b"rw?r--r--"), None);
+
+        let sha1 = "da39a3ee5e6b4b0d3255bfef95601890afd80709";
+        let line = format!("{sha1}|12|rw-------|dir/odd|name.bin");
+        let (name, hashed) = parse_hash_line(line.as_bytes()).unwrap();
+        assert_eq!(name, b"dir/odd|name.bin");
+        assert_eq!(
+            (hashed.size, hashed.perm, hashed.hash.as_str()),
+            (12, 0o600, sha1)
+        );
+        // Directories and short checksums are not files with a hash.
+        assert!(
+            parse_hash_line(b"                                        |4096|rwxr-xr-x|d/")
+                .is_none()
+        );
+        assert!(parse_hash_line(b"abc|1|rw-------|x").is_none());
+    }
+
+    #[test]
+    fn a_look_alike_inside_a_moved_folder_is_not_linked_when_hashes_are_reported() {
+        let mut w = world(&[
+            ("album/a.flac", "audio-data-a"),
+            ("album/b.flac", "audio-data-b"),
+            ("album/c.flac", "audio-data-c"),
+            ("album/d.flac", "audio-data-d"),
+        ]);
+        fs::rename(w.source.join("album"), w.source.join("Music")).unwrap();
+        // Same size, name and time as the original, other content.
+        fs::write(w.source.join("Music/c.flac"), "audio-DATA-c").unwrap();
+        set_mtime(&w.source.join("Music/c.flac"), "2020-05-05 10:00:00");
+        fs::set_permissions(
+            w.source.join("Music/c.flac"),
+            fs::metadata(w.prev.join("album/c.flac"))
+                .unwrap()
+                .permissions(),
+        )
+        .unwrap();
+
+        // Trusting the folder takes the look-alike along.
+        let (_, stats) = w.planned(&tiers(None), false);
+        assert_eq!((stats.group_supported, stats.linked), (4, 4), "{stats:?}");
+
+        // Hashing every member does not.
+        let (shadow, stats) = w.planned(&settings(None), false);
         let shadow = shadow.expect("shadow");
-        assert_eq!((stats.linked, stats.rejected), (4, 0), "{stats:?}");
-        for name in names {
-            assert_eq!(
-                ino(&shadow.join("moved").join(OsStr::from_bytes(name))),
-                ino(&w.prev.join(OsStr::from_bytes(name)))
-            );
-        }
-        assert!(!w.source.join("pwned").exists());
-        assert!(!Path::new("pwned").exists());
+        assert_eq!(
+            (
+                stats.group_supported,
+                stats.linked,
+                stats.rejected,
+                stats.verified
+            ),
+            (0, 3, 1, 3),
+            "{stats:?}"
+        );
+        assert!(!shadow.join("Music/c.flac").exists());
+        assert_eq!(stats.bytes_hashed, 48);
+    }
+
+    #[test]
+    fn a_file_above_the_size_limit_is_not_offered_when_hashes_are_reported() {
+        let mut w = world(&[("big.bin", "this file counts as huge here")]);
+        fs::rename(w.source.join("big.bin"), w.source.join("renamed.bin")).unwrap();
+        let mut cfg = settings(Some("auto"));
+        cfg.hash_max_size = 5;
+
+        let (shadow, stats) = w.planned(&cfg, false);
+
+        assert!(shadow.is_none());
+        assert_eq!(
+            (stats.linked, stats.skipped_large, stats.bytes_hashed),
+            (0, 1, 0)
+        );
+        // The explicit weakest setting still trusts it.
+        cfg.verify = Verify::SizeMtime;
+        let (shadow, stats) = w.planned(&cfg, false);
+        assert!(shadow.is_some());
+        assert_eq!(stats.linked, 1);
+    }
+
+    #[test]
+    fn only_files_that_could_match_are_read() {
+        // Nothing of this size existed before, so nothing is hashed.
+        let mut w = world(&[("keep.bin", "alpha-data")]);
+        write(
+            &w.source.join("brand-new.bin"),
+            "a completely different length",
+        );
+
+        let (shadow, stats) = w.planned(&settings(None), false);
+
+        assert!(shadow.is_none());
+        assert_eq!((stats.new_files, stats.bytes_hashed), (1, 0), "{stats:?}");
+        assert!(!w.dest.join(format!("{}.list", RELOC_NAME)).exists());
+        assert!(!w.dest.join(EMPTY_NAME).exists());
     }
 
     #[test]

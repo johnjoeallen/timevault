@@ -85,6 +85,7 @@ pub fn run_enroll(config_path: &Path, disk_id: Option<&str>, args: DiskAddArgs) 
     mount_device(&device, &mountpoint, "rw,nodev,nosuid,noexec")?;
     let guard = MountGuard::new(mountpoint.clone(), false);
 
+    let _ = crate::disk::identity::migrate_layout(&mountpoint);
     let identity_file = identity_path(&mountpoint);
     let (disk_id_raw, existing_identity) = if identity_file.exists() {
         let identity = read_identity(&identity_file)?;
@@ -566,6 +567,7 @@ pub fn run_rename(config_path: &Path, args: crate::cli::args::DiskRenameArgs) ->
                     .unwrap_or_else(|| "/run/timevault/mounts".to_string()),
             );
             let (guard, mountpoint) = mount_disk_guarded(&disk, &mount_base, &options)?;
+            let _ = crate::disk::identity::migrate_layout(&mountpoint);
             let identity_file = identity_path(&mountpoint);
             let identity = if identity_file.exists() {
                 read_identity(&identity_file)?
@@ -620,6 +622,7 @@ pub fn run_rename(config_path: &Path, args: crate::cli::args::DiskRenameArgs) ->
     let mountpoint = create_temp_dir(&mount_base, "rename")?;
     mount_device(&device, &mountpoint, DEFAULT_BACKUP_MOUNT_OPTS)?;
     let guard = MountGuard::new(mountpoint.clone(), true);
+    let _ = crate::disk::identity::migrate_layout(&mountpoint);
     let identity_file = identity_path(&mountpoint);
     let identity = if identity_file.exists() {
         read_identity(&identity_file)?

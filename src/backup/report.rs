@@ -28,6 +28,8 @@ pub struct BackupJobReport {
     pub failure_reason: Option<String>,
     pub power: Option<String>,
     pub power_diagnostics: Option<String>,
+    /// What moved-file detection did for this job, when it did anything.
+    pub relocation: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,6 +125,22 @@ pub fn render_markdown(reports: &[BackupRunReport]) -> String {
             ));
         }
         body.push('\n');
+        let reuse: Vec<_> = report
+            .jobs
+            .iter()
+            .filter(|job| job.relocation.is_some())
+            .collect();
+        if !reuse.is_empty() {
+            body.push_str("Moved-file reuse:\n\n");
+            for job in reuse {
+                body.push_str(&format!(
+                    "- {}: {}\n",
+                    escape_markdown(job_display_name(job)),
+                    escape_markdown(job.relocation.as_deref().unwrap_or(""))
+                ));
+            }
+            body.push('\n');
+        }
     }
 
     body
@@ -240,6 +258,23 @@ pub fn render_html(reports: &[BackupRunReport]) -> String {
             body.push_str("</tr>");
         }
         body.push_str("</tbody></table>");
+        let reuse_jobs: Vec<_> = report
+            .jobs
+            .iter()
+            .filter(|job| job.relocation.is_some())
+            .collect();
+        if !reuse_jobs.is_empty() {
+            body.push_str("<h3 style=\"font-size:15px; margin:16px 0 8px; color:#334155;\">Moved-file reuse</h3>");
+            body.push_str("<div style=\"background:#f8fafc; border:1px solid #d8e2ea; padding:10px 12px; margin-bottom:18px; font-size:13px; line-height:1.55;\">");
+            for job in reuse_jobs {
+                body.push_str(&format!(
+                    "<strong>{}</strong>: {}<br>",
+                    escape_html(job_display_name(job)),
+                    escape_html(job.relocation.as_deref().unwrap_or(""))
+                ));
+            }
+            body.push_str("</div>");
+        }
         let diagnostic_jobs: Vec<_> = report
             .jobs
             .iter()
@@ -562,6 +597,9 @@ mod tests {
                 power_diagnostics: Some(
                     "Found state: powered off\nChecks completed: ping, SSH readiness".to_string(),
                 ),
+                relocation: Some(
+                    "reused 2 files (2 moved), 10.0 MB not copied again <ok>".to_string(),
+                ),
             }],
         }]);
 
@@ -574,6 +612,29 @@ mod tests {
         assert!(html.contains("Found powered off &lt;by WOL&gt;"));
         assert!(html.contains("Power diagnostics"));
         assert!(html.contains("Checks completed"));
+        assert!(html.contains("Moved-file reuse"));
+        assert!(html.contains("2 moved), 10.0 MB not copied again &lt;ok&gt;"));
+        assert!(render_markdown(&[BackupRunReport {
+            disk_id: "d".to_string(),
+            mountpoint: "/m".to_string(),
+            started_at: now,
+            finished_at: now,
+            jobs: vec![BackupJobReport {
+                name: "j".to_string(),
+                description: None,
+                source: "/s".to_string(),
+                destination: "/d".to_string(),
+                backup_day: "20260601".to_string(),
+                status: BackupJobStatus::Success,
+                attempts: 1,
+                rsync_code: Some(0),
+                failure_reason: None,
+                power: None,
+                power_diagnostics: None,
+                relocation: Some("reused 1 files".to_string()),
+            }],
+        }])
+        .contains("Moved-file reuse:\n\n- j: reused 1 files"));
         assert!(html.contains("background:#0f766e"));
         assert!(html.contains("background:#dcfce7"));
         assert!(html.contains("<table"));
@@ -599,6 +660,7 @@ mod tests {
                 failure_reason: Some("rsync failed: No space left on device".to_string()),
                 power: None,
                 power_diagnostics: None,
+                relocation: None,
             }],
         };
 

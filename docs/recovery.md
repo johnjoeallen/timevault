@@ -60,7 +60,7 @@ Cascade note: if the primary stage failed for a job, downstream disks skip that 
 ## Replace a failed backup disk
 
 1. Remove the failed disk from the config: `sudo timevault disk unregister <old-id>`.
-2. Enroll the replacement: `sudo timevault disk register <new-id> --fs-uuid <uuid>`. Registering writes the `.timevault` identity file and requires a clean filesystem (or `--force`).
+2. Enroll the replacement: `sudo timevault disk register <new-id> --fs-uuid <uuid>`. Registering writes the identity into `.timevault/identity` and requires a clean filesystem (or `--force`).
 3. Run the backup. The new disk has no history, so each job starts with a full initial backup from the source (or from the primary's `current` if cascade is on).
 
 The replacement starts with a single generation. Older generations live only on your other disks.
@@ -75,9 +75,9 @@ Timevault never deletes completed generations to make room. See [Out of space](r
 
 ## Missing or corrupt file index
 
-The file index (`.timevault-index/file-index.sqlite`, kept while moved-file detection is on, which it is by default, or when `options.index: true` is set) is never needed to restore: mount the disk and copy from the generations as usual.
+The file index (`.timevault/index/file-index.sqlite`, kept while moved-file detection is on, which it is by default, or when `options.index: true` is set) is never needed to restore: mount the disk and copy from the generations as usual.
 
-If the index is missing, stale, or from an interrupted run, no action is needed. The next backup rebuilds it from the generations on that disk (a log line says `file index: rebuilt from the previous generation`). If the database is corrupt or not a database at all, Timevault moves it aside as `file-index.sqlite.corrupt-<n>` (only the newest is kept), creates a new one and rebuilds. You can also delete the whole `.timevault-index` directory yourself; nothing else depends on it. If the index belongs to a newer Timevault than the one running, it is left untouched, a warning is printed and the backup runs without it.
+If the index is missing, stale, or from an interrupted run, no action is needed. The next backup rebuilds it from the generations on that disk (a log line says `file index: rebuilt from the previous generation`). If the database is corrupt or not a database at all, Timevault moves it aside as `file-index.sqlite.corrupt-<n>` (only the newest is kept), creates a new one and rebuilds. You can also delete the `.timevault/index` directory yourself; nothing else depends on it. If the index belongs to a newer Timevault than the one running, it is left untouched, a warning is printed and the backup runs without it.
 
 ## Check that a disk is healthy
 

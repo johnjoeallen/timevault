@@ -256,6 +256,7 @@ fn run_backup_job(
             failure_reason: None,
             power: None,
             power_diagnostics: None,
+            relocation: None,
         });
     }
 
@@ -344,6 +345,7 @@ fn run_backup_job(
                 )),
                 power: power_report.as_ref().map(|report| report.summary.clone()),
                 power_diagnostics: power_report.map(|report| report.diagnostics),
+                relocation: None,
             });
         }
     }
@@ -378,6 +380,7 @@ fn run_backup_job(
                 )),
                 power: power_report.as_ref().map(|report| report.summary.clone()),
                 power_diagnostics: power_report.map(|report| report.diagnostics),
+                relocation: None,
             });
         }
     }
@@ -429,6 +432,7 @@ fn run_backup_job(
         rc,
         attempts,
         stderr: rsync_stderr,
+        relocation: relocation_summary,
     } = sync;
     let rsync_ok = rc == 0 || rc == 24;
     let mut failure_reason = if rsync_ok {
@@ -517,6 +521,7 @@ fn run_backup_job(
         failure_reason,
         power: power_report.as_ref().map(|report| report.summary.clone()),
         power_diagnostics: power_report.map(|report| report.diagnostics),
+        relocation: relocation_summary,
     })
 }
 
@@ -577,6 +582,7 @@ fn check_existing_target(
         failure_reason: Some(reason),
         power: None,
         power_diagnostics: None,
+        relocation: None,
     }))
 }
 
@@ -606,6 +612,7 @@ fn failed_job_report(
         failure_reason: Some(failure_reason),
         power: None,
         power_diagnostics: None,
+        relocation: None,
     }
 }
 
@@ -627,6 +634,7 @@ fn offline_job_report(
         failure_reason: Some(reason),
         power: None,
         power_diagnostics: None,
+        relocation: None,
     }
 }
 
@@ -648,6 +656,7 @@ fn skipped_job_report(
         failure_reason: Some(reason),
         power: None,
         power_diagnostics: None,
+        relocation: None,
     }
 }
 
@@ -3100,15 +3109,17 @@ fn plan_relocation(
     cfg: &relocation::RelocationConfig,
     run_mode: RunMode,
     file_index: &mut index::Session,
-) -> Option<PathBuf> {
+) -> (Option<PathBuf>, Option<String>) {
     // An initial backup has no previous generation to take data from.
-    let prev_root = prev_root?;
+    let Some(prev_root) = prev_root else {
+        return (None, None);
+    };
     if run_mode.dry_run {
         crate::pnote!(
             "{}: dry-run: would look for moved or renamed files",
             job.name
         );
-        return None;
+        return (None, None);
     }
     let local_root = local_source_root(&job.source);
     let request = relocation::Prepare {
@@ -3125,7 +3136,10 @@ fn plan_relocation(
             "{}: moved-file detection skipped: the file index is unavailable",
             job.name
         );
-        return None;
+        return (
+            None,
+            Some("skipped: the file index is unavailable".to_string()),
+        );
     };
     crate::progress::status(format!("{}: looking for moved files", job.name));
     match relocation::prepare(&request, index) {
@@ -3144,15 +3158,22 @@ fn plan_relocation(
                     stats.bytes_reused
                 );
             }
-            shadow
+            if let Some(reason) = &stats.hash_fallback {
+                crate::pnote!(
+                    "{}: the source's checksums could not be used ({}); weaker evidence was used instead",
+                    job.name,
+                    reason
+                );
+            }
+            (shadow, stats.summary())
         }
         Ok(relocation::Outcome::Skipped(reason)) => {
             crate::pnote!("{}: moved-file detection skipped: {}", job.name, reason);
-            None
+            (None, Some(format!("skipped: {}", reason)))
         }
         Err(err) => {
             file_index.disable("moved-file detection", err);
-            None
+            (None, None)
         }
     }
 }
@@ -3245,6 +3266,8 @@ struct SyncOutcome {
     rc: i32,
     attempts: usize,
     stderr: String,
+    /// What moved-file detection did, for the report.
+    relocation: Option<String>,
 }
 
 /// Build the next generation in staging with `rsync --link-dest` against the
@@ -3289,8 +3312,9 @@ fn sync_generation(
     file_index.prepare(link_dests.first().map(PathBuf::as_path));
     let staging = generation::prepare_staging(dest, !link_dests.is_empty(), run_mode)?;
     let mut rsync_dests = link_dests.clone();
+    let mut relocation_summary = None;
     if relocation.enabled {
-        rsync_dests.extend(plan_relocation(
+        let (shadow, summary) = plan_relocation(
             job,
             dest,
             excludes_file,
@@ -3299,7 +3323,9 @@ fn sync_generation(
             &relocation,
             run_mode,
             &mut file_index,
-        ));
+        );
+        rsync_dests.extend(shadow);
+        relocation_summary = summary;
     }
 
     let mut rc = 1;
@@ -3365,6 +3391,7 @@ fn sync_generation(
         rc,
         attempts,
         stderr: rsync_stderr,
+        relocation: relocation_summary,
     })
 }
 
@@ -6223,9 +6250,13 @@ mod tests {
 
         fs::create_dir_all(f.source.join("archive")).unwrap();
         fs::rename(f.source.join("photos"), f.source.join("archive/2020")).unwrap();
-        assert_eq!(
-            f.run_reloc("20260102", reloc_on()).status,
-            BackupJobStatus::Success
+        let report = f.run_reloc("20260102", reloc_on());
+        assert_eq!(report.status, BackupJobStatus::Success);
+        // The report says what was reused, for the emailed summary.
+        let summary = report.relocation.expect("a relocation summary");
+        assert!(
+            summary.starts_with("reused 40 files (40 moved)"),
+            "{summary}"
         );
 
         assert_all_share_inodes(&f, "photos", "archive/2020", 40);

@@ -1,6 +1,6 @@
 # Remote content hashing for moved-file detection
 
-**Status: designed and probed, not implemented.** This note records the problem, what was tested, the proposed design and the open decisions. It extends [Reusing moved and renamed files](relocation.md).
+**Status: implemented in 1.20.0.** This note records the problem, what was tested, the design as built, the decisions taken and what is left. It extends [Reusing moved and renamed files](relocation.md).
 
 ## The problem, stated precisely
 
@@ -12,7 +12,7 @@ To reuse a moved or renamed file, Timevault must decide that a new file at the s
 
 So proving a pairing, for lone files, folders, ambiguous groups or copies alike, needs the **content hash of the remote file**. With a local source Timevault reads the file itself. With a remote source something has to read it on the remote host and report a hash.
 
-## What 1.19.0 does without remote hashes
+## What 1.19.0 did without remote hashes (now the fallback)
 
 | Case | Treatment | Proof? |
 |---|---|---|
@@ -23,7 +23,7 @@ So proving a pairing, for lone files, folders, ambiguous groups or copies alike,
 | Ambiguous groups (many files with the same size and mtime) | Not paired | n/a |
 | Copies (old file still exists) | Not detected for remote sources | n/a |
 
-Pairwise `rsync -c` is a yes/no answer for one proposed pair. It cannot choose among candidates, so ambiguous groups would need on the order of N x N guesses, and it cannot find copies at all.
+These tiers remain as the fallback when the source's rsync cannot report checksums (see [Requirements](#requirements-and-how-to-check-a-remote-host)). Pairwise `rsync -c` is a yes/no answer for one proposed pair. It cannot choose among candidates, so ambiguous groups would need on the order of N x N guesses, and it cannot find copies at all.
 
 ## Finding: rsync can report remote hashes, so no script is needed
 
@@ -44,39 +44,38 @@ Probed with rsync 3.5.0 (checksum algorithms: xxh128, xxh3, xxh64, md5, md4, sha
 
 The command is read-only, touches nothing on the remote, and the list of files is data, not a command line.
 
-## Proposed design
+## Design as built
 
-1. **Choose candidates.** From the dry run, take the new files whose size equals that of at least one old file (vanished or still present). Everything else cannot match and is never read. Apply `minSize` and `hashMaxSize` as today, plus a total byte budget.
-2. **Hash the new files remotely.** One rsync run of the form above, with an explicit algorithm (`sha1` if both ends support it, otherwise `md5`). Parse `%C`, size and `%B` per file; ignore files without a checksum.
-3. **Hash the old candidates locally with the same algorithm.** The same rsync form run over the previous generation, or a stored value in the file index under an algorithm name such as `rsync-sha1` (the index key already includes the algorithm). The algorithm must match, so rsync does both sides.
-4. **Match by size and hash.** Linear in the number of files, however many share a size and mtime. Many-to-many is fine: a copy and its original both map to the same old data. Prefer the same name, then the first path.
-5. **Check attributes before offering.** Remote permission bits against the old file's mode; rsync still compares everything it preserves when it decides whether to link.
-6. **Offer through the scratch directory as today.** Only content-proven pairings are linked.
-7. **Fall back safely.** Probe once per run with a tiny request. If the remote rsync rejects `--cc`, or the output has no checksum, use the current tiers.
+1. **Choose candidates.** From the dry run, take the new files whose size equals that of at least one old file (vanished or still present) and is within `hashMaxSize`. Everything else cannot match and is never read. A total of 32 GiB of new files is read per run at most; the rest are left to rsync.
+2. **Hash the new files at the source.** One rsync run (`-n -c --checksum-choice=sha1 --from0 --files-from=LIST --out-format='%C|%l|%B|%n'`) against an empty directory. Each line gives a SHA-1, the size and the permission bits. A file whose size differs from the dry run's (it changed meanwhile) is dropped.
+3. **Hash the old candidates locally with the same algorithm**, by the same rsync run over the previous generation, for the old files of the sizes that remain.
+4. **Match by size and checksum.** Linear in the number of files, however many share a size and mtime. Many-to-many is fine: a copy and its original both map to the same old data. Among equal old files the order of preference is a vanished file of the same name, any vanished file, a file of the same name, then the first path. The permission bits must equal the old file's, so a permission change is copied instead of linked.
+5. **Offer through the scratch directory as before.** Only content-proven pairings are linked, and rsync still compares everything it preserves when it decides whether to link.
+6. **Fall back safely.** The local rsync's version is checked (`rsync --version`, 3.5.0 or newer). The source's version cannot be read over rsync's connection, so it is judged by whether it answers: an error, or no checksum in the output, means "unavailable". The reason is logged and shown in the report, and the earlier tiers are used for that job and that run.
 
-### What it would change
+### What changed
 
-| Case | After |
-|---|---|
-| Lone pairing | Content-proven by hash, like a local source |
-| Folder move | Every member proven (reads the moved files on the remote disk), or the cap decides |
-| File above `hashMaxSize` | Not offered unless the cap is raised, or the explicit `size-mtime` setting is chosen |
-| Ambiguous groups, such as 20,000 uniform files renamed | Recovered: 40,000 hashes instead of 20,000 x 20,000 guesses |
-| Copies of files that still exist | Detected |
-| `verify: size-mtime` | The only setting that trusts size and mtime |
+| Case | Before (1.19.0) | Now |
+|---|---|---|
+| Lone pairing | Confirmed by pairwise `rsync -c` | Content-proven by checksum, like a local source |
+| Folder move | Trusted as a group | Every member read and proven |
+| File above `hashMaxSize` | Accepted as a unique move | Not offered unless the limit is raised, or `verify: size-mtime` is chosen |
+| Ambiguous groups, such as 20,000 uniform files renamed | Left to rsync | Recovered, with 40,000 hashes instead of 20,000 x 20,000 guesses |
+| Copies of files that still exist | Not detected | Detected |
+| `verify: size-mtime` | Trusts everything | The only setting that trusts size and mtime |
 
-Cost: the remote host reads each candidate file once (its disk, not the network; only checksums cross the link), plus the local read of the old file once, which the index can cache. A 20,000-file uniform rename of 4 KiB files is about 80 MB of remote reads.
+Measured over loopback SSH (20,000 files of about 4 KiB, release build): a mass rename of identical-size files now copies 5.2 MiB instead of 157 MiB, in 3.99 s against 0.75 s for a plain run that copies everything; a moved folder takes 3.11 s (it was 2.56 s when trusted as a group) and also copies 5.8 MiB. The extra time is the source host reading about 80 MB once and the local disk reading the same again.
 
 ## Requirements and how to check a remote host
 
-- A recent rsync on **both** ends. `--checksum-choice` arrived in rsync 3.2.0; the exact minimum for `%C` still has to be confirmed when this is implemented, because the probes above used 3.5.0 on both ends. Older rsync versions may refuse the option or print no usable checksum, and many distribution packages are older, so check before relying on it.
+- **rsync 3.5.0 or newer on both ends.** This is the version the probes above were run with, on both the local and the remote side, so it is the minimum that has been shown to work. `--checksum-choice` only arrived in 3.2.0 and nothing older than 3.5.0 was tested for `%C`, so the minimum is deliberately not lowered on a guess; it can be lowered once an older release has been tested. The local version is enforced. The remote version is not read, because rsync does not tell a client the version of its peer; the remote is accepted if it answers with checksums. Many distribution packages are older, so check the remote host (`rsync --version`).
 - Quick check from the Timevault host, against any readable file on the remote:
 
 ```
 rsync -n -c --cc=sha1 --out-format='%C|%n' user@host:/etc/hostname /tmp/
 ```
 
-A 40-character hex value before the `|` (the SHA-1 of that file) means it works; the same command was run locally and over SSH and matched `sha1sum`. An error such as `unknown checksum name`, or an empty value, means the remote rsync is too old.
+A 40-character hex value before the `|` (the SHA-1 of that file) means it works; the same command was run locally and over SSH and matched `sha1sum`. An error such as `unknown checksum name`, or an empty value, means the remote rsync is older than the minimum, and Timevault will use the weaker tiers for that source.
 
 ## Alternatives considered
 
@@ -84,20 +83,20 @@ A 40-character hex value before the `|` (the SHA-1 of that file) means it works;
 |---|---|
 | Trust size and mtime when the pairing is unique | Not proof; a look-alike is accepted silently |
 | Sample the first and last bytes of a file | rsync cannot read byte ranges, so it needs a remote command; weak on templated and structured files |
-| An `ssh ... sha256sum` helper script run as root | Works on any rsync version, but adds remote code, scratch files and shell parsing of names. It remains the fallback for remotes with an old rsync, if that ever matters |
+| An `ssh ... sha256sum` helper script run as root | Works on any rsync version, but adds remote code, scratch files and shell parsing of names. It remains an option for remotes with an old rsync, if that ever matters |
 | Pairwise `rsync -c` in rounds | Quadratic on ambiguous groups; cannot find copies |
 
-## Open decisions
+## Decisions
 
-1. **Default algorithm.** `sha1` where available (stronger), `md5` otherwise. `xxh128` is faster but not cryptographic; reads are disk-bound either way.
-2. **Byte budget and timeout.** A total number of bytes to hash per run, in addition to `hashMaxSize` per file and the planning time limit.
-3. **Behaviour when the remote rsync is too old.** Keep today's tiers (recommended), or require `verify: size-mtime` to be chosen explicitly.
-4. **Folder moves.** Hash every member (proof, more remote reads) or a sample (cheaper, still not proof).
-5. **Caching.** Store the rsync checksum of old files in the file index so they are read once.
+1. **Algorithm: SHA-1**, the strongest of the algorithms in rsync 3.5.0 that is also easy to verify with `sha1sum`. It is used to tell files apart, not to defend against a hostile source; reads are disk-bound whichever algorithm is used. A failure of the request falls back to the earlier tiers, so there is no per-source algorithm choice.
+2. **Budget: `hashMaxSize` per file (existing) and 32 GiB of new files per run (fixed), plus `timeoutSeconds`.** Not configurable yet.
+3. **Old remote rsync: keep the earlier tiers** and say so in the log and the report. Requiring `verify: size-mtime` to be chosen explicitly was rejected as a regression for users with an old remote.
+4. **Folder moves: every member is hashed.** A sample would be cheaper but is not proof.
+5. **Caching: not done.** The old files are hashed with rsync each run, because rsync's SHA-1 is not the index's SHA-256 and the index key would need the algorithm. Storing the checksum in the index (the key already includes the algorithm name) would remove the local reads on later runs.
 
-## Implementation plan
+## Left to do
 
-1. Capability probe and the hash request/parse (`%C|%l|%B|%n`), with the hostile-file-name tests used for the existing confirmation step.
-2. Local hashing of old candidates through the same mechanism, cached in the index.
-3. Matching by size and hash for remote sources, replacing the unverified tiers.
-4. Documentation: update the trust tables, remove the "folder move" and "huge file" exceptions, and record the measured cost.
+- Cache the rsync checksums of old files in the file index.
+- Make the per-run byte budget configurable.
+- Measure over a real network, on spinning disks and on trees of millions of files.
+- Lower the minimum rsync version after testing 3.2.x.

@@ -1,7 +1,7 @@
 //! Disk-local file index.
 //!
 //! Each backup disk keeps its own SQLite database at
-//! `<disk>/.timevault-index/file-index.sqlite`. It describes, per job, the
+//! `<disk>/.timevault/index/file-index.sqlite`. It describes, per job, the
 //! files of two generations: the **previous** one (the last completed
 //! generation, used as the reference) and the **current** one (the generation
 //! being built). Paths are relative to the generation, never absolute, so the
@@ -32,9 +32,9 @@ use sha2::{Digest, Sha256};
 use crate::backup::generation::{marker_token, COMPLETE_MARKER};
 use crate::types::RunMode;
 
-pub const INDEX_DIR: &str = ".timevault-index";
+pub const INDEX_DIR: &str = ".timevault/index";
 pub const INDEX_FILE: &str = "file-index.sqlite";
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 pub const HASH_ALGO: &str = "sha256";
 pub const HASH_VERSION: i64 = 1;
 
@@ -143,6 +143,10 @@ pub struct Stats {
 pub struct DiskIndex {
     conn: Connection,
     job: String,
+    /// Which of the two row sets (`"a"` or `"b"`) holds the previous
+    /// generation; the other is the current one. Publishing swaps them
+    /// instead of rewriting every row.
+    previous_slot: &'static str,
     /// Contents hashed by this handle (for tests and diagnostics).
     pub hashes_computed: u64,
 }
@@ -184,27 +188,61 @@ pub fn quarantine(disk_root: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Bring a database made by an older release up to the current layout. The
+/// file and generation rows only mirror what is on the disk, so they are simply
+/// dropped and rebuilt; the cached hashes are kept.
+fn migrate(conn: &Connection) -> IResult<()> {
+    let has_meta: bool = conn.query_row(
+        "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = 'meta'",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_meta {
+        return Ok(());
+    }
+    let version: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if version.as_deref() != Some("1") {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "BEGIN IMMEDIATE;
+         DROP TABLE IF EXISTS files;
+         DROP TABLE IF EXISTS generations;
+         UPDATE meta SET value = '2' WHERE key = 'schema_version' AND value = '1';
+         COMMIT;",
+    )?;
+    Ok(())
+}
+
 fn setup(conn: &Connection) -> IResult<()> {
     conn.busy_timeout(BUSY_TIMEOUT)?;
     // WAL lets parallel jobs share one disk's database; if the filesystem
     // refuses it the default journal still works, just serialises more.
     let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
+    migrate(conn)?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS meta(
              key TEXT PRIMARY KEY, value TEXT NOT NULL);
          CREATE TABLE IF NOT EXISTS generations(
-             job TEXT NOT NULL, role TEXT NOT NULL, generation TEXT NOT NULL,
+             job TEXT NOT NULL, role TEXT NOT NULL, slot TEXT NOT NULL,
+             generation TEXT NOT NULL,
              marker_token TEXT NOT NULL, file_count INTEGER NOT NULL,
              updated_at INTEGER NOT NULL, PRIMARY KEY(job, role));
          CREATE TABLE IF NOT EXISTS files(
-             job TEXT NOT NULL, role TEXT NOT NULL, path BLOB NOT NULL,
+             job TEXT NOT NULL, slot TEXT NOT NULL, path BLOB NOT NULL,
              name BLOB NOT NULL, kind TEXT NOT NULL, size INTEGER NOT NULL,
              mtime_ns INTEGER NOT NULL, dev INTEGER NOT NULL, ino INTEGER NOT NULL,
              nlink INTEGER NOT NULL, mode INTEGER NOT NULL, uid INTEGER NOT NULL,
-             gid INTEGER NOT NULL, PRIMARY KEY(job, role, path)) WITHOUT ROWID;
-         CREATE INDEX IF NOT EXISTS files_name_size ON files(job, role, name, size);
-         CREATE INDEX IF NOT EXISTS files_size ON files(job, role, size);
+             gid INTEGER NOT NULL, PRIMARY KEY(job, slot, path)) WITHOUT ROWID;
+         CREATE INDEX IF NOT EXISTS files_name_size ON files(job, slot, name, size);
+         CREATE INDEX IF NOT EXISTS files_size ON files(job, slot, size);
          CREATE INDEX IF NOT EXISTS files_inode ON files(ino, size, mtime_ns);
          CREATE TABLE IF NOT EXISTS hashes(
              ino INTEGER NOT NULL, size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL,
@@ -271,8 +309,11 @@ fn scan_tree(root: &Path, mut visit: impl FnMut(&Scanned) -> IResult<()>) -> IRe
             }
             Err(err) => return Err(err.into()),
         };
+        // In name order, so rows reach the database in nearly key order.
+        let mut entries = entries.collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        let mut subdirs = Vec::new();
         for entry in entries {
-            let entry = entry?;
             let name = entry.file_name();
             if rel_dir.as_os_str().is_empty() && (name == COMPLETE_MARKER || name == MARKER_TMP) {
                 continue;
@@ -284,7 +325,7 @@ fn scan_tree(root: &Path, mut visit: impl FnMut(&Scanned) -> IResult<()>) -> IRe
             };
             let rel = rel_dir.join(&name);
             let kind = if meta.is_dir() {
-                stack.push(rel);
+                subdirs.push(rel);
                 continue;
             } else if meta.file_type().is_symlink() {
                 'l'
@@ -308,6 +349,8 @@ fn scan_tree(root: &Path, mut visit: impl FnMut(&Scanned) -> IResult<()>) -> IRe
             })?;
             count += 1;
         }
+        // The stack is last-in first-out: push in reverse to visit in order.
+        stack.extend(subdirs.into_iter().rev());
     }
     Ok(count)
 }
@@ -336,6 +379,7 @@ impl DiskIndex {
     /// Open (creating if needed) the index for `job` on the disk at
     /// `disk_root`. A corrupt database is set aside and replaced.
     pub fn open(disk_root: &Path, job: &str) -> IResult<Self> {
+        let _ = crate::disk::identity::migrate_layout(disk_root);
         fs::create_dir_all(disk_root.join(INDEX_DIR))?;
         let path = index_path(disk_root);
         let conn = match Self::connect(&path) {
@@ -346,11 +390,37 @@ impl DiskIndex {
             }
             Err(err) => return Err(err),
         };
-        Ok(DiskIndex {
+        let mut index = DiskIndex {
             conn,
             job: job.to_string(),
+            previous_slot: "a",
             hashes_computed: 0,
-        })
+        };
+        index.previous_slot = match index.stored_slot(Role::Previous)?.as_deref() {
+            Some("b") => "b",
+            _ => "a",
+        };
+        Ok(index)
+    }
+
+    fn stored_slot(&self, role: Role) -> IResult<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT slot FROM generations WHERE job = ?1 AND role = ?2",
+                params![self.job, role.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// The row set that holds `role`'s files.
+    fn slot(&self, role: Role) -> &'static str {
+        match (role, self.previous_slot) {
+            (Role::Previous, slot) => slot,
+            (Role::Current, "a") => "b",
+            (Role::Current, _) => "a",
+        }
     }
 
     /// Open and prepare the database. Switching a fresh database to WAL can
@@ -391,9 +461,14 @@ impl DiskIndex {
     }
 
     pub fn count_files(&self, role: Role) -> IResult<u64> {
+        // Publishing leaves the replaced rows in the slot that becomes
+        // "current" until the next run clears it; they are not current rows.
+        if role == Role::Current && self.generation_row(Role::Current)?.is_none() {
+            return Ok(0);
+        }
         Ok(self.conn.query_row(
-            "SELECT COUNT(*) FROM files WHERE job = ?1 AND role = ?2",
-            params![self.job, role.as_str()],
+            "SELECT COUNT(*) FROM files WHERE job = ?1 AND slot = ?2",
+            params![self.job, self.slot(role)],
             |row| row.get::<_, i64>(0),
         )? as u64)
     }
@@ -413,23 +488,24 @@ impl DiskIndex {
     /// Replace `role`'s rows for this job with a scan of `root`.
     fn load(&mut self, role: Role, root: &Path, generation: &str, token: &str) -> IResult<u64> {
         let job = self.job.clone();
+        let slot = self.slot(role);
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute(
-            "DELETE FROM files WHERE job = ?1 AND role = ?2",
-            params![job, role.as_str()],
+            "DELETE FROM files WHERE job = ?1 AND slot = ?2",
+            params![job, slot],
         )?;
         let count = {
             let mut insert = tx.prepare(
-                "INSERT OR REPLACE INTO files(job, role, path, name, kind, size, mtime_ns,
+                "INSERT OR REPLACE INTO files(job, slot, path, name, kind, size, mtime_ns,
                      dev, ino, nlink, mode, uid, gid)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             )?;
             scan_tree(root, |f| {
                 insert.execute(params![
                     job,
-                    role.as_str(),
+                    slot,
                     f.rel,
                     f.name,
                     f.kind.to_string(),
@@ -446,11 +522,12 @@ impl DiskIndex {
             })?
         };
         tx.execute(
-            "INSERT OR REPLACE INTO generations(job, role, generation, marker_token,
-                 file_count, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT OR REPLACE INTO generations(job, role, slot, generation, marker_token,
+                 file_count, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 job,
                 role.as_str(),
+                slot,
                 generation,
                 token,
                 count as i64,
@@ -467,12 +544,13 @@ impl DiskIndex {
     /// the file count it recorded; otherwise it is rebuilt from the disk.
     pub fn ensure_previous(&mut self, base: Option<&Path>) -> IResult<PreviousState> {
         let Some(base) = base else {
+            let slot = self.slot(Role::Previous);
             let tx = self
                 .conn
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             tx.execute(
-                "DELETE FROM files WHERE job = ?1 AND role = 'previous'",
-                params![self.job],
+                "DELETE FROM files WHERE job = ?1 AND slot = ?2",
+                params![self.job, slot],
             )?;
             tx.execute(
                 "DELETE FROM generations WHERE job = ?1 AND role = 'previous'",
@@ -500,12 +578,13 @@ impl DiskIndex {
 
     /// Discard any "current" rows left by an earlier, unfinished run.
     pub fn begin_current(&mut self) -> IResult<()> {
+        let slot = self.slot(Role::Current);
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute(
-            "DELETE FROM files WHERE job = ?1 AND role = 'current'",
-            params![self.job],
+            "DELETE FROM files WHERE job = ?1 AND slot = ?2",
+            params![self.job, slot],
         )?;
         tx.execute(
             "DELETE FROM generations WHERE job = ?1 AND role = 'current'",
@@ -534,14 +613,8 @@ impl DiskIndex {
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        tx.execute(
-            "DELETE FROM files WHERE job = ?1 AND role = 'previous'",
-            params![self.job],
-        )?;
-        tx.execute(
-            "UPDATE files SET role = 'previous' WHERE job = ?1 AND role = 'current'",
-            params![self.job],
-        )?;
+        // The current rows become the previous ones by swapping the slots; the
+        // replaced rows are cleared when the next run starts filling their slot.
         tx.execute(
             "DELETE FROM generations WHERE job = ?1 AND role = 'previous'",
             params![self.job],
@@ -559,6 +632,7 @@ impl DiskIndex {
             [],
         )?;
         tx.commit()?;
+        self.previous_slot = self.slot(Role::Current);
         Ok(())
     }
 
@@ -569,9 +643,9 @@ impl DiskIndex {
             .conn
             .query_row(
                 &format!(
-                    "SELECT {RECORD_COLUMNS} FROM files WHERE job = ?1 AND role = ?2 AND path = ?3"
+                    "SELECT {RECORD_COLUMNS} FROM files WHERE job = ?1 AND slot = ?2 AND path = ?3"
                 ),
-                params![self.job, role.as_str(), path.as_os_str().as_bytes()],
+                params![self.job, self.slot(role), path.as_os_str().as_bytes()],
                 record_from_row,
             )
             .optional()?)
@@ -581,9 +655,9 @@ impl DiskIndex {
     pub fn list_files(&self, role: Role) -> IResult<Vec<FileRecord>> {
         self.query_records(
             &format!(
-                "SELECT {RECORD_COLUMNS} FROM files WHERE job = ?1 AND role = ?2 ORDER BY path"
+                "SELECT {RECORD_COLUMNS} FROM files WHERE job = ?1 AND slot = ?2 ORDER BY path"
             ),
-            params![self.job, role.as_str()],
+            params![self.job, self.slot(role)],
         )
     }
 
@@ -597,10 +671,10 @@ impl DiskIndex {
         self.query_records(
             &format!(
                 "SELECT {RECORD_COLUMNS} FROM files
-                 WHERE job = ?1 AND role = ?2 AND name = ?3 AND size = ?4 AND kind = 'f'
+                 WHERE job = ?1 AND slot = ?2 AND name = ?3 AND size = ?4 AND kind = 'f'
                  ORDER BY path"
             ),
-            params![self.job, role.as_str(), name, size as i64],
+            params![self.job, self.slot(role), name, size as i64],
         )
     }
 
@@ -609,9 +683,9 @@ impl DiskIndex {
         self.query_records(
             &format!(
                 "SELECT {RECORD_COLUMNS} FROM files
-                 WHERE job = ?1 AND role = ?2 AND size = ?3 AND kind = 'f' ORDER BY path"
+                 WHERE job = ?1 AND slot = ?2 AND size = ?3 AND kind = 'f' ORDER BY path"
             ),
-            params![self.job, role.as_str(), size as i64],
+            params![self.job, self.slot(role), size as i64],
         )
     }
 
@@ -622,12 +696,12 @@ impl DiskIndex {
                     f.mode, f.uid, f.gid
              FROM files f JOIN hashes h
                ON h.ino = f.ino AND h.size = f.size AND h.mtime_ns = f.mtime_ns
-             WHERE f.job = ?1 AND f.role = ?2 AND f.size = ?3 AND f.kind = 'f'
+             WHERE f.job = ?1 AND f.slot = ?2 AND f.size = ?3 AND f.kind = 'f'
                AND h.algo = ?4 AND h.version = ?5 AND h.hash = ?6
              ORDER BY f.path",
             params![
                 self.job,
-                role.as_str(),
+                self.slot(role),
                 size as i64,
                 HASH_ALGO,
                 HASH_VERSION,
@@ -645,12 +719,12 @@ impl DiskIndex {
     /// Sets of paths that share an inode within `role` (hard links).
     pub fn hard_link_groups(&self, role: Role) -> IResult<Vec<Vec<PathBuf>>> {
         let mut statement = self.conn.prepare(
-            "SELECT ino, path FROM files WHERE job = ?1 AND role = ?2 AND kind = 'f'
-               AND ino IN (SELECT ino FROM files WHERE job = ?1 AND role = ?2 AND kind = 'f'
+            "SELECT ino, path FROM files WHERE job = ?1 AND slot = ?2 AND kind = 'f'
+               AND ino IN (SELECT ino FROM files WHERE job = ?1 AND slot = ?2 AND kind = 'f'
                            GROUP BY ino HAVING COUNT(*) > 1)
              ORDER BY ino, path",
         )?;
-        let rows = statement.query_map(params![self.job, role.as_str()], |row| {
+        let rows = statement.query_map(params![self.job, self.slot(role)], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
         })?;
         let mut groups: Vec<Vec<PathBuf>> = Vec::new();
@@ -1307,7 +1381,7 @@ mod tests {
         index
             .conn
             .execute(
-                "DELETE FROM files WHERE job = 'job' AND role = 'previous' AND path = x'78'",
+                "DELETE FROM files WHERE job = 'job' AND slot = 'a' AND path = x'78'",
                 [],
             )
             .unwrap();
@@ -1471,6 +1545,97 @@ mod tests {
         }
     }
 
+    #[test]
+    fn publishing_swaps_the_row_sets_and_a_reopened_index_agrees() {
+        let f = fixture();
+        let mut index = DiskIndex::open(&f.disk, "job").unwrap();
+        index.ensure_previous(Some(&f.generation)).unwrap();
+        let before = index.list_files(Role::Previous).unwrap().len();
+
+        let next = staged_generation(&f.disk.join("job"), "20260102", "token-2", &[("only", "1")]);
+        index.begin_current().unwrap();
+        index.record_current(&next, "20260102", "token-2").unwrap();
+        assert_eq!(index.count_files(Role::Current).unwrap(), 1);
+        assert_eq!(index.count_files(Role::Previous).unwrap(), before as u64);
+        index.commit_current().unwrap();
+
+        // The replaced rows are still in the other slot but are not "current".
+        assert_eq!(index.count_files(Role::Current).unwrap(), 0);
+        assert_eq!(index.list_files(Role::Previous).unwrap().len(), 1);
+        for _ in 0..2 {
+            let reopened = DiskIndex::open(&f.disk, "job").unwrap();
+            assert_eq!(reopened.list_files(Role::Previous).unwrap().len(), 1);
+            assert_eq!(
+                reopened
+                    .generation_row(Role::Previous)
+                    .unwrap()
+                    .unwrap()
+                    .generation,
+                "20260102"
+            );
+        }
+
+        // Another generation after that, through the swapped slots.
+        let third = staged_generation(
+            &f.disk.join("job"),
+            "20260103",
+            "token-3",
+            &[("p", "1"), ("q", "2")],
+        );
+        let mut index = DiskIndex::open(&f.disk, "job").unwrap();
+        assert_eq!(
+            index.ensure_previous(Some(&next)).unwrap(),
+            PreviousState::Reused(1)
+        );
+        index.begin_current().unwrap();
+        index.record_current(&third, "20260103", "token-3").unwrap();
+        index.commit_current().unwrap();
+        let paths: Vec<_> = index
+            .list_files(Role::Previous)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.path)
+            .collect();
+        assert_eq!(paths, vec![PathBuf::from("p"), PathBuf::from("q")]);
+    }
+
+    #[test]
+    fn an_index_from_the_first_layout_is_rebuilt_and_keeps_its_hashes() {
+        let f = fixture();
+        let dest = f.disk.join("job");
+        {
+            let mut index = DiskIndex::open(&f.disk, "job").unwrap();
+            index.ensure_previous(Some(&f.generation)).unwrap();
+            let first = index.list_files(Role::Previous).unwrap().remove(0);
+            index
+                .ensure_hash(Role::Previous, &first.path, &f.generation)
+                .unwrap();
+            // Put the database back in the layout of release 1.16 to 1.19.
+            index
+                .conn
+                .execute_batch(
+                    "DROP TABLE files; DROP TABLE generations;
+                     CREATE TABLE generations(job TEXT NOT NULL, role TEXT NOT NULL,
+                         generation TEXT NOT NULL, marker_token TEXT NOT NULL,
+                         file_count INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+                         PRIMARY KEY(job, role));
+                     CREATE TABLE files(job TEXT NOT NULL, role TEXT NOT NULL,
+                         path BLOB NOT NULL, PRIMARY KEY(job, role, path));
+                     UPDATE meta SET value = '1' WHERE key = 'schema_version';",
+                )
+                .unwrap();
+        }
+        let mut index = DiskIndex::open(&f.disk, "job").unwrap();
+        assert_eq!(index.stats().unwrap().previous_files, 0);
+        assert_eq!(index.stats().unwrap().hashes, 1);
+        let base = dest.join("20260101");
+        assert!(matches!(
+            index.ensure_previous(Some(&base)).unwrap(),
+            PreviousState::Rebuilt(_)
+        ));
+        assert!(index.stats().unwrap().previous_files > 0);
+    }
+
     /// Timing of the index on a large tree. Run with:
     /// `cargo test --release bench_index -- --ignored --nocapture`
     #[test]
@@ -1507,8 +1672,17 @@ mod tests {
         let t = Instant::now();
         index.begin_current().unwrap();
         index.record_current(&generation, "20260102", "t2").unwrap();
+        eprintln!("record a new generation: {:?}", t.elapsed());
+        let t = Instant::now();
         index.commit_current().unwrap();
-        eprintln!("record + commit a new generation: {:?}", t.elapsed());
+        eprintln!("commit (advance the roles): {:?}", t.elapsed());
+
+        // The next run also clears the rows the previous publish replaced.
+        let t = Instant::now();
+        index.begin_current().unwrap();
+        index.record_current(&generation, "20260103", "t3").unwrap();
+        index.commit_current().unwrap();
+        eprintln!("a further record + commit: {:?}", t.elapsed());
 
         let t = Instant::now();
         let hit = index

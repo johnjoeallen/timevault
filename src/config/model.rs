@@ -33,7 +33,7 @@ pub struct ConfigOptions {
     pub safe: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub progress: Option<bool>,
-    /// Maintain each disk's file index (`<disk>/.timevault-index`). Defaults to
+    /// Maintain each disk's file index (`<disk>/.timevault/index`). Defaults to
     /// [`crate::backup::index::INDEX_DEFAULT`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub index: Option<bool>,
