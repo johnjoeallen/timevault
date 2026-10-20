@@ -1082,7 +1082,7 @@ impl RemotePowerGuard {
                 leaving
             ),
             diagnostics: format!(
-                "Found state: {}\nChecks completed:\n- {}\nPost-backup action: {}",
+                "Initial power state: {}\nChecks completed:\n- {}\nPost-backup action: {}",
                 found_power_state_description(self.found_state),
                 self.checks.join("\n- "),
                 leaving
@@ -1206,7 +1206,13 @@ pub fn wake_remote_job(job: &Job, run_mode: RunMode) -> Result<()> {
             context.mac.as_deref().expect("validated WOL MAC"),
             &context.targets,
             run_mode,
-        )?;
+        )
+        .map_err(|_| {
+            TimevaultError::message(format!(
+                "remote host {} did not respond to ping after Wake-on-LAN; check the configured MAC address, WOL firmware/NIC settings, and network path",
+                context.host
+            ))
+        })?;
     }
     wait_for_ssh_until(&context.ssh_host, deadline, run_mode)
 }

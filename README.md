@@ -4,14 +4,14 @@ Timevault is a safe, rsync-based backup tool built for people who want dependabl
 
 ## Why Timevault
 - Safer by default: disks stay offline until a backup runs.
-- Clear identity: disks are enrolled by filesystem UUID with a `.timevault` marker.
+- Clear identity: disks are enrolled by filesystem UUID with a `.timevault/identity` file.
 - Predictable snapshots: simple, date-stamped rotations and a stable `current` symlink.
 - Minimal moving parts: YAML config, rsync, and system tools you already have.
 
 ## Features
 - YAML config with job-based backups, run policies, per-job disk allowlists, per-job excludes, and a `disabled` disk state.
 - Local and SSH-style remote jobs, including optional wake-on-LAN, temporary suspend inhibition, and post-backup power handling that returns a woken host to the state it was found in.
-- Disk enrollment by filesystem UUID with a `.timevault` identity file.
+- Disk enrollment by filesystem UUID with a `.timevault/identity` file.
 - Snapshot rotation with date-stamped directories and a stable `current` symlink.
 - Safe, dry-run, and print-order modes for validation before writing.
 - Optional pristine package excludes with separate local and remote-host caches.

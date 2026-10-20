@@ -230,7 +230,6 @@ pub fn render_html(reports: &[BackupRunReport]) -> String {
             "Snapshot",
             "Source",
             "Destination",
-            "Power",
         ] {
             body.push_str(&format!(
                 "<th align=\"left\" style=\"background:#134e4a; color:#ffffff; border-bottom:1px solid #0f766e; font-size:12px; text-transform:uppercase; letter-spacing:.04em;\">{}</th>",
@@ -254,7 +253,6 @@ pub fn render_html(reports: &[BackupRunReport]) -> String {
             body.push_str(&table_cell(&job.backup_day));
             body.push_str(&table_cell(&job.source));
             body.push_str(&table_cell(&job.destination));
-            body.push_str(&table_cell(job.power.as_deref().unwrap_or("-")));
             body.push_str("</tr>");
         }
         body.push_str("</tbody></table>");
@@ -608,8 +606,8 @@ mod tests {
         assert!(html.contains("Main filesystem"));
         assert!(html.contains(">Job</th>"));
         assert!(html.contains(">Name</th>"));
-        assert!(html.contains(">Power</th>"));
-        assert!(html.contains("Found powered off &lt;by WOL&gt;"));
+        assert!(!html.contains(">Power</th>"));
+        assert!(!html.contains("Found powered off &lt;by WOL&gt;"));
         assert!(html.contains("Power diagnostics"));
         assert!(html.contains("Checks completed"));
         assert!(html.contains("Moved-file reuse"));
