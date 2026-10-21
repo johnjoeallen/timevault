@@ -9,17 +9,19 @@ Timevault is a safe, rsync-based backup tool built for people who want dependabl
 - Minimal moving parts: YAML config, rsync, and system tools you already have.
 
 ## Features
-- YAML config with job-based backups, run policies, per-job disk allowlists, per-job excludes, and disk states (`disabled`, `rotatedOut`).
+- YAML config with job-based backups, run policies, per-job disk allowlists, per-job excludes, and a `disabled` disk state.
 - Local and SSH-style remote jobs, including optional wake-on-LAN, temporary suspend inhibition, and post-backup power handling that returns a woken host to the state it was found in.
 - Disk enrollment by filesystem UUID with a `.timevault/identity` file.
 - Snapshot rotation with date-stamped directories and a stable `current` symlink.
 - Safe, dry-run, and print-order modes for validation before writing.
 - Optional pristine package excludes with separate local and remote-host caches.
+- Reuse of moved and renamed files (on by default), so reorganising a large collection does not store it again.
 - Manual runs: `timevault backup --job <name|all>`, select disks positionally or with `--disk-id`, or cascade with `--cascade`.
-- Disk commands for registration, listing, mounting, checking, space reporting, rename, enable/disable, rotation control, inspect, and unregister.
+- Disk commands for registration, listing, mounting, checking, space reporting, rename, enable/disable, inspect, and unregister.
 - Optional HTML backup reports sent through `sendmail`.
 - Systemd service + timer support for unattended schedules.
 
 ## Documentation
 - [User Guide](USER_GUIDE.md): configuration, commands, setup workflow, and systemd usage.
+- [Architecture](docs/architecture.md), [Disk rotation](docs/rotation.md), [Cascade](docs/cascade.md), [Retention and capacity](docs/retention-capacity.md), [Recreating a generation](docs/recreate.md), [Moved and renamed files](docs/relocation.md), [Recovery](docs/recovery.md), [Examples](docs/examples.md) and [Design rationale](docs/design-rationale.md).
 - [Packaging](PACKAGING.md): build and install instructions for `.deb` and local installs.

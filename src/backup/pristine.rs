@@ -10,8 +10,7 @@ use tempfile::NamedTempFile;
 
 const OS_RELEASE_PATH: &str = "/etc/os-release";
 const PRISTINE_CACHE_REL: &str = ".cache/timevault/pristine-cache.json";
-const REMOTE_HELPER_PATH: &str = "/root/tmp/timevault-pristine-hash.sh";
-const REMOTE_CACHE_INPUT_PATH: &str = "/root/tmp/timevault-pristine-cache.tsv";
+const REMOTE_TMP_DIR: &str = "/root/tmp";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OsFamily {
@@ -219,10 +218,47 @@ fn analyze_remote_files(
     cache: &CacheFile,
     verbose: bool,
 ) -> Result<AnalyzeStats> {
-    upload_remote_helper(host, pristine_helper_script(), verbose)?;
-    upload_remote_cache_input(host, cache, verbose)?;
-    let output = execute_remote_helper(host, manager, verbose)?;
-    parse_helper_output(&output, cache, "remote", verbose)
+    let paths = RemoteHelperPaths::unique();
+    upload_remote_helper(host, pristine_helper_script(), &paths, verbose)?;
+    upload_remote_cache_input(host, cache, &paths, verbose)?;
+    let output = execute_remote_helper(host, manager, &paths, verbose);
+    // The files are private to this run, so remove them whether or not it worked.
+    remove_remote_helper_files(host, &paths);
+    parse_helper_output(&output?, cache, "remote", verbose)
+}
+
+/// Remote scratch files for one analysis. Unique per run so parallel
+/// `timevault` processes (different jobs, same host) never truncate a script
+/// or cache input another run is executing or reading.
+struct RemoteHelperPaths {
+    helper: String,
+    cache_input: String,
+}
+
+impl RemoteHelperPaths {
+    fn unique() -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let run = format!("{}-{}-{}", std::process::id(), nanos, seq);
+        Self {
+            helper: format!("{}/timevault-pristine-hash.{}.sh", REMOTE_TMP_DIR, run),
+            cache_input: format!("{}/timevault-pristine-cache.{}.tsv", REMOTE_TMP_DIR, run),
+        }
+    }
+}
+
+fn remove_remote_helper_files(host: &str, paths: &RemoteHelperPaths) {
+    let _ = Command::new("ssh")
+        .arg(host)
+        .arg(format!("rm -f {} {}", paths.helper, paths.cache_input))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 fn pristine_helper_script() -> &'static str {
@@ -380,19 +416,20 @@ fn execute_local_helper(
     command_output_to_string("sh", "local pristine helper", output)
 }
 
-fn upload_remote_helper(host: &str, script: &str, verbose: bool) -> Result<()> {
+fn upload_remote_helper(
+    host: &str,
+    script: &str,
+    paths: &RemoteHelperPaths,
+    verbose: bool,
+) -> Result<()> {
     if verbose {
-        crate::pnote!(
-            "pristine: upload remote helper {}:{}",
-            host,
-            REMOTE_HELPER_PATH
-        );
+        crate::pnote!("pristine: upload remote helper {}:{}", host, paths.helper);
     }
     let mut child = Command::new("ssh")
         .arg(host)
         .arg(format!(
-            "mkdir -p /root/tmp && cat > {}",
-            REMOTE_HELPER_PATH
+            "mkdir -p {} && cat > {}",
+            REMOTE_TMP_DIR, paths.helper
         ))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -405,20 +442,25 @@ fn upload_remote_helper(host: &str, script: &str, verbose: bool) -> Result<()> {
     command_output_to_string("ssh", host, output).map(|_| ())
 }
 
-fn upload_remote_cache_input(host: &str, cache: &CacheFile, verbose: bool) -> Result<()> {
+fn upload_remote_cache_input(
+    host: &str,
+    cache: &CacheFile,
+    paths: &RemoteHelperPaths,
+    verbose: bool,
+) -> Result<()> {
     let input = cache_input_tsv(cache);
     if verbose {
         crate::pnote!(
             "pristine: upload remote cache input {}:{}",
             host,
-            REMOTE_CACHE_INPUT_PATH
+            paths.cache_input
         );
     }
     let mut child = Command::new("ssh")
         .arg(host)
         .arg(format!(
-            "mkdir -p /root/tmp && cat > {}",
-            REMOTE_CACHE_INPUT_PATH
+            "mkdir -p {} && cat > {}",
+            REMOTE_TMP_DIR, paths.cache_input
         ))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -448,21 +490,22 @@ fn cache_input_tsv(cache: &CacheFile) -> String {
     input
 }
 
-fn execute_remote_helper(host: &str, manager: PackageManager, verbose: bool) -> Result<String> {
+fn execute_remote_helper(
+    host: &str,
+    manager: PackageManager,
+    paths: &RemoteHelperPaths,
+    verbose: bool,
+) -> Result<String> {
     if verbose {
-        crate::pnote!(
-            "pristine: execute remote helper {}:{}",
-            host,
-            REMOTE_HELPER_PATH
-        );
+        crate::pnote!("pristine: execute remote helper {}:{}", host, paths.helper);
     }
     let child = Command::new("ssh")
         .arg(host)
         .arg(format!(
             "sh {} {} {}",
-            REMOTE_HELPER_PATH,
+            paths.helper,
             remote_package_manager_name(manager),
-            REMOTE_CACHE_INPUT_PATH
+            paths.cache_input
         ))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -549,7 +592,12 @@ fn save_cache(path: &Path, cache: &CacheFile, verbose: bool) -> Result<()> {
     }
     let data = serde_json::to_string_pretty(cache)
         .map_err(|err| crate::error::TimevaultError::message(err.to_string()))?;
-    fs::write(path, data)?;
+    // Write a sibling temp file and rename it into place, so parallel runs
+    // sharing this cache never leave or read a half-written file.
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut tmp = NamedTempFile::new_in(dir)?;
+    tmp.write_all(data.as_bytes())?;
+    tmp.persist(path).map_err(|err| err.error)?;
     if verbose {
         crate::pnote!("pristine: cache updated");
     }
@@ -645,5 +693,77 @@ ID_LIKE=debian
             version_id: None,
         };
         assert_eq!(detect_package_manager(&info), Some(PackageManager::Pacman));
+    }
+
+    #[test]
+    fn remote_helper_paths_are_unique_per_run() {
+        let a = RemoteHelperPaths::unique();
+        let b = RemoteHelperPaths::unique();
+        assert_ne!(a.helper, b.helper);
+        assert_ne!(a.cache_input, b.cache_input);
+        assert!(a.helper.starts_with("/root/tmp/timevault-pristine-hash."));
+        assert!(a
+            .cache_input
+            .starts_with("/root/tmp/timevault-pristine-cache."));
+    }
+
+    fn cache_with(count: usize) -> CacheFile {
+        CacheFile {
+            version: 1,
+            entries: (0..count)
+                .map(|i| {
+                    (
+                        format!("/usr/bin/tool{i}"),
+                        CacheEntry {
+                            mtime: i as u64,
+                            hash: "ab".repeat(32),
+                            dirty: false,
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn save_cache_replaces_the_file_and_leaves_no_temp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache/pristine-cache.json");
+
+        save_cache(&path, &cache_with(3), false).unwrap();
+        save_cache(&path, &cache_with(5), false).unwrap();
+
+        assert_eq!(load_cache(&path, false).entries.len(), 5);
+        let names: Vec<_> = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["pristine-cache.json"]);
+    }
+
+    #[test]
+    fn concurrent_cache_writers_never_expose_a_partial_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pristine-cache.json");
+        save_cache(&path, &cache_with(200), false).unwrap();
+
+        let writers: Vec<_> = (0..4)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..25 {
+                        save_cache(&path, &cache_with(200), false).unwrap();
+                    }
+                })
+            })
+            .collect();
+        // Every read sees a complete cache, never a truncated one (a torn
+        // file would parse as empty).
+        for _ in 0..100 {
+            assert_eq!(load_cache(&path, false).entries.len(), 200);
+        }
+        for writer in writers {
+            writer.join().unwrap();
+        }
     }
 }

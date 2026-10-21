@@ -38,6 +38,12 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "SECONDS")]
     pub min_session_seconds: Option<u64>,
 
+    /// Rebuild the current backup day's generation even though it is already
+    /// complete. Only the current day can be rebuilt; older generations are
+    /// never touched.
+    #[arg(long, global = true, alias = "refresh")]
+    pub recreate: bool,
+
     #[arg(long, global = true)]
     pub disk_id: Option<String>,
     #[arg(long, global = true)]
@@ -203,6 +209,14 @@ pub struct DiskRenameArgs {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn recreate_flag_and_its_refresh_alias_parse() {
+        assert!(!Cli::parse_from(["timevault", "backup"]).recreate);
+        assert!(Cli::parse_from(["timevault", "backup", "--recreate"]).recreate);
+        assert!(Cli::parse_from(["timevault", "backup", "--refresh"]).recreate);
+        assert!(Cli::parse_from(["timevault", "--job", "etc", "--recreate"]).recreate);
+    }
 
     #[test]
     fn parses_disk_ls_alias() {

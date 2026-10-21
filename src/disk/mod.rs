@@ -293,6 +293,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn disabled_disk_can_still_be_selected_for_mounting() {
+        // `disabled` only stops backups; selection used for mount/inspect/ls
+        // must not filter on it.
+        let disks = vec![BackupDiskConfig {
+            disk_id: "a".to_string(),
+            fs_uuid: "uuid-a".to_string(),
+            label: None,
+            mount_options: None,
+            disabled: true,
+            rotated_out: false,
+        }];
+        let connected = ["uuid-a".to_string()].into_iter().collect();
+        let selected = select_disk_from_connected(&disks, Some("a"), &connected).unwrap();
+        assert_eq!(selected.disk_id, "a");
+        assert!(selected.disabled);
+    }
+
+    #[test]
     fn select_disk_with_connected_uuids() {
         let disks = vec![
             BackupDiskConfig {

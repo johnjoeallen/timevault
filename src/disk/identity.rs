@@ -20,9 +20,11 @@ pub struct DiskIdentity {
 }
 
 /// Everything Timevault keeps on a disk outside the job directories lives in
-/// this directory. Earlier releases kept the identity in a file of this name.
+/// this directory. Releases before 1.21.0 kept the identity in a file of this
+/// name and the file index in `.timevault-index`.
 pub const META_DIR: &str = ".timevault";
 pub const IDENTITY_FILE: &str = "identity";
+const LEGACY_INDEX_DIR: &str = ".timevault-index";
 const MIGRATING_IDENTITY: &str = ".timevault-identity.old";
 
 /// Where the identity is read from: `.timevault/identity`, or the old
@@ -37,10 +39,11 @@ pub fn identity_path(root: &std::path::Path) -> std::path::PathBuf {
     }
 }
 
-/// Move an old `.timevault` identity file to `.timevault/identity`. Safe to
-/// repeat and safe to interrupt: a crash between the renames leaves the file as
-/// `.timevault-identity.old`, which the next call completes. Needs a writable
-/// disk.
+/// Move the metadata of an older release into `.timevault/`: the identity file
+/// becomes `.timevault/identity` and `.timevault-index` becomes
+/// `.timevault/index`. Safe to repeat, and safe to interrupt: a crash between
+/// the two renames of the identity leaves it as `.timevault-identity.old`, which
+/// the next call completes. Needs a writable disk.
 pub fn migrate_layout(root: &std::path::Path) -> std::io::Result<()> {
     use std::fs;
     let meta = root.join(META_DIR);
@@ -56,6 +59,12 @@ pub fn migrate_layout(root: &std::path::Path) -> std::io::Result<()> {
         } else {
             fs::rename(&parked, &target)?;
         }
+    }
+    let old_index = root.join(LEGACY_INDEX_DIR);
+    let new_index = meta.join("index");
+    if old_index.is_dir() && !new_index.exists() {
+        fs::create_dir_all(&meta)?;
+        fs::rename(&old_index, &new_index)?;
     }
     Ok(())
 }
@@ -132,24 +141,35 @@ mod tests {
     }
 
     #[test]
-    fn migrates_legacy_identity_file() {
+    fn an_old_layout_is_moved_into_the_timevault_directory() {
         let dir = TempDir::new().expect("tempdir");
         let root = dir.path();
         std::fs::write(root.join(".timevault"), "version: 1\n").unwrap();
+        std::fs::create_dir(root.join(".timevault-index")).unwrap();
+        std::fs::write(root.join(".timevault-index/file-index.sqlite"), "db").unwrap();
+
         assert_eq!(identity_path(root), root.join(".timevault"));
         migrate_layout(root).unwrap();
-        assert_eq!(identity_path(root), root.join(".timevault/identity"));
-        assert!(root.join(".timevault/identity").is_file());
         migrate_layout(root).unwrap();
-        assert!(root.join(".timevault/identity").is_file());
+
+        assert_eq!(identity_path(root), root.join(".timevault/identity"));
+        assert_eq!(
+            std::fs::read_to_string(identity_path(root)).unwrap(),
+            "version: 1\n"
+        );
+        assert!(root.join(".timevault/index/file-index.sqlite").is_file());
+        assert!(!root.join(".timevault-index").exists());
+        assert!(!root.join(".timevault-identity.old").exists());
     }
 
     #[test]
-    fn migration_completes_after_interruption() {
+    fn an_interrupted_migration_is_completed() {
         let dir = TempDir::new().expect("tempdir");
         let root = dir.path();
         std::fs::write(root.join(".timevault-identity.old"), "kept").unwrap();
+
         migrate_layout(root).unwrap();
+
         assert_eq!(
             std::fs::read_to_string(root.join(".timevault/identity")).unwrap(),
             "kept"
