@@ -49,7 +49,7 @@ use crate::config::model::RelocationOption;
 
 pub const DEFAULT_MIN_SIZE: u64 = 64 * 1024;
 pub const DEFAULT_MAX_CHANGES: usize = 200_000;
-pub const DEFAULT_TIMEOUT_SECS: u64 = 300;
+pub const DEFAULT_TIMEOUT_SECS: u64 = 3600;
 /// Whether moved-file detection runs when `options.relocation` is not set.
 pub const RELOCATION_DEFAULT: bool = true;
 /// Content is compared for files up to this size (2 GiB); larger files are
@@ -194,6 +194,9 @@ pub struct Stats {
     pub ambiguous: usize,
     /// Unverified pairings accepted because they form a folder move.
     pub group_supported: usize,
+    /// Whole folders recognised as renamed or moved: every file kept its
+    /// relative path, size and modification time.
+    pub folder_moves: usize,
     /// Files above `hashMaxSize` that were not read (offered only on the
     /// strength of a unique move, or skipped under `verify: hash`).
     pub skipped_large: usize,
@@ -242,6 +245,12 @@ impl Stats {
                 detail,
                 human_bytes(self.bytes_reused)
             ));
+            if self.folder_moves > 0 {
+                parts.push(format!(
+                    "{} renamed folders matched by layout, size and time",
+                    self.folder_moves
+                ));
+            }
         }
         if self.rejected > 0 {
             parts.push(format!("{} look-alikes rejected", self.rejected));
@@ -1027,6 +1036,140 @@ fn hash_group(
     })
 }
 
+/// Layout of the files under one directory: how many there are and a hash of
+/// each one's path below the directory, size and modification time. Summed, so
+/// the order the files are visited in does not matter.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+struct Layout {
+    files: usize,
+    sum_a: u64,
+    sum_b: u64,
+}
+
+fn layout_hash(salt: u64, rel: &[u8], size: u64, mtime: i64) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    salt.hash(&mut hasher);
+    rel.hash(&mut hasher);
+    size.hash(&mut hasher);
+    mtime.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Add a file to the layout of every directory above it.
+fn add_to_layouts(layouts: &mut HashMap<Vec<u8>, Layout>, path: &[u8], size: u64, mtime: i64) {
+    for (at, _) in path.iter().enumerate().filter(|(_, b)| **b == b'/') {
+        let (dir, rel) = (&path[..at], &path[at + 1..]);
+        if dir.is_empty() {
+            continue;
+        }
+        let layout = match layouts.get_mut(dir) {
+            Some(layout) => layout,
+            None => layouts.entry(dir.to_vec()).or_default(),
+        };
+        layout.files += 1;
+        layout.sum_a = layout.sum_a.wrapping_add(layout_hash(1, rel, size, mtime));
+        layout.sum_b = layout.sum_b.wrapping_add(layout_hash(2, rel, size, mtime));
+    }
+}
+
+/// The positions of the paths at and below `dir` in a sorted list of paths.
+fn under(sorted: &[&[u8]], dir: &[u8]) -> std::ops::Range<usize> {
+    let mut prefix = dir.to_vec();
+    prefix.push(b'/');
+    let start = sorted.partition_point(|path| *path < prefix.as_slice());
+    let end = start + sorted[start..].partition_point(|path| path.starts_with(prefix.as_slice()));
+    start..end
+}
+
+/// Find folders that were renamed or moved as a whole: a directory of new
+/// files and a directory of vanished files that hold exactly the same files,
+/// each with the same path below the directory, size and modification time.
+/// rsync trusts a file with the same path, size and time as unchanged, so the
+/// same evidence for a whole folder justifies reusing its data without reading
+/// it. Returns `(new, old)` positions in `news` and `gone`, which must be
+/// sorted by path, and the number of folders. The outermost folder wins, and a
+/// layout that appears more than once on either side is left alone.
+fn match_folders(
+    news: &[&NewFile],
+    gone: &[FileRecord],
+    gone_order: &[usize],
+) -> (Vec<(usize, usize)>, usize) {
+    let gone_path = |gi: usize| gone[gi].path.as_os_str().as_bytes();
+    let new_paths: Vec<&[u8]> = news.iter().map(|n| n.path.as_slice()).collect();
+    let old_paths: Vec<&[u8]> = gone_order.iter().map(|gi| gone_path(*gi)).collect();
+    let mut new_layouts: HashMap<Vec<u8>, Layout> = HashMap::new();
+    for n in news {
+        add_to_layouts(&mut new_layouts, &n.path, n.size, n.mtime);
+    }
+    let mut gone_layouts: HashMap<Vec<u8>, Layout> = HashMap::new();
+    for record in gone {
+        let path = record.path.as_os_str().as_bytes();
+        add_to_layouts(
+            &mut gone_layouts,
+            path,
+            record.size,
+            mtime_secs(record.mtime_ns),
+        );
+    }
+    let mut new_by_layout: HashMap<Layout, Vec<&Vec<u8>>> = HashMap::new();
+    for (dir, layout) in &new_layouts {
+        if layout.files >= GROUP_MIN {
+            new_by_layout.entry(*layout).or_default().push(dir);
+        }
+    }
+    let mut gone_by_layout: HashMap<Layout, Vec<&Vec<u8>>> = HashMap::new();
+    for (dir, layout) in &gone_layouts {
+        gone_by_layout.entry(*layout).or_default().push(dir);
+    }
+
+    let mut candidates: Vec<(&Vec<u8>, &Vec<u8>)> = Vec::new();
+    for (layout, new_dirs) in &new_by_layout {
+        if let (&[new_dir], Some(&[old_dir])) = (
+            new_dirs.as_slice(),
+            gone_by_layout.get(layout).map(Vec::as_slice),
+        ) {
+            candidates.push((new_dir, old_dir));
+        }
+    }
+    // Outermost first, so a folder wins over the folders inside it.
+    candidates
+        .sort_by_key(|(new_dir, _)| (new_dir.iter().filter(|b| **b == b'/').count(), *new_dir));
+
+    let mut pairs = Vec::new();
+    let mut folders = 0;
+    let mut taken_new: HashSet<usize> = HashSet::new();
+    for (new_dir, old_dir) in candidates {
+        let new_range = under(&new_paths, new_dir);
+        let old_range = under(&old_paths, old_dir);
+        if new_range.len() != old_range.len() || new_range.clone().any(|ni| taken_new.contains(&ni))
+        {
+            continue;
+        }
+        // The summed hashes are not proof; compare the files one by one.
+        let old_by_rel: HashMap<&[u8], usize> = old_range
+            .clone()
+            .map(|oi| gone_order[oi])
+            .map(|gi| (&gone_path(gi)[old_dir.len() + 1..], gi))
+            .collect();
+        let matched: Option<Vec<(usize, usize)>> = new_range
+            .clone()
+            .map(|ni| {
+                let n = news[ni];
+                let gi = *old_by_rel.get(&n.path[new_dir.len() + 1..])?;
+                let record = &gone[gi];
+                (record.size == n.size && mtime_secs(record.mtime_ns) == n.mtime)
+                    .then_some((ni, gi))
+            })
+            .collect();
+        let Some(matched) = matched else { continue };
+        taken_new.extend(new_range);
+        pairs.extend(matched);
+        folders += 1;
+    }
+    (pairs, folders)
+}
+
 /// Pair new files with reusable old ones. See the module documentation for
 /// the evidence each kind of pairing relies on.
 ///
@@ -1087,8 +1230,36 @@ pub fn match_changes(
     let mut digests: HashMap<usize, Option<SourceDigest>> = HashMap::new();
     let mut gone_groups: HashMap<(u64, i64), HashMap<String, Vec<usize>>> = HashMap::new();
 
+    // Whole folders that were renamed or moved: the same files with the same
+    // sizes and times, so nothing needs reading.
+    if cfg.verify != Verify::Hash {
+        let mut gone_order: Vec<usize> = (0..gone.len()).collect();
+        gone_order.sort_by(|a, b| gone[*a].path.cmp(&gone[*b].path));
+        let (folder_pairs, folders) = match_folders(&news, &gone, &gone_order);
+        stats.folder_moves = folders;
+        for (ni, gi) in folder_pairs {
+            let n = news[ni];
+            claimed.insert(gi);
+            paired_new.insert(ni);
+            if gone[gi].name == file_name_bytes(&n.path) {
+                stats.moved += 1;
+            } else {
+                stats.renamed += 1;
+            }
+            pairs.push(Pair {
+                new: PathBuf::from(OsStr::from_bytes(&n.path)),
+                old: gone[gi].path.clone(),
+                size: n.size,
+                verified: false,
+            });
+        }
+    }
+
     // Moves and renames: the old path vanished from the source.
     for (ni, n) in news.iter().enumerate() {
+        if paired_new.contains(&ni) {
+            continue;
+        }
         if Instant::now() > input.deadline {
             stats.hit_deadline = true;
             break;
@@ -1697,7 +1868,7 @@ mod tests {
         let unset = RelocationConfig::from_option(None).unwrap();
         assert!(unset.enabled);
         assert_eq!(unset.min_size, DEFAULT_MIN_SIZE);
-        assert_eq!(unset.timeout_secs, 300);
+        assert_eq!(unset.timeout_secs, DEFAULT_TIMEOUT_SECS);
         let off = RelocationConfig::from_option(Some(&RelocationOption::Flag(false))).unwrap();
         assert!(!off.enabled);
         assert!(!RelocationConfig::default().enabled);
@@ -1810,6 +1981,134 @@ mod tests {
         // Unchanged files are left to rsync's own path matching.
         assert!(!shadow.join("keep.bin").exists());
         assert_eq!(stats.bytes_reused, 10 + 11);
+    }
+
+    /// A tree of look-alikes: same size and modification time, different
+    /// content, so only the layout can tell the files apart without reading.
+    fn lookalikes() -> World {
+        world(&[
+            ("media/a/one.bin", "aaaa"),
+            ("media/a/two.bin", "bbbb"),
+            ("media/b/three.bin", "cccc"),
+            ("media/four.bin", "dddd"),
+            ("keep.bin", "keep"),
+        ])
+    }
+
+    #[test]
+    fn a_renamed_folder_with_the_same_layout_is_linked_without_reading_anything() {
+        let mut w = lookalikes();
+        fs::rename(w.source.join("media"), w.source.join("entertainment")).unwrap();
+        // A limit this low would make hashing skip every file.
+        let mut cfg = settings(None);
+        cfg.hash_max_size = 1;
+
+        let (shadow, stats) = w.planned(&cfg, true);
+
+        let shadow = shadow.expect("shadow");
+        assert_eq!(stats.folder_moves, 1, "{stats:?}");
+        assert_eq!((stats.linked, stats.verified), (4, 0), "{stats:?}");
+        for rel in ["a/one.bin", "a/two.bin", "b/three.bin", "four.bin"] {
+            assert_eq!(
+                ino(&shadow.join("entertainment").join(rel)),
+                ino(&w.prev.join("media").join(rel)),
+                "{rel}"
+            );
+        }
+        assert!(!shadow.join("keep.bin").exists());
+    }
+
+    #[test]
+    fn a_folder_moved_under_another_name_and_depth_is_linked_as_one() {
+        let mut w = lookalikes();
+        fs::create_dir_all(w.source.join("archive/2020")).unwrap();
+        fs::rename(w.source.join("media"), w.source.join("archive/2020/pics")).unwrap();
+
+        let (shadow, stats) = w.planned(&settings(None), true);
+
+        assert_eq!((stats.folder_moves, stats.linked), (1, 4), "{stats:?}");
+        assert_eq!(
+            ino(&shadow.unwrap().join("archive/2020/pics/a/two.bin")),
+            ino(&w.prev.join("media/a/two.bin"))
+        );
+    }
+
+    #[test]
+    fn a_folder_whose_files_differ_in_time_is_not_taken_as_a_rename() {
+        let mut w = lookalikes();
+        fs::rename(w.source.join("media"), w.source.join("entertainment")).unwrap();
+        set_mtime(
+            &w.source.join("entertainment/a/two.bin"),
+            "2021-01-01 00:00:00",
+        );
+        let mut cfg = settings(None);
+        cfg.hash_max_size = 1;
+
+        let (_, stats) = w.planned(&cfg, true);
+
+        // No layout match, so nothing is trusted on layout: the look-alikes
+        // are ambiguous and the files too big to read are left to rsync.
+        assert_eq!(stats.folder_moves, 0, "{stats:?}");
+        assert_eq!(stats.verified, 0);
+    }
+
+    #[test]
+    fn a_folder_whose_contents_were_partly_replaced_is_not_taken_as_a_rename() {
+        let mut w = lookalikes();
+        fs::rename(w.source.join("media"), w.source.join("entertainment")).unwrap();
+        write(&w.source.join("entertainment/a/extra.bin"), "eeee");
+        set_mtime(
+            &w.source.join("entertainment/a/extra.bin"),
+            "2020-05-05 10:00:00",
+        );
+
+        let (_, stats) = w.planned(&settings(None), true);
+
+        assert_eq!(stats.folder_moves, 0, "{stats:?}");
+        // The unchanged files are still found, one by one, by content.
+        assert_eq!(stats.linked, 4, "{stats:?}");
+    }
+
+    #[test]
+    fn a_layout_that_appears_twice_is_left_to_the_file_by_file_rules() {
+        let mut w = lookalikes();
+        fs::rename(w.source.join("media"), w.source.join("copy1")).unwrap();
+        let status = Command::new("cp")
+            .args(["-a"])
+            .arg(w.source.join("copy1"))
+            .arg(w.source.join("copy2"))
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let (_, stats) = w.planned(&settings(None), true);
+
+        assert_eq!(stats.folder_moves, 0, "{stats:?}");
+    }
+
+    #[test]
+    fn verify_hash_demands_content_proof_even_for_a_renamed_folder() {
+        let mut w = lookalikes();
+        fs::rename(w.source.join("media"), w.source.join("entertainment")).unwrap();
+
+        let (_, stats) = w.planned(&settings(Some("hash")), true);
+
+        assert_eq!(stats.folder_moves, 0, "{stats:?}");
+        assert_eq!((stats.linked, stats.verified), (4, 4), "{stats:?}");
+    }
+
+    #[test]
+    fn a_renamed_folder_is_linked_for_a_remote_source_too() {
+        let mut w = lookalikes();
+        fs::rename(w.source.join("media"), w.source.join("entertainment")).unwrap();
+
+        let (shadow, stats) = w.planned(&tiers(None), false);
+
+        assert_eq!(stats.linked, 4, "{stats:?}");
+        assert_eq!(
+            ino(&shadow.unwrap().join("entertainment/four.bin")),
+            ino(&w.prev.join("media/four.bin"))
+        );
     }
 
     #[test]

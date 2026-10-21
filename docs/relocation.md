@@ -42,9 +42,10 @@ flowchart TD
 ```
 
 1. **Find what changed.** Timevault runs the real rsync command a second time as a *dry run* against the previous generation. Nothing is written. It reports the files that are new at the source and the files that vanished from it. The pass reads the source tree once, so for a remote source it costs an extra file-list exchange over SSH.
-2. **Pair them.** A new file is paired with an old file when they have the same size and modification time (moving or renaming a file keeps its modification time) and, where possible, the same content. The disk-local [file index](architecture.md#disk-local-file-index) supplies the old files' details, which is why relocation switches the index on.
-3. **Offer the data to rsync safely.** For each pairing, Timevault makes a hard link at the *new* path, pointing to the old file, inside a scratch directory `<job>/.timevault-reloc`. That directory is passed to rsync as one more `--link-dest`.
-4. **Clean up.** The scratch directory holds only links, and is removed when the run ends (or at the start of the next run if the machine crashed).
+2. **Recognise renamed folders.** If a directory of new files and a directory of vanished files hold exactly the same files (the same path below the directory, size and modification time, at least three of them), the folder was renamed or moved, and its files are paired without reading any content. This is the same evidence rsync itself accepts for a file at an unchanged path, so it is trusted in `verify: auto` and `size-mtime`, for a local source and for a remote one whose checksums are unavailable (`verify: hash` still demands content proof; a remote source that reports checksums is still matched by them, which reads only the candidate files). It is exact: one added, missing or touched file, or the same layout appearing twice, means the folder is not treated as a rename and its files go through the steps below. The outermost renamed folder is used, and the report says how many were matched this way.
+3. **Pair the rest.** A new file is paired with an old file when they have the same size and modification time (moving or renaming a file keeps its modification time) and, where possible, the same content. The disk-local [file index](architecture.md#disk-local-file-index) supplies the old files' details, which is why relocation switches the index on.
+4. **Offer the data to rsync safely.** For each pairing, Timevault makes a hard link at the *new* path, pointing to the old file, inside a scratch directory `<job>/.timevault-reloc`. That directory is passed to rsync as one more `--link-dest`.
+5. **Clean up.** The scratch directory holds only links, and is removed when the run ends (or at the start of the next run if the machine crashed).
 
 ### Why this is safe
 
@@ -86,7 +87,7 @@ options:
     enabled: true             # default true when this block is present
     minSize: 65536            # smallest file considered, in bytes (default 64 KiB)
     maxChanges: 200000        # give up if more files than this are new or vanished
-    timeoutSeconds: 300       # give up if planning takes longer than this
+    timeoutSeconds: 3600      # give up if planning takes longer than this
     verify: auto              # auto | hash | size-mtime
     hashMaxSize: 2147483648   # largest file whose content is compared (default 2 GiB, 0 = no limit)
 jobs:
