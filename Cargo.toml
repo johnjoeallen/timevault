@@ -23,7 +23,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [package.metadata.deb]
 maintainer = "Timevault Maintainers"
-revision = "4"
+revision = "5"
 depends = "rsync, util-linux, coreutils"
 assets = [
   ["target/release/timevault", "usr/bin/timevault", "755"],
