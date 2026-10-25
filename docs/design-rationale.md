@@ -46,26 +46,6 @@ A second run on a day that already has a completed generation does nothing unles
 - **Cost:** a job run several times a day keeps the state of the first run, and refreshing it needs an explicit flag. This reverses the behaviour of releases before 1.15.0.
 - **Safe replacement:** the rebuild happens in staging and replaces the old generation by an atomic swap, so a failed rebuild leaves the old generation in place.
 
-## Reusing moved files through a read-only reference
-
-Moved and renamed files are offered to rsync as an extra `--link-dest` directory of hard links, instead of being pre-linked into the new generation or patched afterwards.
-
-- **Why:** rsync never writes into a `--link-dest` reference. It links a file from it only when every preserved attribute matches the source, and otherwise writes a new file. A moved file whose permissions, owner or timestamp changed therefore cannot alter the old generation, which pre-populating the new generation with links could do, because hard-linked files share one inode's metadata.
-- **Why a dry run first:** rsync's own comparison of the source against the previous generation is the cheapest complete list of what is new and what vanished, and it handles arbitrary file names. Pairing a *vanished* old path with a *new* path of the same size and modification time is strong evidence of a move; a file that still exists is a copy and is only shared after its content is compared.
-- **Why bounded, and on by default:** the extra pass is real work, especially over SSH: about 0.25 s per 20,000 files locally and 0.37 s over loopback SSH on a quiet night. It is on because a single reorganisation saves far more (157 MiB of copying avoided in the benchmark), it cannot damage history, and it never fails a backup. A time limit and a change limit make it fall back to ordinary copying instead of slowing the backup, and `relocation: false` turns it off globally or per job.
-- **Why rsync's checksum for remote confirmation:** it needs no code uploaded to, or run as root on, the remote host, and file names never pass through a shell.
-- **Why remote files are hashed through rsync:** size and modification time never prove identical content, however unique the pairing, so a wrong pairing would silently store the wrong bytes. They only choose which files are worth reading. For a remote source the source's own rsync reports a SHA-1 for each candidate (`-n -c --checksum-choice=sha1 --out-format=%C...`), so nothing is installed or run as root there and file names never reach a shell. Reads are limited to new files that have an old file of the same size, capped by size and per run, so a huge file is never read unless you ask. When the source's rsync is too old to answer, the earlier, weaker tiers (folder moves trusted as a group, lone files confirmed pairwise) take over and the log says so. See [Remote content hashing](remote-hashing.md).
-- **Cost:** an extra pass per run, the file index, and, for remote sources, a checksum read of each lone candidate up to `hashMaxSize`.
-
-## A file index on each disk, not a central one
-
-The index that lets Timevault recognise moved files is stored on the backup disk it describes.
-
-- **Why:** a disk must stay usable on its own, and an index that lived on the host (or on another disk) would tie it to that machine or disk and go stale whenever disks are rotated. A disk-local index travels with the disk, describes exactly what that disk holds, and can be rebuilt from it.
-- **Why it is an optimisation, not a dependency:** the generations are the truth. Treating the index as disposable means a crash, a corrupt file or a version change can never make backups unreadable, only slower once.
-- **Why hashing is lazy:** hashing every file on every run would cost far more than the savings. Hashes are computed on demand, shared between hard links, and trusted only after the file is re-checked.
-- **Cost:** extra disk space and a walk of each new generation per run, which is why `options.index` itself is off by default and the index is kept only while a feature that uses it, such as moved-file detection, is on.
-
 ## Completed generations are never modified
 
 - **Why:** a restore from last month must still return last month. Hard links share inodes, so a permission or timestamp change applied in place to a shared file would rewrite that file in every generation that links it. Timevault builds into staging and stores a changed file anew.

@@ -21,10 +21,12 @@ pub struct DiskIdentity {
 
 /// Everything Timevault keeps on a disk outside the job directories lives in
 /// this directory. Releases before 1.21.0 kept the identity in a file of this
-/// name and the file index in `.timevault-index`.
+/// name. Releases 1.19 to 1.21 also kept a file index, which is no longer
+/// used and is removed when found.
 pub const META_DIR: &str = ".timevault";
 pub const IDENTITY_FILE: &str = "identity";
 const LEGACY_INDEX_DIR: &str = ".timevault-index";
+const INDEX_DIR: &str = "index";
 const MIGRATING_IDENTITY: &str = ".timevault-identity.old";
 
 /// Where the identity is read from: `.timevault/identity`, or the old
@@ -40,8 +42,8 @@ pub fn identity_path(root: &std::path::Path) -> std::path::PathBuf {
 }
 
 /// Move the metadata of an older release into `.timevault/`: the identity file
-/// becomes `.timevault/identity` and `.timevault-index` becomes
-/// `.timevault/index`. Safe to repeat, and safe to interrupt: a crash between
+/// becomes `.timevault/identity`. The file index of releases 1.19 to 1.21
+/// (`.timevault-index` or `.timevault/index`) is deleted. Safe to repeat, and safe to interrupt: a crash between
 /// the two renames of the identity leaves it as `.timevault-identity.old`, which
 /// the next call completes. Needs a writable disk.
 pub fn migrate_layout(root: &std::path::Path) -> std::io::Result<()> {
@@ -60,11 +62,10 @@ pub fn migrate_layout(root: &std::path::Path) -> std::io::Result<()> {
             fs::rename(&parked, &target)?;
         }
     }
-    let old_index = root.join(LEGACY_INDEX_DIR);
-    let new_index = meta.join("index");
-    if old_index.is_dir() && !new_index.exists() {
-        fs::create_dir_all(&meta)?;
-        fs::rename(&old_index, &new_index)?;
+    for stale in [root.join(LEGACY_INDEX_DIR), meta.join(INDEX_DIR)] {
+        if stale.is_dir() {
+            fs::remove_dir_all(&stale)?;
+        }
     }
     Ok(())
 }
@@ -157,7 +158,7 @@ mod tests {
             std::fs::read_to_string(identity_path(root)).unwrap(),
             "version: 1\n"
         );
-        assert!(root.join(".timevault/index/file-index.sqlite").is_file());
+        assert!(!root.join(".timevault/index").exists());
         assert!(!root.join(".timevault-index").exists());
         assert!(!root.join(".timevault-identity.old").exists());
     }

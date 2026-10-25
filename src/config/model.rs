@@ -33,14 +33,6 @@ pub struct ConfigOptions {
     pub safe: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub progress: Option<bool>,
-    /// Maintain each disk's file index (`<disk>/.timevault/index`). Defaults to
-    /// [`crate::backup::index::INDEX_DEFAULT`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub index: Option<bool>,
-    /// Reuse files that were moved or renamed instead of copying them again.
-    /// Needs the file index, which it switches on.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub relocation: Option<RelocationOption>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rsync: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -74,52 +66,6 @@ pub struct JobConfig {
     pub disk_ids: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote: Option<RemoteJobOptions>,
-    /// Per-job override of `options.relocation` (moved or renamed file reuse).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub relocation: Option<bool>,
-}
-
-/// `options.relocation`: either a plain on/off flag or a settings block.
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
-#[serde(untagged)]
-pub enum RelocationOption {
-    Flag(bool),
-    Settings(RelocationSettings),
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct RelocationSettings {
-    /// Defaults to `true` when a settings block is given.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub enabled: Option<bool>,
-    /// Smallest file (bytes) considered for reuse.
-    #[serde(default, rename = "minSize", skip_serializing_if = "Option::is_none")]
-    pub min_size: Option<u64>,
-    /// Give up on a run when rsync reports more new or vanished files than this.
-    #[serde(
-        default,
-        rename = "maxChanges",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub max_changes: Option<usize>,
-    /// Give up on a run when planning takes longer than this.
-    #[serde(
-        default,
-        rename = "timeoutSeconds",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub timeout_seconds: Option<u64>,
-    /// `auto`, `hash` or `size-mtime`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub verify: Option<String>,
-    /// Largest file (bytes) whose content is compared; `0` means no limit.
-    #[serde(
-        default,
-        rename = "hashMaxSize",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub hash_max_size: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq, Eq)]
@@ -239,7 +185,6 @@ pub struct Job {
     pub includes: Vec<String>,
     pub disk_ids: Option<Vec<String>>,
     pub remote: Option<RemoteJobOptions>,
-    pub relocation: Option<bool>,
 }
 
 #[derive(Debug, Clone)]

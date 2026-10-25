@@ -191,7 +191,6 @@ fn parse_runtime(cfg: Config) -> Result<RuntimeConfig> {
             includes: job.includes,
             disk_ids: disk_ids_for_job,
             remote: job.remote,
-            relocation: job.relocation,
         });
     }
 

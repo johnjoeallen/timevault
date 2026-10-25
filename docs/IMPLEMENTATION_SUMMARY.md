@@ -1,5 +1,7 @@
 # Implementation summary
 
+> **Superseded in part:** the file index and moved-file reuse described here were removed after 1.21 because of their runtime cost. This page and the other implementation records are kept as history.
+
 This summarises the work described in [PLAN.md](PLAN.md): staged publication, current-target recreation, a disk-local file index, moved-file reuse, rotation and cascade validation, and the user documentation. The detailed record of each step, including every decision and what was found along the way, is [IMPLEMENTATION_LOG.md](IMPLEMENTATION_LOG.md). The work is on branch `worktree-generational-phase0`, version 1.14.0 to 1.20.0.
 
 ## Outcome in one paragraph
@@ -90,7 +92,7 @@ The first mass-rename implementation took 55.7 s and saved nothing on uniform da
 
 ## Remaining limitations
 
-- **Remote pairing needs rsync 3.5.0 or newer at the source.** With an older one Timevault falls back to the earlier, weaker evidence (folder moves trusted as a group, lone files confirmed pairwise, thousands of look-alikes left to rsync) and says so in the log and the report. The minimum is the only version tested; 3.2.x might work and has not been tried. See [remote-hashing.md](remote-hashing.md).
+- **Remote pairing needs rsync 3.5.0 or newer at the source.** With an older one Timevault falls back to the earlier, weaker evidence (folder moves trusted as a group, lone files confirmed pairwise, thousands of look-alikes left to rsync) and says so in the log and the report. The minimum is the only version tested; 3.2.x might work and has not been tried. See remote-hashing.md (removed).
 - **SSH overhead is measured on loopback only.** There was no real network latency or bandwidth limit; the figures show protocol and process cost. Cold caches, spinning disks and trees of millions of files were not measured.
 - **Index cost scales with all files, not changed files.** Recording a generation touches every row (about 4 microseconds per file; publishing no longer does). Recording only the changes would fix that. The checksums rsync reports for old files are not cached, so the old files are read again each run. Extended attributes and ACLs are not captured in the index (rsync decides whether they match).
 - **A mount or lock error stops the run;** disks after it are not attempted. This is the existing behaviour, documented and now tested; no automatic fallback was added.

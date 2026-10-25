@@ -50,12 +50,6 @@ options:
   #   emailTo: "admin@example.com"
   #   emailFrom: "timevault@example.com"
   #   sendmail: "/usr/sbin/sendmail"
-  # Keep a per-disk file index (<disk>/.timevault-index). Off by default.
-  # index: true
-  # Reuse files that were moved or renamed instead of storing them again.
-  # On by default (it keeps the per-disk file index). Set false to turn it off,
-  # or give a block of settings. See docs/relocation.md.
-  # relocation: false
   rsync:
     - "--one-file-system"
 

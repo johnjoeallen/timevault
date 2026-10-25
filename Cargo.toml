@@ -1,6 +1,6 @@
 [package]
 name = "timevault"
-version = "1.21.1"
+version = "1.21.2"
 edition = "2021"
 description = "Safe rsync-based backup tool with mount validation and snapshot rotation"
 license = "GPL-3.0-or-later"
@@ -10,11 +10,9 @@ anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
-rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
-sha2 = "0.10"
 signal-hook = "0.3"
 tempfile = "3"
 thiserror = "1"
@@ -23,7 +21,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [package.metadata.deb]
 maintainer = "Timevault Maintainers"
-revision = "5"
+revision = "0"
 depends = "rsync, util-linux, coreutils"
 assets = [
   ["target/release/timevault", "usr/bin/timevault", "755"],
@@ -39,8 +37,6 @@ assets = [
   ["docs/retention-capacity.md", "usr/share/doc/timevault/docs/retention-capacity.md", "644"],
   ["docs/recovery.md", "usr/share/doc/timevault/docs/recovery.md", "644"],
   ["docs/recreate.md", "usr/share/doc/timevault/docs/recreate.md", "644"],
-  ["docs/relocation.md", "usr/share/doc/timevault/docs/relocation.md", "644"],
-  ["docs/remote-hashing.md", "usr/share/doc/timevault/docs/remote-hashing.md", "644"],
   ["docs/examples.md", "usr/share/doc/timevault/docs/examples.md", "644"],
   ["docs/design-rationale.md", "usr/share/doc/timevault/docs/design-rationale.md", "644"],
   ["LICENSE", "usr/share/doc/timevault/LICENSE", "644"],

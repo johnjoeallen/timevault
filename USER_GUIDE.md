@@ -15,7 +15,6 @@ Timevault is built around a few principles:
 - [Cascade guide](docs/cascade.md): copying one finished backup to other connected disks.
 - [Retention and capacity](docs/retention-capacity.md): `copies` versus calendar days, and how space is used.
 - [Skipping completed days and recreating](docs/recreate.md): why a second run on the same day is skipped, and `--recreate`.
-- [Reusing moved and renamed files](docs/relocation.md): `options.relocation`, how it works, its limits and cost.
 - [Recovery guide](docs/recovery.md): restores, failed backups, replacing a disk, running out of space.
 - [Operational examples](docs/examples.md) and [Design rationale](docs/design-rationale.md).
 
@@ -28,8 +27,6 @@ Timevault reads a YAML config file (default `/etc/timevault.yaml`).
 - `backupDisks`: List of enrolled backup disks (required for backups).
 - `excludes`: Global exclude paths applied to all jobs.
 - `options`: Optional defaults for CLI flags (currently `cascade`, `exclude-pristine`, `verbose`, `safe`, `rsync`). CLI flags still take precedence. `rsync` args from config are prepended to any CLI `--rsync` args.
-- `options.index`: Optional boolean, default `false`; the index is kept anyway while moved-file detection is on, which it is by default. When `true`, Timevault keeps a file index on each backup disk (`<disk>/.timevault/index/file-index.sqlite`) describing the previous and the newly built generation of every job. Moved-file detection (`options.relocation`) uses it and keeps it on; on its own it does not change what is backed up. It costs one extra walk of each new generation per run and roughly 0.5 KB of disk per file. It is never required for restoring, and a missing or corrupt index is rebuilt automatically. See [Architecture](docs/architecture.md#disk-local-file-index).
-- `options.relocation`: **On by default** (from 1.19.0); set `false` to turn it off. Reuse files that were moved or renamed instead of storing them again. Either `true`/`false`, or a block with `enabled`, `minSize` (bytes, default 65536), `maxChanges` (default 200000), `timeoutSeconds` (default 3600), `verify` (`auto`, `hash` or `size-mtime`) and `hashMaxSize` (bytes, default 2 GiB, `0` for no limit; content is compared only for files up to this size). It runs an extra read-only rsync pass against the previous generation, needs the file index (and keeps it on), and never fails a backup: if it gives up, rsync copies the files as before. For a remote source it asks the source's rsync for SHA-1 checksums of the candidate files (rsync 3.5.0 or newer on both ends; with an older one it falls back to weaker evidence and says so), and the emailed report shows what was reused. A job can override it with its own `relocation:`. See [Reusing moved and renamed files](docs/relocation.md).
 - `jobs`: List of backup jobs. Job names must not start with `.timevault`.
 
 ### backupDisks entries
@@ -63,7 +60,6 @@ Each job defines a backup source and retention policy.
 - `includes`: Optional paths to back up for this job even if a global or job exclude covers them (e.g. `/data/docker/volumes` when `/data/docker` is excluded). Paths are anchored at the job `source`. Excluded parent directories stay excluded except for the included path.
 - `diskIds`: Optional list of disk IDs this job is allowed to run on.
 - `remote`: Optional remote power behavior for SSH-style sources.
-- `relocation`: Optional boolean. Overrides `options.relocation` for this job (moved and renamed file reuse). See [Reusing moved and renamed files](docs/relocation.md).
 
 Optional job hooks are discovered by convention:
 - `/etc/timevault/scripts/{jobname}.pre`: Runs before the job starts.
@@ -260,7 +256,7 @@ By default Timevault uses `/usr/sbin/sendmail -t`; set `options.report.sendmail`
 - Running Timevault with no command and no `--job` displays help, the same as `--help`.
 - Uses the first connected disk unless `--disk-id` is set to a disk id or filesystem UUID.
 - If the backup day already has a completed generation on a disk, that job is skipped for that disk and reported `already complete`: no hooks run and nothing is rebuilt. Add `--recreate` to rebuild it. **Behaviour change in 1.15.0:** earlier releases replaced the day's generation on every run, so a job run more than once a day now keeps the state of the first run unless `--recreate` is used.
-- Moved and renamed files are detected and their data reused instead of being stored again. **Behaviour change in 1.19.0:** this is now on by default. It adds a read-only rsync pass per job and a `.timevault/` directory on each backup disk (about 0.5 KB per file); set `options.relocation: false`, or `relocation: false` on a job, to turn it off. See [Reusing moved and renamed files](docs/relocation.md).
+- Releases 1.19 to 1.21 reused moved and renamed files through a SQLite file index. That feature, the index and the `options.index` / `options.relocation` settings were removed because of their runtime cost; the settings are now ignored if still present in a config, and the index directory on each disk is deleted on the next backup. A moved or renamed file is stored again.
 - With `--cascade`, uses the primary disk’s `current` as the source for other disks. A job is cascaded only if its backup to the primary disk produced a snapshot this run; if the primary backup was skipped, failed, or offline, that job's cascade is skipped (with a note) rather than copying a stale snapshot.
 
 ### Wake test
@@ -440,12 +436,12 @@ Each run builds the next generation with a single `rsync --link-dest` against th
 - A leftover `.timevault-staging` is removed on the next run when there is a previous generation to link against, and resumed for an initial backup. Re-running a job on a day that already has a completed generation skips it unless `--recreate` is given; with `--recreate` a fresh generation is built and swapped in (a single atomic exchange where the filesystem supports it, otherwise a rename); an interrupted swap is repaired automatically on the next run (`.timevault-publishing`, `.timevault-replaced-<day>`). See the [Recovery guide](docs/recovery.md).
 - A partial `<YYYYMMDD>` directory left by an earlier release's failed run is replaced the same way, but until then it still counts toward `copies`.
 - Files are linked only when every attribute rsync preserves matches (`-a`: permissions, owner, group, mtime). Adding `--xattrs`, `--acls` or `--numeric-ids` through `rsync` options therefore makes the first run afterwards copy everything.
-- A renamed or moved file is copied again, because `--link-dest` matches files by path, unless `options.relocation` is enabled. With it, moved and renamed files are found before the copy and their data is reused from the previous generation through a scratch directory `<job>/.timevault-reloc` that is passed to rsync as an extra read-only `--link-dest`. See [Reusing moved and renamed files](docs/relocation.md).
+- A renamed or moved file is copied again, because `--link-dest` matches files by path.
 - `--safe` still skips every deletion; a stale staging or replaced directory is then left in place.
 - Post-backup scripts receive the final `<YYYYMMDD>` path; after a failed run that directory does not exist.
 
 ## Notes
 - Backup disks must contain `/.timevault/identity` and match the configured `diskId` and `fsUuid`.
-- Snapshot structure is `<mount>/<job>/<YYYYMMDD>` with a `current` symlink. Each generation also holds a small `.timevault-complete` file, and the disk root holds `.timevault/` (the disk identity and the file index) while moved-file detection is on. Neither is needed to restore.
+- Snapshot structure is `<mount>/<job>/<YYYYMMDD>` with a `current` symlink. Each generation also holds a small `.timevault-complete` file, and the disk root holds `.timevault/` (the disk identity). Neither is needed to restore.
 - `--safe` and `--dry-run` are recommended when validating new configurations.
 - Two `timevault` processes may run different jobs concurrently, even against the same disk (each gets its own mount point and excludes file). A second run of the *same* job is refused with `job <name> is already running` (per-job lock at `/var/run/timevault.<job>.pid`, stale-pid aware).

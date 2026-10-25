@@ -1,6 +1,6 @@
 # Plan: relocation-aware reuse, disk-local index, safe publication, current-target recreation, rotation docs
 
-Status: approved plan, in progress. All phases are done. The outcome is summarised in [IMPLEMENTATION_SUMMARY.md](IMPLEMENTATION_SUMMARY.md). The follow-up that proves remote pairings by content was built in 1.20.0 ([remote-hashing.md](remote-hashing.md)). Evolves the existing architecture; it does not replace it.
+Status: approved plan, in progress. All phases are done. The outcome is summarised in [IMPLEMENTATION_SUMMARY.md](IMPLEMENTATION_SUMMARY.md). The follow-up that proves remote pairings by content was built in 1.20.0 (remote-hashing.md (removed)). Evolves the existing architecture; it does not replace it.
 
 This plan is kept current as work proceeds. What was done, decided and learned is recorded in [IMPLEMENTATION_LOG.md](IMPLEMENTATION_LOG.md); every change to the plan itself is noted there too.
 

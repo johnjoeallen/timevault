@@ -63,17 +63,13 @@ A file deleted from the source disappears from newer generations, but its data s
 
 ### Moved and renamed files
 
-Matching is by relative path. If you move a large tree or rename many files, rsync sees new paths and stores that content again, even though the old copy still exists in earlier generations. Without moved-file detection, expect the next backup to need space close to the size of the moved data, and that space stays in use until the old generations holding the old paths expire.
+Matching is by relative path. If you move a large tree or rename many files, rsync sees new paths and stores that content again, even though the old copy still exists in earlier generations. Expect the next backup to need space close to the size of the moved data, and that space stays in use until the old generations holding the old paths expire.
 
-With moved-file detection (on by default; `options.relocation`), such files are found and their existing data is reused, so the next backup adds only directory entries (in a test, moving every folder of 20,000 files added 10.6 MiB instead of 157 MiB). It only reuses files at or above `minSize`, files whose content and attributes are unchanged, and, for remote sources, moves it can pair with confidence. A file that is edited as well as moved, or whose permissions or owner changed, is stored again. See [Reusing moved and renamed files](relocation.md). If a disk is too full to take a reorganised tree, keeping this on is often the way to make the next backup fit without deleting any history.
+Plan for this when reorganising a large tree on a nearly full disk.
 
 ### A disk returning after time away
 
 A disk returning after a week does not need a full backup. It needs room for what changed, was added or was removed at the source since its last generation. A longer absence can mean a larger single increment.
-
-### The file index
-
-Because moved-file detection is on by default, the disk also holds `.timevault/index/file-index.sqlite` (unless you set `options.relocation: false`). Plan for about half a kilobyte per file in the generation being indexed (roughly 50 MB per 100,000 files, more with long paths), plus a similar amount while a new generation is being recorded. It is not shared with hard links, so it counts fully against the disk.
 
 ### Headroom
 

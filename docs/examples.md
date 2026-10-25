@@ -147,21 +147,6 @@ jobs:
 
 Retention is per job and per disk: the three jobs keep different numbers of generations on the same disk.
 
-## 9. Turning moved-file detection off for one slow job
-
-Moved-file detection is on by default. For a job on a slow link where files are never reorganised, switch it off for that job only:
-
-```yaml
-jobs:
-  - name: "branch-office"
-    source: "root@branch.example.com:/srv"
-    copies: 14
-    run: "auto"
-    relocation: false
-```
-
-Or turn it off everywhere with `options: { relocation: false }`. See [Reusing moved and renamed files](relocation.md).
-
 ## Useful commands
 
 ```bash

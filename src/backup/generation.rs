@@ -35,8 +35,8 @@ pub const COMPLETE_MARKER: &str = ".timevault-complete";
 pub const PUBLISH_INTENT: &str = ".timevault-publishing";
 /// Temporary symlink renamed over `current`, so `current` is replaced atomically.
 pub const CURRENT_TMP: &str = ".timevault-current.tmp";
-/// Scratch directory of hard links used by moved-file detection while a
-/// generation is built. Holds only links, so removing it never touches data.
+/// Scratch directory of hard links left by releases 1.19 to 1.21 (moved-file
+/// detection). Holds only links, so removing it never touches data.
 pub const RELOC_NAME: &str = ".timevault-reloc";
 
 const RENAME_EXCHANGE: libc::c_uint = 2;

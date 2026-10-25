@@ -56,14 +56,6 @@ pub fn run_backup_command(
         exclude_pristine_only: options.exclude_pristine_only,
         session_seconds_override: options.session_seconds_override,
         recreate: options.recreate,
-        index: cfg
-            .options
-            .index
-            .unwrap_or(crate::backup::index::INDEX_DEFAULT),
-        relocation: crate::backup::relocation::RelocationConfig::from_option(
-            cfg.options.relocation.as_ref(),
-        )
-        .map_err(TimevaultError::message)?,
     };
     let report_options = cfg.options.report.clone();
 
@@ -665,7 +657,6 @@ mod tests {
             includes: Vec::new(),
             disk_ids: None,
             remote: None,
-            relocation: None,
         };
         assert!(!job_requires_disk(&job, "disk-a"));
         let job = crate::config::model::Job {
@@ -678,7 +669,6 @@ mod tests {
             includes: Vec::new(),
             disk_ids: Some(vec!["disk-a".to_string()]),
             remote: None,
-            relocation: None,
         };
         assert!(job_requires_disk(&job, "disk-a"));
         assert!(!job_requires_disk(&job, "disk-b"));
@@ -714,7 +704,6 @@ mod tests {
             includes: Vec::new(),
             disk_ids: Some(vec!["disk-b".to_string()]),
             remote: None,
-            relocation: None,
         };
         let allowed = allowed_disks_for_job(&job, &connected);
         assert_eq!(allowed.len(), 1);
@@ -751,7 +740,6 @@ mod tests {
             includes: Vec::new(),
             disk_ids: None,
             remote: None,
-            relocation: None,
         };
         let allowed = allowed_disks_for_job(&job, &connected);
         assert_eq!(allowed.len(), 2);
@@ -779,7 +767,6 @@ mod tests {
             includes: Vec::new(),
             disk_ids: disk_ids.map(|ids| ids.iter().map(|id| id.to_string()).collect()),
             remote: None,
-            relocation: None,
         }
     }
 
@@ -880,7 +867,6 @@ mod tests {
                     failure_reason: None,
                     power: None,
                     power_diagnostics: None,
-                    relocation: None,
                 })
                 .collect(),
         }
@@ -1089,7 +1075,6 @@ mod tests {
         source: PathBuf,
         host: TestHost,
         disks: Vec<BackupDiskConfig>,
-        relocation: std::cell::Cell<crate::backup::relocation::RelocationConfig>,
     }
 
     fn lab(disk_ids: &[&str]) -> Lab {
@@ -1109,7 +1094,6 @@ mod tests {
             _locks: locks,
             source,
             disks: disk_ids.iter().map(|id| plan_disk(id)).collect(),
-            relocation: std::cell::Cell::new(crate::backup::relocation::RelocationConfig::default()),
         }
     }
 
@@ -1161,8 +1145,6 @@ mod tests {
                     exclude_pristine_only: false,
                     session_seconds_override: None,
                     recreate: false,
-                    index: false,
-                    relocation: self.relocation.get(),
                 },
                 &mut reports,
             )?;
@@ -1633,80 +1615,6 @@ mod tests {
         assert_eq!(statuses(&reports, "a"), vec![BackupJobStatus::Success]);
         assert!(statuses(&reports, "b").is_empty());
         assert!(lab.gens("b", "data").is_empty());
-    }
-
-    // ---- real SSH (opt in: TIMEVAULT_TEST_SSH=1 cargo test -- --test-threads=1) ----
-
-    #[test]
-    fn remote_sources_over_real_ssh_cascade_and_reuse_moved_files() {
-        let Some(ssh) = crate::util::testsupport::SshLoopback::enabled() else {
-            return;
-        };
-        let lab = lab(&["a", "b"]);
-        lab.relocation
-            .set(crate::backup::relocation::RelocationConfig {
-                enabled: true,
-                min_size: 1,
-                ..Default::default()
-            });
-        // A folder of tracks and one lone file, all with the same mtime.
-        for i in 0..5 {
-            let path = lab.source.join(format!("album/track{i}.flac"));
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(&path, format!("audio-{i}-{}", "z".repeat(i * 10))).unwrap();
-            touch(&path, "2020-05-05 10:00:00");
-        }
-        let lone = lab.source.join("lone.bin");
-        std::fs::write(&lone, "a lone file with its own content").unwrap();
-        touch(&lone, "2020-05-05 10:00:00");
-        let remote = ssh.source(&lab.source);
-        let job = |lab: &Lab| lab.job("data", Path::new(&remote), 20);
-
-        // Day one: the remote host goes to the primary over SSH, and the
-        // primary's generation goes to the second disk locally.
-        *lab.host.day.borrow_mut() = String::new();
-        let (result, reports) = lab.run(1, &["a", "b"], true, vec![job(&lab)]).unwrap();
-        assert_eq!(result, AutoResult::Done);
-        assert_eq!(statuses(&reports, "a"), vec![BackupJobStatus::Success]);
-        assert_eq!(statuses(&reports, "b"), vec![BackupJobStatus::Success]);
-
-        // The remote host reorganises: the folder is renamed and the lone file moves.
-        std::fs::rename(lab.source.join("album"), lab.source.join("Music")).unwrap();
-        std::fs::rename(&lone, lab.source.join("lone-renamed.bin")).unwrap();
-        let (result, reports) = lab.run(2, &["a", "b"], true, vec![job(&lab)]).unwrap();
-        assert_eq!(result, AutoResult::Done);
-        assert_eq!(statuses(&reports, "a"), vec![BackupJobStatus::Success]);
-        assert_eq!(statuses(&reports, "b"), vec![BackupJobStatus::Success]);
-
-        for disk in ["a", "b"] {
-            // The folder move (found without reading anything on the primary,
-            // by content on the second disk) and the lone file (confirmed by
-            // rsync's checksum on the primary) all reused existing data.
-            for i in 0..5 {
-                let old = lab
-                    .job_dir(disk, "data")
-                    .join(day_name(1))
-                    .join(format!("album/track{i}.flac"));
-                let new = lab
-                    .job_dir(disk, "data")
-                    .join(day_name(2))
-                    .join(format!("Music/track{i}.flac"));
-                assert_eq!(
-                    std::fs::metadata(&old).unwrap().ino(),
-                    std::fs::metadata(&new).unwrap().ino(),
-                    "{disk} track {i}"
-                );
-            }
-            assert_eq!(
-                lab.ino(disk, "data", 1, "lone.bin"),
-                lab.ino(disk, "data", 2, "lone-renamed.bin"),
-                "{disk} lone file"
-            );
-        }
-        assert_eq!(
-            lab.text("a", "data", 2, "lone-renamed.bin"),
-            "a lone file with its own content"
-        );
     }
 }
 

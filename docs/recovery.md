@@ -73,12 +73,6 @@ Just connect it and run a normal backup. The disk links against its own latest g
 
 Timevault never deletes completed generations to make room. See [Out of space](retention-capacity.md#out-of-space) for the safe procedure.
 
-## Missing or corrupt file index
-
-The file index (`.timevault/index/file-index.sqlite`, kept while moved-file detection is on, which it is by default, or when `options.index: true` is set) is never needed to restore: mount the disk and copy from the generations as usual.
-
-If the index is missing, stale, or from an interrupted run, no action is needed. The next backup rebuilds it from the generations on that disk (a log line says `file index: rebuilt from the previous generation`). If the database is corrupt or not a database at all, Timevault moves it aside as `file-index.sqlite.corrupt-<n>` (only the newest is kept), creates a new one and rebuilds. You can also delete the `.timevault/index` directory yourself; nothing else depends on it. If the index belongs to a newer Timevault than the one running, it is left untouched, a warning is printed and the backup runs without it.
-
 ## Check that a disk is healthy
 
 `timevault disk check [<disk>]` verifies that connected disks have a `.timevault` identity matching the config. `timevault disk df` reports free space.
