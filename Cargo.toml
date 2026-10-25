@@ -1,6 +1,6 @@
 [package]
 name = "timevault"
-version = "1.15.0"
+version = "1.21.2"
 edition = "2021"
 description = "Safe rsync-based backup tool with mount validation and snapshot rotation"
 license = "GPL-3.0-or-later"
@@ -13,7 +13,6 @@ libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
-sha2 = "0.10"
 signal-hook = "0.3"
 tempfile = "3"
 thiserror = "1"
@@ -22,7 +21,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [package.metadata.deb]
 maintainer = "Timevault Maintainers"
-revision = "2"
+revision = "0"
 depends = "rsync, util-linux, coreutils"
 assets = [
   ["target/release/timevault", "usr/bin/timevault", "755"],
@@ -31,6 +30,15 @@ assets = [
   ["timevault.timer", "lib/systemd/system/timevault.timer", "644"],
   ["PACKAGING.md", "usr/share/doc/timevault/PACKAGING.md", "644"],
   ["README.md", "usr/share/doc/timevault/README.md", "644"],
+  ["USER_GUIDE.md", "usr/share/doc/timevault/USER_GUIDE.md", "644"],
+  ["docs/architecture.md", "usr/share/doc/timevault/docs/architecture.md", "644"],
+  ["docs/rotation.md", "usr/share/doc/timevault/docs/rotation.md", "644"],
+  ["docs/cascade.md", "usr/share/doc/timevault/docs/cascade.md", "644"],
+  ["docs/retention-capacity.md", "usr/share/doc/timevault/docs/retention-capacity.md", "644"],
+  ["docs/recovery.md", "usr/share/doc/timevault/docs/recovery.md", "644"],
+  ["docs/recreate.md", "usr/share/doc/timevault/docs/recreate.md", "644"],
+  ["docs/examples.md", "usr/share/doc/timevault/docs/examples.md", "644"],
+  ["docs/design-rationale.md", "usr/share/doc/timevault/docs/design-rationale.md", "644"],
   ["LICENSE", "usr/share/doc/timevault/LICENSE", "644"],
 ]
 maintainer-scripts = "debian"

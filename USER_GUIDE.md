@@ -10,6 +10,13 @@ Timevault is built around a few principles:
 ## Other docs
 - [README](README.md)
 - [Packaging](PACKAGING.md)
+- [Architecture overview](docs/architecture.md): how generations, hard links, staging and cascade work.
+- [Disk rotation guide](docs/rotation.md): single-disk, two-disk and multi-disk arrangements and how to choose.
+- [Cascade guide](docs/cascade.md): copying one finished backup to other connected disks.
+- [Retention and capacity](docs/retention-capacity.md): `copies` versus calendar days, and how space is used.
+- [Skipping completed days and recreating](docs/recreate.md): why a second run on the same day is skipped, and `--recreate`.
+- [Recovery guide](docs/recovery.md): restores, failed backups, replacing a disk, running out of space.
+- [Operational examples](docs/examples.md) and [Design rationale](docs/design-rationale.md).
 
 ## Configuration
 Timevault reads a YAML config file (default `/etc/timevault.yaml`).
@@ -20,7 +27,7 @@ Timevault reads a YAML config file (default `/etc/timevault.yaml`).
 - `backupDisks`: List of enrolled backup disks (required for backups).
 - `excludes`: Global exclude paths applied to all jobs.
 - `options`: Optional defaults for CLI flags (currently `cascade`, `exclude-pristine`, `verbose`, `safe`, `rsync`). CLI flags still take precedence. `rsync` args from config are prepended to any CLI `--rsync` args.
-- `jobs`: List of backup jobs.
+- `jobs`: List of backup jobs. Job names must not start with `.timevault`.
 
 ### backupDisks entries
 Each entry identifies a backup disk by UUID.
@@ -29,7 +36,7 @@ Each entry identifies a backup disk by UUID.
 - `label`: Optional human label.
 - `mountOptions`: Optional mount options for backups. Default: `rw,nodev,nosuid,noexec`.
 - `disabled`: Optional boolean. If `true`, Timevault will not use the disk for backups, including explicit `--disk-id` runs.
-- `rotatedOut`: Optional boolean. If `true`, Timevault skips the disk for automatic backup selection, but explicit `--disk-id <id>` runs still work.
+- `rotatedOut`: **Deprecated; will be removed.** Optional boolean. If `true`, Timevault skips the disk for automatic backup selection, but explicit `--disk-id <id>` runs still work. Timevault prints a warning when it is set. To stop backing up to a disk, use `disabled: true` (`timevault disk disable <disk>`), or simply unplug the disk.
 
 Example:
 ```yaml
@@ -230,6 +237,7 @@ Global options:
 - `--rsync <args...>`: Pass remaining args to rsync.
 - `--disk-id <id>`: Select a specific enrolled disk by disk id.
 - `--cascade`: Run backups across all connected disks.
+- `--recreate` (alias `--refresh`): Rebuild the current backup day's generation even though it is already complete. Without it, a day that already has a completed generation is skipped (reported `already complete`). Only the current day can be rebuilt; older generations are never touched. See [Skipping completed days and recreating](docs/recreate.md).
 - `--send-report`: Send the configured report email even during `--dry-run`.
 - `--version`: Show version and license info.
 - `-h`: Show help.
@@ -247,6 +255,8 @@ By default Timevault uses `/usr/sbin/sendmail -t`; set `options.report.sendmail`
 - `timevault backup` with no `--job` is the same as `timevault backup --job all`.
 - Running Timevault with no command and no `--job` displays help, the same as `--help`.
 - Uses the first connected disk unless `--disk-id` is set to a disk id or filesystem UUID.
+- If the backup day already has a completed generation on a disk, that job is skipped for that disk and reported `already complete`: no hooks run and nothing is rebuilt. Add `--recreate` to rebuild it. **Behaviour change in 1.15.0:** earlier releases replaced the day's generation on every run, so a job run more than once a day now keeps the state of the first run unless `--recreate` is used.
+- Releases 1.19 to 1.21 reused moved and renamed files through a SQLite file index. That feature, the index and the `options.index` / `options.relocation` settings were removed because of their runtime cost; the settings are now ignored if still present in a config, and the index directory on each disk is deleted on the next backup. A moved or renamed file is stored again.
 - With `--cascade`, uses the primary disk’s `current` as the source for other disks. A job is cascaded only if its backup to the primary disk produced a snapshot this run; if the primary backup was skipped, failed, or offline, that job's cascade is skipped (with a note) rather than copying a stale snapshot.
 
 ### Wake test
@@ -304,15 +314,16 @@ By default Timevault uses `/usr/sbin/sendmail -t`; set `options.report.sendmail`
 - `timevault disk enable <disk>`
 - `timevault disk disable <disk>`
 - Compatibility: `--disk-id <id>` or `--fs-uuid <uuid>` may be used instead of the positional selector.
-- `disable` keeps the disk enrolled but prevents all backup use, including explicit `--disk-id` runs.
+- `disable` keeps the disk enrolled but prevents all backup use, including explicit `--disk-id` runs and cascade. A disabled disk can still be listed, mounted and inspected for restores.
 - `enable` clears that state.
 
-### Disk rotation
+### Disk rotation (deprecated)
+Rotation is something you manage by connecting and disconnecting disks: enrolled disks that are not connected are ignored. These commands only set or clear the deprecated `rotatedOut` flag, print a deprecation warning, and will be removed. Use `timevault disk disable <disk>` instead.
 - `timevault disk rotate-in <disk>`
 - `timevault disk rotate-out <disk>`
 - Compatibility: `--disk-id <id>` or `--fs-uuid <uuid>` may be used instead of the positional selector.
-- `rotate-out` keeps the disk enrolled but removes it from automatic backup selection and cascade planning.
-- `rotate-in` returns the disk to automatic rotation.
+- `rotate-out` removes the disk from automatic backup selection and cascade planning.
+- `rotate-in` clears the flag.
 
 ### Disk inspect
 - `timevault disk inspect [<disk>]`
@@ -332,10 +343,10 @@ By default Timevault uses `/usr/sbin/sendmail -t`; set `options.report.sendmail`
 
 ## Job disk allowlists (`diskIds`)
 - If `diskIds` is set for a job, it will only run on those disks.
-- Without `--disk-id`, Timevault chooses the first connected disk in that list as the primary and cascades to the other connected disks in the list.
+- Without `--disk-id`, Timevault chooses the first eligible connected disk (in `backupDisks` order) that appears in that list as the primary and, with cascade, cascades to the other connected disks in the list.
 - With `--disk-id`, only jobs that include that disk in `diskIds` will run.
 - Disks with `disabled: true` are never used for backups.
-- Disks with `rotatedOut: true` are skipped by automatic selection and cascade planning, but can still be targeted with `--disk-id`.
+- Disks with the deprecated `rotatedOut: true` are skipped by automatic selection and cascade planning, but can still be targeted with `--disk-id`.
 
 ## Typical setup workflow
 1) Create a test config in your home directory:
@@ -419,18 +430,18 @@ Remote power options require `systemctl` over SSH on the remote host for suspend
 ## Snapshot generations
 Each run builds the next generation with a single `rsync --link-dest` against the last completed generation (the one `current` points at). Unchanged files become hard links, so every generation is a full, independently browsable tree that only costs the space of what changed. The on-disk layout is unchanged, so repositories created by earlier releases (which seeded the new day with hard links and synced in place) are used as-is, with no migration.
 
-- The new generation is built in `<mount>/<job>/.timevault-staging` and renamed to `<YYYYMMDD>` only after rsync succeeds (exit 0 or 24). A failed or interrupted run is never published, `current` does not move, and nothing is pruned.
-- Old generations are pruned after the new one is published, keeping `copies` of them. Earlier releases pruned first and so left `copies + 1` generations after a run. The generation `current` points at is never pruned.
+- The new generation is built in `<mount>/<job>/.timevault-staging`, flushed to disk, stamped with a `.timevault-complete` file and renamed to `<YYYYMMDD>` only after rsync succeeds (exit 0 or 24). A failed or interrupted run is never published, `current` does not move, and nothing is pruned. `current` is replaced atomically, and a run interrupted between publishing and moving `current` is repaired automatically at the start of the next run.
+- Old generations are pruned after the new one is published, keeping `copies` of them. The generation just published is always kept, so `copies: 1` keeps exactly the newest one. Earlier releases pruned first and so left `copies + 1` generations after a run, and before 1.18.1 `copies: 1` still kept the previous generation as an extra because it was the one `current` pointed at.
 - Completed generations are never written to. Previously, a permission, owner or timestamp change at the source was applied to the shared inode and so rewrote that file in every generation that linked it.
-- A leftover `.timevault-staging` is removed on the next run when there is a previous generation to link against, and resumed for an initial backup. Re-running a job on a day that already has a generation builds a fresh one and swaps it in with a rename; an interrupted swap is repaired automatically on the next run (`.timevault-replaced-<day>`).
+- A leftover `.timevault-staging` is removed on the next run when there is a previous generation to link against, and resumed for an initial backup. Re-running a job on a day that already has a completed generation skips it unless `--recreate` is given; with `--recreate` a fresh generation is built and swapped in (a single atomic exchange where the filesystem supports it, otherwise a rename); an interrupted swap is repaired automatically on the next run (`.timevault-publishing`, `.timevault-replaced-<day>`). See the [Recovery guide](docs/recovery.md).
 - A partial `<YYYYMMDD>` directory left by an earlier release's failed run is replaced the same way, but until then it still counts toward `copies`.
 - Files are linked only when every attribute rsync preserves matches (`-a`: permissions, owner, group, mtime). Adding `--xattrs`, `--acls` or `--numeric-ids` through `rsync` options therefore makes the first run afterwards copy everything.
-- A renamed or moved file is copied again, as before; `--link-dest` matches files by path.
+- A renamed or moved file is copied again, because `--link-dest` matches files by path.
 - `--safe` still skips every deletion; a stale staging or replaced directory is then left in place.
 - Post-backup scripts receive the final `<YYYYMMDD>` path; after a failed run that directory does not exist.
 
 ## Notes
 - Backup disks must contain `/.timevault/identity` and match the configured `diskId` and `fsUuid`.
-- Snapshot structure is `<mount>/<job>/<YYYYMMDD>` with a `current` symlink.
+- Snapshot structure is `<mount>/<job>/<YYYYMMDD>` with a `current` symlink. Each generation also holds a small `.timevault-complete` file, and the disk root holds `.timevault/` (the disk identity). Neither is needed to restore.
 - `--safe` and `--dry-run` are recommended when validating new configurations.
 - Two `timevault` processes may run different jobs concurrently, even against the same disk (each gets its own mount point and excludes file). A second run of the *same* job is refused with `job <name> is already running` (per-job lock at `/var/run/timevault.<job>.pid`, stale-pid aware).

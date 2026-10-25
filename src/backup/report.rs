@@ -37,6 +37,9 @@ pub enum BackupJobStatus {
     Failed,
     Offline,
     Skipped,
+    /// The backup day already had a completed generation and nothing was
+    /// rebuilt (pass `--recreate` to rebuild it).
+    AlreadyComplete,
 }
 
 impl BackupJobStatus {
@@ -47,13 +50,19 @@ impl BackupJobStatus {
             BackupJobStatus::Failed => "failed",
             BackupJobStatus::Offline => "offline",
             BackupJobStatus::Skipped => "skipped",
+            BackupJobStatus::AlreadyComplete => "already complete",
         }
     }
 
-    /// Whether this run left a usable `current` snapshot on the disk — the
-    /// precondition for cascading the job to other disks.
+    /// Whether the disk holds a usable `current` snapshot for this backup day
+    /// after the run — the precondition for cascading the job to other disks.
+    /// A job that was already complete counts: its generation is intact, and
+    /// disks that lack it still need it.
     pub fn produced_snapshot(self) -> bool {
-        matches!(self, BackupJobStatus::Success | BackupJobStatus::Partial)
+        matches!(
+            self,
+            BackupJobStatus::Success | BackupJobStatus::Partial | BackupJobStatus::AlreadyComplete
+        )
     }
 }
 
@@ -378,6 +387,7 @@ fn status_cell(status: BackupJobStatus) -> String {
         BackupJobStatus::Failed => ("#fee2e2", "#991b1b"),
         BackupJobStatus::Offline => ("#fef3c7", "#92400e"),
         BackupJobStatus::Skipped => ("#e2e8f0", "#334155"),
+        BackupJobStatus::AlreadyComplete => ("#e0f2fe", "#075985"),
     };
     format!(
         "<td style=\"border-bottom:1px solid #e5edf3; vertical-align:top;\"><span style=\"display:inline-block; background:{}; color:{}; border-radius:999px; padding:3px 9px; font-weight:bold; font-size:12px;\">{}</span></td>",
@@ -487,6 +497,7 @@ mod tests {
     fn only_successful_statuses_produce_a_cascade_snapshot() {
         assert!(BackupJobStatus::Success.produced_snapshot());
         assert!(BackupJobStatus::Partial.produced_snapshot());
+        assert!(BackupJobStatus::AlreadyComplete.produced_snapshot());
         assert!(!BackupJobStatus::Failed.produced_snapshot());
         assert!(!BackupJobStatus::Offline.produced_snapshot());
         assert!(!BackupJobStatus::Skipped.produced_snapshot());

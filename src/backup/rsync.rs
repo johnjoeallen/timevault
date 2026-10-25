@@ -1,5 +1,5 @@
 use std::io::{self, BufReader, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::error::{Result, TimevaultError};
@@ -16,7 +16,7 @@ pub fn run_rsync(
     source: &str,
     backup_dir: &Path,
     excludes_file: &Path,
-    link_dest: Option<&Path>,
+    link_dests: &[PathBuf],
     extra: &[String],
     run_mode: RunMode,
     label: &str,
@@ -33,7 +33,7 @@ pub fn run_rsync(
         args.push("--delete-after".to_string());
         args.push("--delete-excluded".to_string());
     }
-    if let Some(base) = link_dest {
+    for base in link_dests {
         args.push(format!("--link-dest={}", base.display()));
     }
     let streamed = progress::enabled();
@@ -44,12 +44,7 @@ pub fn run_rsync(
     args.push(source);
     args.push(backup_dir);
     let mut cmd = Command::new("nice");
-    cmd.arg("-n")
-        .arg("19")
-        .arg("ionice")
-        .arg("-c")
-        .arg("3")
-        .arg("-n7");
+    cmd.arg("-n").arg("19").arg("ionice").arg("-c").arg("3");
     cmd.args(&args);
 
     if run_mode.dry_run {
@@ -183,7 +178,7 @@ fn rsync_summary(captured: &str, label: &str) -> Option<String> {
     }
 }
 
-fn normalize_rsync_source(source: &str) -> String {
+pub(crate) fn normalize_rsync_source(source: &str) -> String {
     if source.ends_with('/') {
         return source.to_string();
     }
@@ -193,7 +188,7 @@ fn normalize_rsync_source(source: &str) -> String {
     ensure_trailing_slash(source)
 }
 
-fn ensure_trailing_slash(path: &str) -> String {
+pub(crate) fn ensure_trailing_slash(path: &str) -> String {
     if path.ends_with('/') {
         path.to_string()
     } else {

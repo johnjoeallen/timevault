@@ -4,7 +4,7 @@ set -eu
 help_out=$(timevault --help 2>/dev/null || true)
 
 must_have() {
-  echo "$help_out" | grep -q "$1" || {
+  echo "$help_out" | grep -q -- "$1" || {
     echo "missing in --help: $1" >&2
     exit 1
   }

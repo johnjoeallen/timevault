@@ -15,7 +15,7 @@ use crate::types::RunMode;
 
 const CONFIG_FILE: &str = "/etc/timevault.yaml";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-pub(crate) const BUILD_NUMBER: u32 = 2;
+pub(crate) const BUILD_NUMBER: u32 = 0;
 const LICENSE_NAME: &str = "GNU GPL v3 or later";
 const COPYRIGHT: &str = "Copyright (C) 2026 John Allen (john.joe.allen@gmail.com)";
 const PROJECT_URL: &str = "https://github.com/johnjoeallen/timevault";
@@ -54,6 +54,7 @@ pub fn run() -> Result<()> {
         exclude_pristine: cli.exclude_pristine || cli.exclude_pristine_only,
         exclude_pristine_only: cli.exclude_pristine_only,
         session_seconds_override: cli.min_session_seconds,
+        recreate: cli.recreate,
     };
 
     let command = cli.command.clone().unwrap_or(Command::Backup);
@@ -123,11 +124,19 @@ pub fn run() -> Result<()> {
                 }
             }
             DiskCommand::RotateIn(args) => {
+                eprintln!(
+                    "{}",
+                    crate::cli::commands::backup::rotate_command_deprecation_warning("rotate-in")
+                );
                 if let Err(err) = disk_add::run_set_rotated_out(&config_path, args, false) {
                     exit_for_error(&err);
                 }
             }
             DiskCommand::RotateOut(args) => {
+                eprintln!(
+                    "{}",
+                    crate::cli::commands::backup::rotate_command_deprecation_warning("rotate-out")
+                );
                 if let Err(err) = disk_add::run_set_rotated_out(&config_path, args, true) {
                     exit_for_error(&err);
                 }
@@ -273,6 +282,9 @@ fn print_help() {
     println!("  --rsync <args...>      Pass remaining args to rsync");
     println!("  --disk-id <id>         Select enrolled backup disk by id");
     println!("  --cascade              Run backup across all connected disks");
+    println!(
+        "  --recreate             Rebuild today's already-complete generation (alias --refresh)"
+    );
     println!("  --send-report          Send configured report email even during dry-run");
     println!("  --fs-uuid <uuid>       Filesystem UUID selector");
     println!("  --device <path>        Block device path (disk enroll)");
@@ -294,8 +306,8 @@ fn print_help() {
     println!("  rename                 Rename a disk id");
     println!("  enable                 Allow the disk to be used for backups again");
     println!("  disable                Prevent the disk from being used for backups");
-    println!("  rotate-in              Return the disk to automatic backup rotation");
-    println!("  rotate-out             Exclude the disk from automatic backup rotation");
+    println!("  rotate-in              Deprecated: clear the rotatedOut flag (use enable/disable instead)");
+    println!("  rotate-out             Deprecated: set the rotatedOut flag (use disable instead)");
 }
 
 fn needs_backup_selection_help(command: Option<&Command>, jobs: &[String]) -> bool {
