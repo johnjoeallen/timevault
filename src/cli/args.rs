@@ -79,7 +79,12 @@ pub enum DiskCommand {
     #[command(alias = "ls", alias = "list")]
     Discover(DiskLsArgs),
     Mount(MountArgs),
-    Check(DiskCheckArgs),
+    /// Verify disk identity files against the config
+    Verify(DiskVerifyArgs),
+    /// Run a read-only filesystem check (fsck) on connected, unmounted disks
+    Check(DiskFsckArgs),
+    /// Run an auto-repairing filesystem check (fsck) on connected, unmounted disks
+    Fix(DiskFsckArgs),
     Df(DiskDfArgs),
     Du(DiskDuArgs),
     #[command(alias = "unmount")]
@@ -139,7 +144,15 @@ pub struct DiskLsArgs {
 }
 
 #[derive(Args, Debug, Clone)]
-pub struct DiskCheckArgs {
+pub struct DiskVerifyArgs {
+    pub selector: Option<String>,
+    #[arg(long)]
+    pub fs_uuid: Option<String>,
+}
+
+/// Arguments for `disk check` (read-only fsck) and `disk fix` (auto-repairing fsck).
+#[derive(Args, Debug, Clone)]
+pub struct DiskFsckArgs {
     pub selector: Option<String>,
     #[arg(long)]
     pub fs_uuid: Option<String>,
@@ -365,13 +378,13 @@ mod tests {
     }
 
     #[test]
-    fn parses_disk_check_with_fs_uuid() {
-        let cli = Cli::parse_from(["timevault", "disk", "check", "--fs-uuid", "uuid-a"]);
+    fn parses_disk_verify_with_fs_uuid() {
+        let cli = Cli::parse_from(["timevault", "disk", "verify", "--fs-uuid", "uuid-a"]);
         let Some(Command::Disk {
-            command: DiskCommand::Check(args),
+            command: DiskCommand::Verify(args),
         }) = cli.command
         else {
-            panic!("expected disk check");
+            panic!("expected disk verify");
         };
         assert_eq!(args.fs_uuid.as_deref(), Some("uuid-a"));
     }

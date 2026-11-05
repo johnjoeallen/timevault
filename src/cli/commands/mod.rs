@@ -1,10 +1,11 @@
 pub mod backup;
 pub mod disk_add;
-pub mod disk_check;
 pub mod disk_df;
 pub mod disk_du;
+pub mod disk_fsck;
 pub mod disk_inspect;
 pub mod disk_ls;
+pub mod disk_verify;
 pub mod mount;
 pub mod umount;
 pub mod wake;

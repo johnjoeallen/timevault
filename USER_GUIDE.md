@@ -290,11 +290,21 @@ By default Timevault uses `/usr/sbin/sendmail -t`; set `options.report.sendmail`
 - Compatibility: `--disk-id <id>` or `--fs-uuid <uuid>` may be used instead of the positional selector.
 - Shows enabled state, size, used space, free space, and percent used for enrolled disks; offline disks are listed with unknown usage.
 
-### Disk check
-- `timevault disk check [<disk>]`
+### Disk verify
+- `timevault disk verify [<disk>]`
 - Compatibility: `--disk-id <id>` or `--fs-uuid <uuid>` may be used instead of the positional selector.
 - Scans configured disks, reports whether they are online or offline, and verifies connected `.timevault/identity` files against config.
 - Fails if a connected disk is missing its identity, has a mismatched `diskId`, or has a `.timevault/identity` `fsUuid` that differs from the actual filesystem UUID.
+
+### Disk check
+- `timevault disk check [<disk>]`
+- Compatibility: `--disk-id <id>` or `--fs-uuid <uuid>` may be used instead of the positional selector.
+- Runs a read-only filesystem check (`e2fsck -n -f`, `xfs_repair -n`, `btrfs check --readonly`, `jfs_fsck -n`, `fsck.f2fs`) on each selected disk that is connected and not mounted. Mounted disks, and ZFS, are skipped. It never repairs; a non-zero checker exit fails the command.
+
+### Disk fix
+- `timevault disk fix [<disk>]`
+- Compatibility: `--disk-id <id>` or `--fs-uuid <uuid>` may be used instead of the positional selector.
+- Like `disk check`, but runs the checker in automatic-repair mode (`e2fsck -y -f`, `xfs_repair`, `btrfs check --repair`, `jfs_fsck -f`, `fsck.f2fs -a -f`). Same skips as `disk check`. Repairs modify the disk (`btrfs check --repair` is considered risky by its authors); run `disk check` first and back up what you can. An `e2fsck` exit code of 1 (errors corrected) counts as success.
 
 ### Disk du
 - `timevault disk du [du options] <disk>:/path`

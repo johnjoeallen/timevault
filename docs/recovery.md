@@ -75,7 +75,7 @@ Timevault never deletes completed generations to make room. See [Out of space](r
 
 ## Check that a disk is healthy
 
-`timevault disk check [<disk>]` verifies that connected disks have a `.timevault` identity matching the config. `timevault disk df` reports free space.
+`timevault disk verify [<disk>]` verifies that connected disks have a `.timevault` identity matching the config. `timevault disk check` runs a read-only fsck on unmounted disks and `timevault disk fix` runs an auto-repairing fsck. `timevault disk df` reports free space.
 
 ## Interrupted runs
 

@@ -8,14 +8,14 @@ use clap::Parser;
 use crate::backup::BackupOptions;
 use crate::cli::args::{Cli, Command, DiskCommand};
 use crate::cli::commands::{
-    backup, disk_add, disk_check, disk_df, disk_du, disk_inspect, disk_ls, exit_for_error, mount,
-    umount, wake,
+    backup, disk_add, disk_df, disk_du, disk_fsck, disk_inspect, disk_ls, disk_verify,
+    exit_for_error, mount, umount, wake,
 };
 use crate::types::RunMode;
 
 const CONFIG_FILE: &str = "/etc/timevault.yaml";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-pub(crate) const BUILD_NUMBER: u32 = 1;
+pub(crate) const BUILD_NUMBER: u32 = 0;
 const LICENSE_NAME: &str = "GNU GPL v3 or later";
 const COPYRIGHT: &str = "Copyright (C) 2026 John Allen (john.joe.allen@gmail.com)";
 const PROJECT_URL: &str = "https://github.com/johnjoeallen/timevault";
@@ -92,9 +92,30 @@ pub fn run() -> Result<()> {
                     exit_for_error(&err);
                 }
             }
-            DiskCommand::Check(args) => {
-                if let Err(err) = disk_check::run_check(&config_path, args, cli.disk_id.as_deref())
+            DiskCommand::Verify(args) => {
+                if let Err(err) =
+                    disk_verify::run_verify(&config_path, args, cli.disk_id.as_deref())
                 {
+                    exit_for_error(&err);
+                }
+            }
+            DiskCommand::Check(args) => {
+                if let Err(err) = disk_fsck::run_fsck(
+                    &config_path,
+                    args,
+                    cli.disk_id.as_deref(),
+                    disk_fsck::Mode::Check,
+                ) {
+                    exit_for_error(&err);
+                }
+            }
+            DiskCommand::Fix(args) => {
+                if let Err(err) = disk_fsck::run_fsck(
+                    &config_path,
+                    args,
+                    cli.disk_id.as_deref(),
+                    disk_fsck::Mode::Fix,
+                ) {
                     exit_for_error(&err);
                 }
             }
@@ -238,7 +259,9 @@ fn print_help() {
     println!("  timevault disk ls [--short | --columns] [<disk>:/path]");
     println!("  timevault disk register <id> [--fs-uuid <uuid> | --device <path>] [--label <label>] [--mount-options <opts>] [--force]");
     println!("  timevault disk df [<disk>]");
+    println!("  timevault disk verify [<disk>]");
     println!("  timevault disk check [<disk>]");
+    println!("  timevault disk fix [<disk>]");
     println!("  timevault disk du [du options] <disk>:/path");
     println!("  timevault disk mount [<disk>]");
     println!("  timevault disk umount");
@@ -257,7 +280,9 @@ fn print_help() {
     );
     println!("  <disk> may be either a disk id or filesystem UUID");
     println!("  timevault disk df [<disk> | --disk-id <id> | --fs-uuid <uuid>]");
+    println!("  timevault disk verify [<disk> | --disk-id <id> | --fs-uuid <uuid>]");
     println!("  timevault disk check [<disk> | --disk-id <id> | --fs-uuid <uuid>]");
+    println!("  timevault disk fix [<disk> | --disk-id <id> | --fs-uuid <uuid>]");
     println!("  timevault disk mount [<disk> | --disk-id <id> | --fs-uuid <uuid>]");
     println!("  timevault disk inspect [<disk> | --disk-id <id> | --fs-uuid <uuid>]");
     println!("  timevault disk un-register [<disk> | --disk-id <id> | --fs-uuid <uuid>]");

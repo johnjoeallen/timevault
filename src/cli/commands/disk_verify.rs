@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::cli::args::DiskCheckArgs;
+use crate::cli::args::DiskVerifyArgs;
 use crate::config::load::load_config;
 use crate::config::model::BackupDiskConfig;
 use crate::disk::discovery::{list_candidates, DiskCandidate};
@@ -18,7 +18,7 @@ struct CheckRow {
     ok: bool,
 }
 
-pub fn run_check(config_path: &Path, args: DiskCheckArgs, disk_id: Option<&str>) -> Result<()> {
+pub fn run_verify(config_path: &Path, args: DiskVerifyArgs, disk_id: Option<&str>) -> Result<()> {
     let cfg = load_config(config_path.to_string_lossy().as_ref())?;
     let candidates = list_candidates(&cfg.backup_disks, Path::new(&cfg.user_mount_base))?;
     let selector = args
@@ -42,7 +42,7 @@ pub fn run_check(config_path: &Path, args: DiskCheckArgs, disk_id: Option<&str>)
     let failures = rows.iter().filter(|row| !row.ok).count();
     if failures > 0 {
         return Err(DiskError::IdentityMismatch(format!(
-            "disk check failed: {} issue(s)",
+            "disk verify failed: {} issue(s)",
             failures
         ))
         .into());

@@ -1,6 +1,6 @@
 [package]
 name = "timevault"
-version = "1.21.2"
+version = "1.22.0"
 edition = "2021"
 description = "Safe rsync-based backup tool with mount validation and snapshot rotation"
 license = "GPL-3.0-or-later"
@@ -21,7 +21,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [package.metadata.deb]
 maintainer = "Timevault Maintainers"
-revision = "1"
+revision = "0"
 depends = "rsync, util-linux, coreutils"
 assets = [
   ["target/release/timevault", "usr/bin/timevault", "755"],
